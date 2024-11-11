@@ -33,26 +33,22 @@ import yaml
 from packaging.version import Version
 from typing_extensions import ParamSpec, TypeIs, assert_never
 
-# import vllm.envs as envs
-# from vllm.logger import enable_trace_function_call, init_logger
-# from vllm.platforms import current_platform
-from llm_perf.utils.logger import logger
+from aterKernels import logger
 
-# logger = init_logger(__name__)
 
 # Exception strings for non-implemented encoder/decoder scenarios
 
 STR_NOT_IMPL_ENC_DEC_SWA = \
     "Sliding window attention for encoder/decoder models " + \
-                    "is not currently supported."
+    "is not currently supported."
 
 STR_NOT_IMPL_ENC_DEC_PREFIX_CACHE = \
     "Prefix caching for encoder/decoder models " + \
-                    "is not currently supported."
+    "is not currently supported."
 
 STR_NOT_IMPL_ENC_DEC_CHUNKED_PREFILL = \
     "Chunked prefill for encoder/decoder models " + \
-                    "is not currently supported."
+    "is not currently supported."
 
 STR_NOT_IMPL_ENC_DEC_LOGIT_SOFTCAP = (
     "Models with logits_soft_cap "
@@ -739,7 +735,7 @@ def _generate_random_fp8(
     # to generate random data for fp8 data.
     # For example, s.11111.00 in fp8e5m2 format represents Inf.
     #     | E4M3        | E5M2
-    #-----|-------------|-------------------
+    # -----|-------------|-------------------
     # Inf | N/A         | s.11111.00
     # NaN | s.1111.111  | s.11111.{01,10,11}
     from vllm import _custom_ops as ops
@@ -1234,7 +1230,7 @@ def weak_bind(bound_method: Callable[..., Any], ) -> Callable[..., None]:
     return weak_bound
 
 
-#From: https://stackoverflow.com/a/4104188/2749989
+# From: https://stackoverflow.com/a/4104188/2749989
 def run_once(f: Callable[P, None]) -> Callable[P, None]:
 
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:

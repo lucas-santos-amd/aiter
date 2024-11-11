@@ -34,14 +34,10 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 import os
-# import vllm.envs as envs
-# from vllm.logger import init_logger
-# import logging
-# init_logger = logging.getLogger
-from llm_perf.utils.logger import logger
-# from vllm.platforms import current_platform
-# from vllm.utils import supports_custom_op
-supports_custom_op=lambda:True
+from aterKernels import logger
+
+
+def supports_custom_op(): return True
 
 
 @dataclass
@@ -346,7 +342,7 @@ class GroupCoordinator:
             return input_
 
         if self.tpu_communicator is not None and \
-            not self.tpu_communicator.disabled:
+                not self.tpu_communicator.disabled:
             # TPU handles Dynamo with its own logic.
             return self.tpu_communicator.all_reduce(input_)
 
@@ -357,7 +353,7 @@ class GroupCoordinator:
                 input_, group_name=self.unique_name)
         else:
             inplace_all_reduce(input_,
-                                              group_name=self.unique_name)
+                               group_name=self.unique_name)
             return input_
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
@@ -912,8 +908,6 @@ def graph_capture():
     ).graph_capture(context):
         yield context
 
-
-# logger = init_logger(__name__)
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
 

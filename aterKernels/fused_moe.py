@@ -9,14 +9,9 @@ import triton
 import triton.language as tl
 
 import aterKernels as moe_kernels
-# import vllm.envs as envs
-# from vllm import _custom_ops as moe_kernels
-# from vllm.logger import init_logger
-# from vllm.platforms import current_platform
 
-import logging
-logger = logging.getLogger(__name__)
-# logger = init_logger(__name__)
+
+logger = moe_kernels.getLogger()
 VLLM_MOE_PADDING = bool(int(os.getenv("VLLM_MOE_PADDING", "1")))
 FUSED_MOE_PERSISTENT = bool(int(os.getenv("FUSED_MOE_PERSISTENT", "0")))
 ENABLE_MOE_LDS_BYPASS = bool(int(os.getenv("ENABLE_MOE_LDS_BYPASS", "1")))

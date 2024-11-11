@@ -10,9 +10,7 @@ import triton.language as tl
 
 import aterKernels as moe_kernels
 
-import logging
-logger = logging.getLogger(__name__)
-# logger = init_logger(__name__)
+logger = moe_kernels.getLogger()
 VLLM_MOE_PADDING = bool(int(os.getenv("VLLM_MOE_PADDING", "1")))
 FUSED_MOE_PERSISTENT = bool(int(os.getenv("FUSED_MOE_PERSISTENT", "0")))
 ENABLE_MOE_LDS_BYPASS = bool(int(os.getenv("ENABLE_MOE_LDS_BYPASS", "1")))

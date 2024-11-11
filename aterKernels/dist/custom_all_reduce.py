@@ -12,9 +12,7 @@ import os
 from .custom_all_reduce_utils import (
     gpu_p2p_access_check)
 from .parallel_state import in_the_same_node_as
-from llm_perf.utils.logger import logger
-# from vllm.logger import init_logger
-# from vllm.platforms import current_platform
+from aterKernels import logger
 
 try:
     ops.meta_size()
@@ -22,8 +20,6 @@ try:
 except Exception:
     # For CPUs
     custom_ar = False
-
-# logger = init_logger(__name__)
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:
@@ -126,7 +122,7 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         # assert current_platform.is_cuda() or current_platform.is_rocm()
         # full_nvlink = current_platform.is_full_nvlink(physical_device_ids)
-        full_nvlink=True
+        full_nvlink = True
         if world_size > 2 and not full_nvlink:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"

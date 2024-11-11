@@ -1,3 +1,8 @@
+from functools import lru_cache, partial, wraps
+from .utils import (cuda_device_count_stateless,
+                    update_environment_variables)
+from aterKernels import logger
+from .cuda_wrapper import CudaRTLibrary
 import ctypes
 import json
 import os
@@ -11,16 +16,7 @@ from typing import Dict, List, Optional, Sequence
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-# import vllm.envs as envs
-VLLM_CACHE_ROOT=os.path.expanduser("~/.cache/vllm")
-from .cuda_wrapper import CudaRTLibrary
-# from vllm.logger import init_logger
-from llm_perf.utils.logger import logger
-from .utils import (cuda_device_count_stateless,
-                        update_environment_variables)
-from functools import lru_cache, partial, wraps
-
-# logger = init_logger(__name__)
+VLLM_CACHE_ROOT = os.path.expanduser("~/.cache/vllm")
 
 
 def producer(batch_src: Sequence[int],

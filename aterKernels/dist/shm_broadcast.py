@@ -12,9 +12,7 @@ from torch.distributed import ProcessGroup
 from zmq import IPV6  # type: ignore
 from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 
-# import vllm.envs as envs
-from llm_perf.utils.logger import logger
-# from vllm.logger import init_logger
+from aterKernels import logger
 from .utils import get_ip, get_open_port, is_valid_ipv6_address
 
 VLLM_RINGBUFFER_WARNING_INTERVAL = 60
@@ -24,8 +22,6 @@ VLLM_RINGBUFFER_WARNING_INTERVAL = 60
 # if we sleep for too long, it will slow down the writer/reader
 # 0.1 us is a good balance
 RINGBUFFER_SLEEP_INTERVAL = 1e-7
-
-# logger = init_logger(__name__)
 
 
 class ShmRingBuffer:
@@ -42,7 +38,7 @@ class ShmRingBuffer:
         of items that can be stored in the buffer are known in advance.
         In this case, we don't need to synchronize the access to
          the buffer.
-        
+
         Buffer memory layout:
                   data                                 metadata
                     |                                      |
@@ -83,7 +79,7 @@ class ShmRingBuffer:
         created object to other processes by pickling it. The other processes will
         get the name of the shared memory and open it, so that they can access the
         same shared memory buffer.
-        """# noqa
+        """  # noqa
         self.n_reader = n_reader
         self.metadata_size = 1 + n_reader
         self.max_chunk_bytes = max_chunk_bytes
