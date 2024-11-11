@@ -170,8 +170,8 @@ class RotaryEmbedding(nn.Module):
                                          self.is_neox_style, self.rotary_dim,
                                          offsets)
         else:
-            ops.rotary_embedding(positions, query, key, self.head_size,
-                                 self.cos_sin_cache, self.is_neox_style)
+            ops.rotary_embedding_fwd(positions, query, key, self.head_size,
+                                     self.cos_sin_cache, self.is_neox_style)
         return query, key
 
     def forward_xpu(
@@ -601,7 +601,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base**(torch.arange(
             0, self.rotary_dim, 2, dtype=torch.float, device="cuda") /
-                                self.rotary_dim)
+            self.rotary_dim)
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
@@ -762,12 +762,12 @@ class MRotaryEmbedding(RotaryEmbedding):
                 m[i]
                 for i, m in enumerate(cos.split(self.mrope_section, dim=-1))
             ],
-                            dim=-1)
+                dim=-1)
             sin = torch.cat([
                 m[i]
                 for i, m in enumerate(sin.split(self.mrope_section, dim=-1))
             ],
-                            dim=-1)
+                dim=-1)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)

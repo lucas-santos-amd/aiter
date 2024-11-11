@@ -10,9 +10,12 @@ def getLogger():
     if not logger.handlers:
         logger.setLevel(logging.DEBUG)
         formatter = logging.Formatter(
-            "%(levelname)s - %(process)d - %(processName)s - %(asctime)s  - %(funcName)s - %(pathname)s:%(lineno)d\n%(message)s")
+            fmt="[%(levelname)s] %(asctime)s.%(msecs)03d - %(process)d:%(processName)s - %(pathname)s:%(lineno)d - %(funcName)s\n%(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
 
         console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
         console_handler.setLevel(logging.INFO)
         logger.addHandler(console_handler)
 
