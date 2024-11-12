@@ -2,7 +2,6 @@ import torch
 import torch.nn.functional as F
 import aterKernels
 from test_common import checkAllclose, perftest
-print(dir(aterKernels),1111)
 
 
 @perftest()

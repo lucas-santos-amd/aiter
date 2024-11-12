@@ -199,10 +199,10 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
   2) This implementation assumes k is small, but will work for any k.
 */
 
-template <int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG>
+template <int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG, bool need_renorm>
 __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
     void topkGatingSoftmax(const float *input, const bool *finished, float *output, const int num_rows, int *indices,
-                           int *source_rows, const int k, const int start_expert, const int end_expert, const bool need_renorm)
+                           int *source_rows, const int k, const int start_expert, const int end_expert)
 {
     // We begin by enforcing compile time assertions and setting up compile time constants.
     static_assert(VPT == (VPT & -VPT), "VPT must be power of 2");
@@ -383,7 +383,7 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
             source_rows[idx] = k_idx * num_rows + thread_row;
 
             // Accumulate renorm scalar
-            if (need_renorm)
+            if constexpr (need_renorm)
             {
                 renorm_value += max_val;
             }
@@ -405,13 +405,16 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
         }
     }
 
-    if (need_renorm && thread_group_idx == 0 && renorm_value != 0.f)
+    if constexpr (need_renorm)
     {
-        renorm_value = 1 / renorm_value;
-        for (int k_idx = 0; k_idx < k; k_idx++)
+        if (thread_group_idx == 0 && renorm_value != 0.f)
         {
-            int64_t const idx = k * thread_row + k_idx;
-            output[idx] *= renorm_value;
+            renorm_value = 1 / renorm_value;
+            for (int k_idx = 0; k_idx < k; k_idx++)
+            {
+                int64_t const idx = k * thread_row + k_idx;
+                output[idx] *= renorm_value;
+            }
         }
     }
 }
@@ -445,8 +448,18 @@ void topkGatingSoftmaxLauncherHelper(const float *input, const bool *finished, f
     const int num_blocks = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
 
     dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
-    topkGatingSoftmax<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG><<<num_blocks, block_dim, 0, stream>>>(
-        input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert, need_renorm);
+    if (need_renorm)
+    {
+        topkGatingSoftmax<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, true><<<num_blocks, block_dim, 0, stream>>>(
+            input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert);
+    }
+    else
+    {
+        topkGatingSoftmax<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, false><<<num_blocks, block_dim, 0, stream>>>(
+            input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert);
+    }
+    
+
 }
 
 #define LAUNCH_SOFTMAX(NUM_EXPERTS, WARPS_PER_TB)                            \
