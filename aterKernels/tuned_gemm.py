@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from hipbsolidxgemm import hipb_create_extension, hipb_mm
 from rocsolidxgemm import rocb_create_extension, rocb_mm
+from aterKernels import logger
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -18,6 +19,7 @@ class TunedGemm:
         self.untune_path = f'{this_dir}/configs/untuned_gemm.csv'
         self.tune_path = f'{this_dir}/configs/tuned_gemm.csv'
         self.bestsols = {}
+        self.solMap = ['torch', 'hipblaslt', 'rocblas', 'skinny']
         self.load_best_sols()
         self.create_ds()
         self.cu_count = torch.cuda.get_device_properties(
@@ -44,9 +46,9 @@ class TunedGemm:
             ds = df.iloc[i]
             key = (ds['M'], ds['N'], ds['K'], ds['bias'], ds['dtype'])
             if ds['libtype'] == 'hipblaslt':
-                soltype = 1
+                soltype = self.solMap.index(ds['libtype'])
             elif ds['libtype'] == 'rocblas':
-                soltype = 2
+                soltype = self.solMap.index(ds['libtype'])
             solds[key] = (soltype, int(ds['solidx']))
         self.solids = solds
         self.solfuncs = [
@@ -59,11 +61,14 @@ class TunedGemm:
     @functools.lru_cache(maxsize=1024)
     def query_sol(self, m, n, k, bias, dtype):
         if dtype == torch.float16 and k % 8 == 0:
-            if m > 8 and 0 < n <= 4:
+            if n > 8 and 0 < m <= 4:
                 return 3, 0
-            elif m % 4 == 0 and n == 1 and k <= 8192:
+            elif n % 4 == 0 and m == 1 and k <= 8192:
                 return 3, 1
-        return self.solids.get((m, n, k, bias, str(dtype)), (0, 0))
+        soltype, solidx = self.solids.get((m, n, k, bias, str(dtype)), (0, 0))
+        logger.info(
+            f'using {soltype=}, {solidx=} for {m=} {n=} {k=} {dtype=} {bias=}')
+        return soltype, solidx
 
     def apply_skinny(self, inp, weights, solidx, bias=None):
         import aterKernels as ops
@@ -93,9 +98,8 @@ class TunedGemm:
 
     def apply_torch_mm(self, inp, weights, solidx, bias=None):
         if (self.save_gemm == 1):
-            m = weights.shape[0]
-            n = inp.shape[0]
-            k = inp.shape[1]
+            m, k = inp.shape
+            n = weights.shape[0]
             self.tuned_df = pd.concat([
                 self.tuned_df,
                 pd.DataFrame({
@@ -123,8 +127,8 @@ class TunedGemm:
             rocb_create_extension()
             hipb_create_extension()
             self.extensions_created = True
-        m = weights.shape[0]
-        n, k = inp_view.shape
+        m, k = inp_view.shape
+        n = weights.shape[0]
         use_bias = bias is not None
         soltype, solidx = self.query_sol(m=m,
                                          n=n,
