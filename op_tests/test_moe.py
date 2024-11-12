@@ -6,8 +6,8 @@ import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 from test_common import checkAllclose, perftest
-from aterKernels.fused_moe_bf16_asm import asm_moe, moe_sorting_ck
-from aterKernels.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
+from ater.fused_moe_bf16_asm import asm_moe, moe_sorting_ck
+from ater.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
 
 
 BLOCK_SIZE_M = 32
@@ -38,7 +38,7 @@ def moe_sorting_vllm(topk_ids: torch.Tensor,
     num_tokens_post_pad = torch.empty((1),
                                       dtype=torch.int32,
                                       device=topk_ids.device)
-    aterKernels.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
+    ater.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
                                      expert_ids, token_nums, num_tokens_post_pad)
     return sorted_ids, expert_ids, token_nums, num_tokens_post_pad
 

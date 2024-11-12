@@ -11,7 +11,7 @@
 
 import torch
 import numpy as np
-from aterKernels import logger
+from ater import logger
 num_iters = 100
 num_warmup = 20
 

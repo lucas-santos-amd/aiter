@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import sys
 import os
-from aterKernels import gemm_op_a8w8
+from ater import gemm_op_a8w8
 
 
 @perftest()

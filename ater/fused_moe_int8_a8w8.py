@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-import aterKernels as moe_kernels
+import ater as moe_kernels
 
 logger = moe_kernels.getLogger()
 VLLM_MOE_PADDING = bool(int(os.getenv("VLLM_MOE_PADDING", "1")))

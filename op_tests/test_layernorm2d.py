@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-import aterKernels
+import ater
 from test_common import checkAllclose, perftest
 
 
@@ -32,7 +32,7 @@ def run_ck(input, weight, bias, eps, residual=None):
     if residual is None:
         residual_out = None
         output = torch.empty_like(input)
-        aterKernels.layernorm2d_fwd(
+        ater.layernorm2d_fwd(
             output,
             input,
             weight,
@@ -42,7 +42,7 @@ def run_ck(input, weight, bias, eps, residual=None):
     else:
         residual_out = torch.empty_like(input)
         output = torch.empty_like(input)
-        aterKernels.layernorm2d_fwd_with_add(
+        ater.layernorm2d_fwd_with_add(
             output,
             input,
             residual,

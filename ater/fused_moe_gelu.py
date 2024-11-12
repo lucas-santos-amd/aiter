@@ -8,16 +8,27 @@ import torch
 import triton
 import triton.language as tl
 
-import aterKernels as moe_kernels
+import ater as moe_kernels
 
 
 logger = moe_kernels.getLogger()
-VLLM_MOE_PADDING = bool(int(os.getenv("VLLM_MOE_PADDING", "1")))
+VLLM_MOE_PADDING = bool(int(os.getenv("VLLM_MOE_PADDING", "0")))
 FUSED_MOE_PERSISTENT = bool(int(os.getenv("FUSED_MOE_PERSISTENT", "0")))
 ENABLE_MOE_LDS_BYPASS = bool(int(os.getenv("ENABLE_MOE_LDS_BYPASS", "1")))
 print(f'{FUSED_MOE_PERSISTENT=}, {ENABLE_MOE_LDS_BYPASS=}, {VLLM_MOE_PADDING=}')
 VLLM_FUSED_MOE_CHUNK_SIZE = 65536
 padding_size = 128 if VLLM_MOE_PADDING else 0
+
+
+@triton.jit
+def tanh(x):
+    # Tanh is just a scaled sigmoid
+    return 2 * tl.sigmoid(2 * x) - 1
+
+
+@triton.jit
+def gelu(x):
+    return 0.5 * x * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
 
 
 @triton.jit
@@ -172,6 +183,9 @@ def fused_moe_kernel(
         accumulator = (accumulator * a_scale * b_scale).to(compute_type)
     else:
         accumulator = accumulator.to(compute_type)
+    if not MUL_ROUTED_WEIGHT:
+        accumulator = gelu(accumulator)
+
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -295,12 +309,12 @@ def fused_moe_persistent_kernel(
         token_mask = offs_token < num_valid_tokens
         # Compute the A pointer
         a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
-            offs_k[None, :] * stride_ak)
+                          offs_k[None, :] * stride_ak)
         # Compute the B pointer
         offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         off_experts = tl.load(expert_ids_ptr + pid_m)
         b_ptrs = (b_ptr + off_experts * stride_be +
-            (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn))
+                  (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn))
 
         if use_fp8:
             a_scale = tl.load(a_scale_ptr)
@@ -318,7 +332,7 @@ def fused_moe_persistent_kernel(
                 a = tl.load(
                     a_ptrs,
                     mask=token_mask[:, None] &
-                        (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                    (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                     other=0.0
                 )
                 b = tl.load(
@@ -337,8 +351,8 @@ def fused_moe_persistent_kernel(
 
         if MUL_ROUTED_WEIGHT:
             moe_weight = tl.load(topk_weights_ptr + offs_token,
-                                mask=token_mask,
-                                other=0)
+                                 mask=token_mask,
+                                 other=0)
             accumulator = accumulator * moe_weight[:, None]
 
         if use_fp8:
@@ -349,7 +363,7 @@ def fused_moe_persistent_kernel(
         # Write back the block of the output
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = (c_ptr + stride_cm * offs_token[:, None] +
-                stride_cn * offs_cn[None, :])
+                  stride_cn * offs_cn[None, :])
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
         tl.store(c_ptrs, accumulator, mask=c_mask)
 
@@ -441,7 +455,7 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
         assert B_scale is None
 
     if not FUSED_MOE_PERSISTENT:
-        grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META[
+        def grid(META): return (triton.cdiv(sorted_token_ids.shape[0], META[
             "BLOCK_SIZE_M"]) * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]), )
 
         fused_moe_kernel[grid](
@@ -477,12 +491,14 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
             enable_moe_lds_bypass=ENABLE_MOE_LDS_BYPASS
         )
     else:
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count * 2
-        grid = lambda META: (min(
-                NUM_SMS,
-                triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) *
-                    triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"])
-                ), )
+        NUM_SMS = torch.cuda.get_device_properties(
+            "cuda").multi_processor_count * 2
+
+        def grid(META): return (min(
+            NUM_SMS,
+            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) *
+            triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"])
+        ), )
 
         fused_moe_persistent_kernel[grid](
             A,
@@ -549,7 +565,7 @@ def get_moe_configs(E: int, N: int,
 
     # If no optimized configuration is available, we will use the default
     # configuration
-    logger.info("---> MOE tuned file not found at %s",config_file_path)
+    logger.info("---> MOE tuned file not found at %s", config_file_path)
     return None
 
 
@@ -564,16 +580,16 @@ def get_default_config(
 ) -> Dict[str, int]:
     config = {
         'BLOCK_SIZE_M': 64,
-        'BLOCK_SIZE_N': 128, # reqd. for MOE shuffle
-        'BLOCK_SIZE_K': 128, # reqd. for MOE shuffle
+        'BLOCK_SIZE_N': 128,  # reqd. for MOE shuffle
+        'BLOCK_SIZE_K': 128,  # reqd. for MOE shuffle
         'GROUP_SIZE_M': 8
     }
     # A heuristic: fused marlin works faster with this config for small M
     if M <= E or (is_marlin and M <= 32):
         config = {
             'BLOCK_SIZE_M': 16,
-            'BLOCK_SIZE_N': 128, # reqd. for MOE shuffle
-            'BLOCK_SIZE_K': 128, # reqd. for MOE shuffle
+            'BLOCK_SIZE_N': 128,  # reqd. for MOE shuffle
+            'BLOCK_SIZE_K': 128,  # reqd. for MOE shuffle
             'GROUP_SIZE_M': 1
         }
     return config
@@ -707,7 +723,8 @@ def fused_experts(hidden_states: torch.Tensor,
                   a1_scale: Optional[torch.Tensor] = None,
                   a2_scale: Optional[torch.Tensor] = None):
     # Check constraints.
-    assert hidden_states.shape[1] == w1.shape[2] - padding_size, "Hidden size mismatch"
+    assert hidden_states.shape[1] == w1.shape[2] - \
+        padding_size, "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -740,9 +757,9 @@ def fused_experts(hidden_states: torch.Tensor,
     intermediate_cache1 = torch.empty((M, topk_ids.shape[1], N),
                                       device=hidden_states.device,
                                       dtype=hidden_states.dtype)
-    intermediate_cache2 = torch.empty((M * topk_ids.shape[1], N // 2),
-                                      device=hidden_states.device,
-                                      dtype=hidden_states.dtype)
+    # intermediate_cache2 = torch.empty((M * topk_ids.shape[1], N // 2),
+    #                                   device=hidden_states.device,
+    #                                   dtype=hidden_states.dtype)
     intermediate_cache3 = torch.empty((M, topk_ids.shape[1], w2.shape[1]),
                                       device=hidden_states.device,
                                       dtype=hidden_states.dtype)
@@ -801,7 +818,8 @@ def fused_experts(hidden_states: torch.Tensor,
                                 use_fp8_w8a8=use_fp8_w8a8,
                                 use_int8_w8a16=use_int8_w8a16)
 
-        moe_kernels.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        # moe_kernels.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        intermediate_cache2 = intermediate_cache1.view(M*topk_ids.shape[1], N)
 
         invoke_fused_moe_kernel(intermediate_cache2,
                                 w2,

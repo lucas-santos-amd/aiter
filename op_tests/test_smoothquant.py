@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-import aterKernels
+import ater
 from test_common import checkAllclose, perftest
 import argparse
 
@@ -54,7 +54,7 @@ def run_ck(input, x_scale, y_scale_dtype = torch.float32):
         start_event.record()
         output = torch.empty(input.shape, device="cuda", dtype=torch.int8)
         y_scale = torch.empty(input.shape[0], 1, device="cuda", dtype=y_scale_dtype)
-        aterKernels.smoothquant_fwd(output,
+        ater.smoothquant_fwd(output,
                                     input,
                                     x_scale,
                                     y_scale)

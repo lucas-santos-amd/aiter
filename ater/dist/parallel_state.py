@@ -34,7 +34,7 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 import os
-from aterKernels import logger
+from ater import logger
 
 
 def supports_custom_op(): return True

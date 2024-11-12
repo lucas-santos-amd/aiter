@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from hipbsolidxgemm import hipb_create_extension, hipb_mm
 from rocsolidxgemm import rocb_create_extension, rocb_mm
-from aterKernels import logger
+from ater import logger
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -70,8 +70,8 @@ class TunedGemm:
             f'using {soltype=}, {solidx=} for {m=} {n=} {k=} {dtype=} {bias=}')
         return soltype, solidx
 
-    def apply_skinny(self, inp, weights, solidx, bias=None):
-        import aterKernels as ops
+    def apply_skinny(self, inp, weights, solidx, bias=None, otype=None):
+        import ater as ops
         if solidx == 0:
             out = torch.empty(inp.shape[0],
                               weights.shape[0],
@@ -87,16 +87,18 @@ class TunedGemm:
         if bias is not None:
             return out + bias
 
-    def apply_hipb_mm(self, inp, weights, solidx, bias=None):
-        return hipb_mm(inp, weights.t(), solidx, bias=bias)
+    def apply_hipb_mm(self, inp, weights, solidx, bias=None, otype=None):
+        if otype is None:
+            otype = inp.dtype
+        return hipb_mm(inp, weights.t(), solidx, bias=bias, out_dtype=otype)
 
-    def apply_rocb_mm(self, inp, weights, solidx, bias=None):
+    def apply_rocb_mm(self, inp, weights, solidx, bias=None, otype=None):
         out = rocb_mm(inp, weights.t(), solidx)
         if bias is not None:
             out = out + bias
         return out
 
-    def apply_torch_mm(self, inp, weights, solidx, bias=None):
+    def apply_torch_mm(self, inp, weights, solidx, bias=None, otype=None):
         if (self.save_gemm == 1):
             m, k = inp.shape
             n = weights.shape[0]
@@ -113,7 +115,7 @@ class TunedGemm:
             self.tuned_df.to_csv(self.untune_path, index=False)
         return F.linear(inp, weights, bias)
 
-    def mm(self, inp, weights, bias=None):
+    def mm(self, inp, weights, bias=None, otype=None):
         # F.Linear can take a 3 dimensional input. vllm
         # uses this for linear units. However, sampler
         # will use torch.matmul with 2 dimensions only
@@ -135,8 +137,8 @@ class TunedGemm:
                                          k=k,
                                          bias=use_bias,
                                          dtype=inp.dtype)
-        # # print('soltype:', soltype, 'solidx:', solidx, f'apply_skinny: {out is not None}')
-        out = self.solfuncs[soltype](inp_view, weights, solidx, bias=bias)
+        out = self.solfuncs[soltype](
+            inp_view, weights, solidx, bias=bias, otype=otype)
         if batched:
             out = out.view(inp.shape[0], inp.shape[1], weights.shape[0])
         return out

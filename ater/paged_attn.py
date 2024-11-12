@@ -1,6 +1,6 @@
 from typing import List, Optional, Tuple, Union
 import torch
-import aterKernels as ops
+import ater as ops
 
 from dataclasses import dataclass
 # from vllm.utils import is_hip

@@ -1,7 +1,7 @@
 from functools import lru_cache, partial, wraps
 from .utils import (cuda_device_count_stateless,
                     update_environment_variables)
-from aterKernels import logger
+from ater import logger
 from .cuda_wrapper import CudaRTLibrary
 import ctypes
 import json

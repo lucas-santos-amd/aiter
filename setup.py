@@ -30,7 +30,7 @@ ck_dir = os.environ.get("CK_DIR", "/mnt/raid0/ljin1/dk/composable_kernel")
 this_dir = os.path.dirname(os.path.abspath(__file__))
 bd_dir = f"{this_dir}/build"
 blob_dir = f"{this_dir}/blob"
-PACKAGE_NAME = 'aterKernels'
+PACKAGE_NAME = 'ater'
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
 if BUILD_TARGET == "auto":

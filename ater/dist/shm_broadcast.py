@@ -12,7 +12,7 @@ from torch.distributed import ProcessGroup
 from zmq import IPV6  # type: ignore
 from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 
-from aterKernels import logger
+from ater import logger
 from .utils import get_ip, get_open_port, is_valid_ipv6_address
 
 VLLM_RINGBUFFER_WARNING_INTERVAL = 60

@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-import aterKernels
+import ater
 from test_common import checkAllclose, perftest
 
 
@@ -28,7 +28,7 @@ def test_nofuse(
                                         dtype=torch.int32,
                                         device=hidden_states.device)
 
-    aterKernels.topk_softmax(
+    ater.topk_softmax(
         topk_weights,
         topk_ids,
         token_expert_indicies,
@@ -48,7 +48,7 @@ def test_fuse(hidden_states: torch.Tensor,
               gating_output: torch.Tensor,
               topk: int,
               renormalize: bool):
-    from aterKernels.fused_moe_gelu import fused_topk
+    from ater.fused_moe_gelu import fused_topk
     return fused_topk(hidden_states, gating_output, topk, renormalize)
 
 

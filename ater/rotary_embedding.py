@@ -158,7 +158,7 @@ class RotaryEmbedding(nn.Module):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # from vllm import _custom_ops as ops
-        import aterKernels as ops
+        import ater as ops
 
         self.cos_sin_cache = self.cos_sin_cache.to(query.device,
                                                    dtype=query.dtype)

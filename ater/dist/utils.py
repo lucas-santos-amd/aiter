@@ -33,7 +33,7 @@ import yaml
 from packaging.version import Version
 from typing_extensions import ParamSpec, TypeIs, assert_never
 
-from aterKernels import logger
+from ater import logger
 
 
 # Exception strings for non-implemented encoder/decoder scenarios

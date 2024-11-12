@@ -7,7 +7,7 @@ import os
 if 1:
     _path = os.path.abspath(os.path.dirname(__file__))
     sys.path.insert(0, f'{_path}/../../')
-    from aterKernels.tuned_gemm import tgemm
+    from ater.tuned_gemm import tgemm
 
 
 @perftest()

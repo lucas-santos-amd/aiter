@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-import aterKernels
+import ater
 import argparse
 
 num_iters = 100
@@ -77,7 +77,7 @@ def run_ck(input, weight, bias, eps, residual=None, x_scale = None, y_scale_dtyp
             if residual is None:
                 residual_out = None
                 output = torch.empty_like(input)
-                aterKernels.layernorm2d_fwd(
+                ater.layernorm2d_fwd(
                     output,
                     input,
                     weight,
@@ -87,7 +87,7 @@ def run_ck(input, weight, bias, eps, residual=None, x_scale = None, y_scale_dtyp
             elif residual is not None:
                 residual_out = torch.empty_like(input)
                 output = torch.empty_like(input)
-                aterKernels.layernorm2d_fwd_with_add(
+                ater.layernorm2d_fwd_with_add(
                     output,
                     input,
                     residual,
@@ -101,7 +101,7 @@ def run_ck(input, weight, bias, eps, residual=None, x_scale = None, y_scale_dtyp
             output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
             if residual is None:
                 residual_out = None
-                aterKernels.layernorm2d_fwd_with_dynamicquant(
+                ater.layernorm2d_fwd_with_dynamicquant(
                     output,
                     input,
                     y_scale,
@@ -111,7 +111,7 @@ def run_ck(input, weight, bias, eps, residual=None, x_scale = None, y_scale_dtyp
                 )
             elif residual is not None:
                 residual_out = torch.empty_like(input)
-                aterKernels.layernorm2d_fwd_with_add_dynamicquant(
+                ater.layernorm2d_fwd_with_add_dynamicquant(
                     output,
                     input,
                     residual,
@@ -126,7 +126,7 @@ def run_ck(input, weight, bias, eps, residual=None, x_scale = None, y_scale_dtyp
             output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
             if residual is None:
                 residual_out = None
-                aterKernels.layernorm2d_fwd_with_smoothquant(
+                ater.layernorm2d_fwd_with_smoothquant(
                     output,
                     input,
                     x_scale,
@@ -137,7 +137,7 @@ def run_ck(input, weight, bias, eps, residual=None, x_scale = None, y_scale_dtyp
                 )
             elif residual is not None:
                 residual_out = torch.empty_like(input)
-                aterKernels.layernorm2d_fwd_with_add_smoothquant(
+                ater.layernorm2d_fwd_with_add_smoothquant(
                     output,
                     input,
                     residual,

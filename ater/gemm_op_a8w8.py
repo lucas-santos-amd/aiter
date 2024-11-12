@@ -1,5 +1,5 @@
 import torch
-from aterKernels import gemm_a8w8
+from ater import gemm_a8w8
 
 def gemm_a8w8_bias(
         XQ: torch.tensor,

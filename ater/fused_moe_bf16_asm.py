@@ -4,7 +4,7 @@ import numpy as np
 import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
-import aterKernels
+import ater
 BLOCK_SIZE_M = 32
 
 
@@ -30,7 +30,7 @@ def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype)
     moe_buf = torch.empty((topk_ids.shape[0], model_dim),
                           dtype=moebuf_dtype,
                           device=device)
-    aterKernels.moe_sorting(topk_ids, topk_weights, sorted_ids, sorted_weights,  sorted_expert_ids,
+    ater.moe_sorting(topk_ids, topk_weights, sorted_ids, sorted_weights,  sorted_expert_ids,
                             num_tokens_post_pad, moe_buf, num_experts, BLOCK_SIZE_M)
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad, moe_buf
 
@@ -40,6 +40,6 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids):
     dtype = w1.dtype
     sorted_ids_b, sorted_weights_b, sorted_expert_ids_b, num_tokens_post_padded, moe_buf = moe_sorting_ck(topk_ids, topk_weight, E,
                                                                                                           model_dim, dtype)
-    aterKernels.fmoe(moe_buf, hidden_states, w1, w2, sorted_ids_b,
+    ater.fmoe(moe_buf, hidden_states, w1, w2, sorted_ids_b,
                      sorted_weights_b, sorted_expert_ids_b, num_tokens_post_padded)
     return moe_buf
