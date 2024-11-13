@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-11 18:48:26
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-11-13 17:05:44
+# @Last Modified At: 2024-11-13 17:10:53
 # @Description: This is description.
 
 import warnings
@@ -27,7 +27,7 @@ from torch.utils.cpp_extension import (
 
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-ck_dir = os.environ.get("CK_DIR", "{this_dir}/3rdparty/composable_kernel")
+ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 bd_dir = f"{this_dir}/build"
 blob_dir = f"{this_dir}/blob"
 PACKAGE_NAME = 'ater'
