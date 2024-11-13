@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-11 18:48:26
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-11-13 17:10:53
+# @Last Modified At: 2024-11-13 18:41:26
 # @Description: This is description.
 
 import warnings
@@ -113,6 +113,7 @@ if IS_ROCM:
         "-mllvm", "-amdgpu-early-inline-all=true",
         "-mllvm", "-amdgpu-function-calls=false",
         "-mllvm", "--amdgpu-kernarg-preload-count=16",
+        "-Wunused-result",
     ]
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
@@ -243,6 +244,7 @@ setup(
             "dist",
             "docs",
             "benchmarks",
+            "3rdparty",
         )
     ),
     classifiers=[
