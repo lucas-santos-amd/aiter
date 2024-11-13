@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-11 18:48:26
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-11-11 20:26:26
+# @Last Modified At: 2024-11-13 17:05:44
 # @Description: This is description.
 
 import warnings
@@ -26,8 +26,8 @@ from torch.utils.cpp_extension import (
 )
 
 
-ck_dir = os.environ.get("CK_DIR", "/mnt/raid0/ljin1/dk/composable_kernel")
 this_dir = os.path.dirname(os.path.abspath(__file__))
+ck_dir = os.environ.get("CK_DIR", "{this_dir}/3rdparty/composable_kernel")
 bd_dir = f"{this_dir}/build"
 blob_dir = f"{this_dir}/blob"
 PACKAGE_NAME = 'ater'
@@ -94,10 +94,11 @@ if IS_ROCM:
     torch_dir = torch.__path__[0]
     if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
         generator_flag.append("-DOLD_GENERATOR_PATH")
-    if os.path.exists(ck_dir):
-        generator_flag.append("-DFIND_CK")
-        os.system(
-            f'python {ck_dir}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {blob_dir}')
+    assert os.path.exists(
+        ck_dir), f'CK is needed by ater, please make sure clone by "git clone --recursive https://github.com/ROCm/ater.git" or "git submodule sync ; git submodule update --init --recursive"'
+    generator_flag.append("-DFIND_CK")
+    os.system(
+        f'python {ck_dir}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {blob_dir}')
 
     cc_flag = []
 
