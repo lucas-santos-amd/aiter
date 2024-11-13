@@ -6,11 +6,12 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-11 18:48:26
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-11-13 18:41:26
+# @Last Modified At: 2024-11-13 23:18:25
 # @Description: This is description.
 
 import warnings
 import os
+import sys
 import shutil
 
 from setuptools import setup, find_packages
@@ -98,7 +99,7 @@ if IS_ROCM:
         ck_dir), f'CK is needed by ater, please make sure clone by "git clone --recursive https://github.com/ROCm/ater.git" or "git submodule sync ; git submodule update --init --recursive"'
     generator_flag.append("-DFIND_CK")
     os.system(
-        f'python {ck_dir}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {blob_dir}')
+        f'{sys.executable} {ck_dir}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {blob_dir}')
 
     cc_flag = []
 
@@ -109,11 +110,13 @@ if IS_ROCM:
     cc_flag += [
         "-mllvm", "--lsr-drop-solution=1",
         "-mllvm", "-enable-post-misched=0",
-        "-mllvm", "-amdgpu-coerce-illegal-types=1",
+        # "-mllvm", "-amdgpu-coerce-illegal-types=1",
         "-mllvm", "-amdgpu-early-inline-all=true",
         "-mllvm", "-amdgpu-function-calls=false",
         "-mllvm", "--amdgpu-kernarg-preload-count=16",
-        "-Wunused-result",
+        "-Wno-unused-result",
+        "-Wno-switch-bool",
+        "-Wno-vla-cxx-extension",
     ]
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
@@ -139,7 +142,6 @@ if IS_ROCM:
                 "-DUSE_PROF_API=1",
                 "-D__HIP_PLATFORM_HCC__=1",
                 "-D__HIP_PLATFORM_AMD__=1",
-                # "-DLEGACY_HIPBLAS_DIRECT",
                 "-U__HIP_NO_HALF_CONVERSIONS__",
                 "-U__HIP_NO_HALF_OPERATORS__",
         ]
