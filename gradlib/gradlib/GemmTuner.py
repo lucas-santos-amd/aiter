@@ -30,13 +30,13 @@ class Gemm:
         self.use_rocblas = (indtype == outdtype
                             and str(indtype) != 'torch.float8_e4m3fnuz')
         self.nb = CACHE_INVALIDATE_BUFFERS
-        self.inp = torch.randn((self.n, self.k),
+        self.inp = torch.randn((self.m, self.k),
                                device='cuda').to(self.indtype)
-        self.weights = torch.randn((self.m, self.k),
+        self.weights = torch.randn((self.n, self.k),
                                    device='cuda').to(self.indtype)
         # weights2 is used in measurement/warm iters to ensure
         # HBM fetch for weight tensors
-        self.weights2 = torch.randn((self.nb, self.m, self.k),
+        self.weights2 = torch.randn((self.nb, self.n, self.k),
                                     device='cuda').to(self.indtype)
         self.blob = torch.ones(128 * 1024 * 1024,
                                dtype=torch.float32,
@@ -224,7 +224,7 @@ class Gemm:
     def find_fastest_solution(self):
         if self.use_rocblas:
             self.find_rocblas_sols()
-        if not (self.rocblas_decode and self.n == 1):
+        if not (self.rocblas_decode and self.m == 1):
             self.find_hipblas_sols()
         self.warmup()
         self.rocb_time_all_sols(fast_mode=1)
