@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-11 18:48:26
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-11-13 23:18:25
+# @Last Modified At: 2024-11-14 16:33:11
 # @Description: This is description.
 
 import warnings
@@ -15,7 +15,7 @@ import sys
 import shutil
 
 from setuptools import setup, find_packages
-
+from packaging.version import parse, Version
 
 import torch
 from torch.utils.cpp_extension import (
@@ -46,6 +46,10 @@ else:
         IS_ROCM = True
 
 FORCE_CXX11_ABI = False
+
+
+def get_hip_version():
+    return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
 
 
 def rename_cpp_to_cu(pths):
@@ -98,6 +102,12 @@ if IS_ROCM:
     assert os.path.exists(
         ck_dir), f'CK is needed by ater, please make sure clone by "git clone --recursive https://github.com/ROCm/ater.git" or "git submodule sync ; git submodule update --init --recursive"'
     generator_flag.append("-DFIND_CK")
+
+    if os.path.exists(f'{bd_dir}/ck'):
+        shutil.rmtree(f'{bd_dir}/ck')
+    shutil.copytree(ck_dir, f'{bd_dir}/ck')
+
+    ck_dir = f'{bd_dir}/ck'
     os.system(
         f'{sys.executable} {ck_dir}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {blob_dir}')
 
@@ -107,17 +117,19 @@ if IS_ROCM:
     validate_and_update_archs(archs)
 
     cc_flag = [f"--offload-arch={arch}" for arch in archs]
+    hip_version = get_hip_version()
     cc_flag += [
-        "-mllvm", "--lsr-drop-solution=1",
         "-mllvm", "-enable-post-misched=0",
-        # "-mllvm", "-amdgpu-coerce-illegal-types=1",
         "-mllvm", "-amdgpu-early-inline-all=true",
         "-mllvm", "-amdgpu-function-calls=false",
         "-mllvm", "--amdgpu-kernarg-preload-count=16",
         "-Wno-unused-result",
         "-Wno-switch-bool",
         "-Wno-vla-cxx-extension",
+        "-Wno-undefined-func-template",
     ]
+    if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
+        cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
