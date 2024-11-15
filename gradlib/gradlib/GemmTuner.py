@@ -24,7 +24,7 @@ class Gemm:
         self.m = m
         self.k = k
         self.n = n
-        self.bias = torch.randn(m, device='cuda').to(indtype) if bias else None
+        self.bias = torch.randn(n, device='cuda').to(indtype) if bias else None
         self.indtype = indtype
         self.outdtype = outdtype
         self.use_rocblas = (indtype == outdtype
