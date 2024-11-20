@@ -118,9 +118,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("layernorm2d_fwd_with_dynamicquant", &layernorm2d_with_dynamicquant);
       m.def("layernorm2d_fwd_with_add_dynamicquant", &layernorm2d_with_add_dynamicquant);
       m.def("smoothquant_fwd", &smoothquant_fwd);
+      m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
       // ck staff end
 #endif
 
       m.def("fmoe", &fmoe);
+      m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0);
       m.def("moe_sorting", &moe_sorting_fwd);
 }

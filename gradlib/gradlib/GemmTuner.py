@@ -2,14 +2,14 @@ import os
 import random
 from pathlib import Path
 
-import hipbsolidxgemm
+import ater
 import pandas as pd
-import rocsolidxgemm
+import ater
 import torch
 import torch.nn.functional as F
 
-rocsolidxgemm.rocb_create_extension()
-hipbsolidxgemm.hipb_create_extension()
+ater.rocb_create_extension()
+ater.hipb_create_extension()
 
 rtol = 1e-5
 atol = 1
@@ -54,7 +54,7 @@ class Gemm:
         self.rocblas_decode = rocblas_decode
 
     def find_hipblas_sols(self):
-        sols = hipbsolidxgemm.hipb_findallsols(self.inp,
+        sols = ater.hipb_findallsols(self.inp,
                                                self.weights.t(),
                                                bias=self.bias,
                                                out_dtype=self.outdtype)
@@ -83,13 +83,13 @@ class Gemm:
         else:
             ref = F.linear(self.inp, self.weights, self.bias)
         if libtype == 'hipblaslt':
-            c = hipbsolidxgemm.hipb_mm(self.inp,
+            c = ater.hipb_mm(self.inp,
                                        self.weights.t(),
                                        solidx,
                                        bias=self.bias,
                                        out_dtype=self.outdtype)
         elif libtype == 'rocblas':
-            c = rocsolidxgemm.rocb_mm(self.inp, self.weights.t(), solidx)
+            c = ater.rocb_mm(self.inp, self.weights.t(), solidx)
             if self.bias is not None:
                 c += self.bias
         if torch.allclose(c.to(self.outdtype),
@@ -111,13 +111,13 @@ class Gemm:
     def hipb_time_sol(self, solidx, cold_iters=2, warm_iters=10):
         #print('>>>hipbtime',solidx)
         for i in range(cold_iters):
-            hipbsolidxgemm.hipb_mm(self.inp,
+            ater.hipb_mm(self.inp,
                                    self.weights.t(),
                                    solidx,
                                    out_dtype=self.outdtype)
         self.start.record()
         for i in range(warm_iters):
-            hipbsolidxgemm.hipb_mm(self.inp,
+            ater.hipb_mm(self.inp,
                                    self.weights2[random.randint(
                                        0, self.nb - 1)].t(),
                                    solidx,
@@ -152,10 +152,10 @@ class Gemm:
     def rocb_time_sol(self, solidx, cold_iters=2, warm_iters=10):
 
         def rocb_mm_bias(inp, w, solidx, bias):
-            return rocsolidxgemm.rocb_mm(inp, w, solidx) + bias
+            return ater.rocb_mm(inp, w, solidx) + bias
 
         def rocb_mm_nobias(inp, w, solidx, _):
-            return rocsolidxgemm.rocb_mm(inp, w, solidx)
+            return ater.rocb_mm(inp, w, solidx)
 
         rocb_fun = rocb_mm_bias if self.bias is not None else rocb_mm_nobias
         for _ in range(cold_iters):
@@ -174,7 +174,7 @@ class Gemm:
         return gtime
 
     def find_rocblas_sols(self):
-        sols = rocsolidxgemm.rocb_findallsols(self.inp, self.weights.t())
+        sols = ater.rocb_findallsols(self.inp, self.weights.t())
         print('M N K dtype',
               self.m,
               self.n,

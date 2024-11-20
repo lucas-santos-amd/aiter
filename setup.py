@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-11 18:48:26
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-11-14 16:33:11
+# @Last Modified At: 2024-11-20 16:22:11
 # @Description: This is description.
 
 import warnings
@@ -30,7 +30,7 @@ from torch.utils.cpp_extension import (
 this_dir = os.path.dirname(os.path.abspath(__file__))
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 bd_dir = f"{this_dir}/build"
-blob_dir = f"{this_dir}/blob"
+blob_dir = f"{bd_dir}/blob"
 PACKAGE_NAME = 'ater'
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
@@ -95,7 +95,7 @@ if IS_ROCM:
 
     # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
     # See https://github.com/pytorch/pytorch/pull/70650
-    generator_flag = [f'-DFMOE_HSACO="{this_dir}/hsa/fmoe.co"']
+    generator_flag = [f'-DFMOE_HSACO="{this_dir}/hsa/"']
     torch_dir = torch.__path__[0]
     if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
         generator_flag.append("-DOLD_GENERATOR_PATH")
@@ -103,9 +103,7 @@ if IS_ROCM:
         ck_dir), f'CK is needed by ater, please make sure clone by "git clone --recursive https://github.com/ROCm/ater.git" or "git submodule sync ; git submodule update --init --recursive"'
     generator_flag.append("-DFIND_CK")
 
-    if os.path.exists(f'{bd_dir}/ck'):
-        shutil.rmtree(f'{bd_dir}/ck')
-    shutil.copytree(ck_dir, f'{bd_dir}/ck')
+    shutil.copytree(ck_dir, f'{bd_dir}/ck', dirs_exist_ok=True)
 
     ck_dir = f'{bd_dir}/ck'
     os.system(
@@ -123,13 +121,12 @@ if IS_ROCM:
         "-mllvm", "-amdgpu-early-inline-all=true",
         "-mllvm", "-amdgpu-function-calls=false",
         "-mllvm", "--amdgpu-kernarg-preload-count=16",
+        "-mllvm", "-amdgpu-coerce-illegal-types=1",
         "-Wno-unused-result",
         "-Wno-switch-bool",
         "-Wno-vla-cxx-extension",
         "-Wno-undefined-func-template",
     ]
-    if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
-        cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -143,10 +140,12 @@ if IS_ROCM:
             f"{blob_dir}",
             f"{ck_dir}/example/ck_tile/12_smoothquant/instances/",
             f"{ck_dir}/example/ck_tile/13_moe_sorting/",
+            f"{ck_dir}/example/ck_tile/14_moe_smoothquant/instances/",
         ])
     if int(os.environ.get("USE_CK_A8W8", 0)) == 1:
         generator_flag.append("-DUSE_CK_A8W8")
-        renamed_ck_srcs += rename_cpp_to_cu([f"{this_dir}/csrc/ck_gemm_a8w8", f"{this_dir}/csrc/ck_gemm_a8w8/impl"])
+        renamed_ck_srcs += rename_cpp_to_cu(
+            [f"{this_dir}/csrc/ck_gemm_a8w8", f"{this_dir}/csrc/ck_gemm_a8w8/impl"])
     extra_compile_args = {
         "cxx": ["-O3", "-std=c++17"] + generator_flag,
         "nvcc":
@@ -169,6 +168,7 @@ if IS_ROCM:
         f"{ck_dir}/example/ck_tile/02_layernorm2d",
         f"{ck_dir}/example/ck_tile/12_smoothquant",
         f"{ck_dir}/example/ck_tile/13_moe_sorting",
+        f"{ck_dir}/example/ck_tile/14_moe_smoothquant",
     ]
 
     ext_modules.append(
@@ -185,7 +185,7 @@ if IS_ROCM:
     include_dirs = []
     ext_modules.append(
         CUDAExtension(
-            name='rocsolidxgemm',
+            name='rocsolidxgemm_',
             sources=[f'{bd_dir}/rocsolgemm.cu'],
             include_dirs=include_dirs,
             # add additional libraries argument for hipblaslt
@@ -205,7 +205,7 @@ if IS_ROCM:
             }))
     ext_modules.append(
         CUDAExtension(
-            name='hipbsolidxgemm',
+            name='hipbsolidxgemm_',
             sources=[f'{bd_dir}/hipbsolgemm.cu'],
             include_dirs=include_dirs,
             # add additional libraries argument for hipblaslt

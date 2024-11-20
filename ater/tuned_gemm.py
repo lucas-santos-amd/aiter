@@ -4,8 +4,8 @@ import functools
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from hipbsolidxgemm import hipb_create_extension, hipb_mm
-from rocsolidxgemm import rocb_create_extension, rocb_mm
+from ater import hipb_create_extension, hipb_mm
+from ater import rocb_create_extension, rocb_mm
 from ater import logger
 
 this_dir = os.path.dirname(os.path.abspath(__file__))

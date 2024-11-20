@@ -7,6 +7,6 @@ shapes will be captured in ater/configs/untuned_gemm.csv
 
 2. to tune gemms in ater/configs/untuned_gemm.csv,
 run 
-    python gradlib/gradlib/gemm_tuner.py --tuned_file ater/configs/tuned_gemm.csv  --input_file ater/configs/untuned_gemm.csv
+    python3 gradlib/gradlib/gemm_tuner.py --tuned_file ater/configs/tuned_gemm.csv  --input_file ater/configs/untuned_gemm.csv
 
 3. then run your test as normal~

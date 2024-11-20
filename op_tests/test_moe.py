@@ -6,9 +6,9 @@ import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 from test_common import checkAllclose, perftest
-from ater.fused_moe_bf16_asm import asm_moe, moe_sorting_ck
+from ater.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck
 from ater.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
-
+from test_smoothquant import pertoken_quant
 
 BLOCK_SIZE_M = 32
 
@@ -39,7 +39,7 @@ def moe_sorting_vllm(topk_ids: torch.Tensor,
                                       dtype=torch.int32,
                                       device=topk_ids.device)
     ater.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
-                                     expert_ids, token_nums, num_tokens_post_pad)
+                              expert_ids, token_nums, num_tokens_post_pad)
     return sorted_ids, expert_ids, token_nums, num_tokens_post_pad
 
 
@@ -48,11 +48,11 @@ def moe_sorting_ck_test(topk_ids, topk_weights, num_experts, model_dim, moebuf_d
     return moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype)
 
 
-def test_moe_sort(dtype, token, model_dim, hidden_dim, E, topk):
-    dim = (token, model_dim, hidden_dim)
+def test_moe_sort(dtype, token, model_dim, inter_dim, E, topk):
+    dim = (token, model_dim, inter_dim)
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
-    w1 = torch.randn((E, hidden_dim, model_dim), dtype=dtype, device="cuda")
-    w2 = torch.randn((E, model_dim, hidden_dim), dtype=dtype, device="cuda")
+    w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype, device="cuda")
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device="cuda")
     score = torch.randn((token, E), device="cuda", dtype=dtype)
 
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
@@ -87,7 +87,7 @@ def test_moe_sort(dtype, token, model_dim, hidden_dim, E, topk):
     # print(f'{moe_buf.max()=}')
 
     print(
-        f"[perf] {token=}, {model_dim=}, {hidden_dim=}, {E=}, {topk=}, dtype: {dtype}, torch avg: {avg_a:.2f} us, ck avg: {avg_b:.2f} us, uplift: {avg_a/avg_b-1:.1%}")
+        f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch avg: {avg_a:.2f} us, ck avg: {avg_b:.2f} us, uplift: {avg_a/avg_b-1:.1%}")
     if num_tokens_post_padded_a[0] != num_tokens_post_padded_b[0]:
         print("[F!!!]")
         return
@@ -136,40 +136,33 @@ def permute_weight_b(x: torch.Tensor) -> torch.Tensor:
 
 
 @perftest()
-def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids):
-    B, D = hidden_states.shape
-    topk = topk_weight.shape[1]
-    hidden_states = hidden_states.view(
-        B, -1, D).repeat(1, topk, 1).reshape(-1, D)
-    out = torch.zeros(
-        B * topk,
-        w2.shape[1],
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
-
-    topk_weight = topk_weight.view(-1)
-    topk_ids = topk_ids.view(-1)
-    for i in range(w1.shape[0]):
-        mask = topk_ids == i
-        if mask.sum():
-            silu_input = hidden_states[mask] @ (w1[i].transpose(0, 1))
-            d = silu_input.shape[-1] // 2
-            silu_output_shape = silu_input.shape[:-1] + (d,)
-            silu_out = torch.empty(
-                silu_output_shape, dtype=silu_input.dtype, device=silu_input.device
-            )
-            silu_out = F.gelu(silu_input)
-            out[mask] = silu_out @ (w2[i].transpose(0, 1))
-    # out = out + 2.0
-    return (
-        out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
-    ).sum(dim=1)
+def torch_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
+                   # following for int8 quant
+                   fc1_scale=None,  # [expert, inter_dim, 1]
+                   fc2_scale=None,  # [expert, model_dim, 1]
+                   fc1_smooth_scale=None,  # [expert, 1, model_dim]
+                   fc2_smooth_scale=None,  # [expert, 1, inter_dim]
+                   ):
+    return torch_moe(hidden_states,
+                     w1,
+                     w2,
+                     topk_weight,
+                     topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
 
 
 @perftest()
-def asm_moe_test(hidden_states, w1, w2, topk_weight, topk_ids):
-    return asm_moe(hidden_states, w1, w2, topk_weight, topk_ids)
+def asm_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
+                 # following for int8 quant
+                 fc1_scale=None,  # [expert, inter_dim, 1]
+                 fc2_scale=None,  # [expert, model_dim, 1]
+                 fc1_smooth_scale=None,  # [expert, 1, model_dim]
+                 fc2_smooth_scale=None,  # [expert, 1, inter_dim]
+                 ):
+    return asm_moe(hidden_states,
+                   w1,
+                   w2,
+                   topk_weight,
+                   topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
 
 
 @perftest()
@@ -182,11 +175,10 @@ def vllm_moe(hidden_states, w1, w2, topk_weight, topk_ids):
                          inplace=False)
 
 
-def test_fmoe(dtype, token, model_dim, hidden_dim, E, topk):
-    dim = (token, model_dim, hidden_dim)
+def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant=False):
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
-    w1 = torch.randn((E, hidden_dim, model_dim), dtype=dtype, device="cuda")
-    w2 = torch.randn((E, model_dim, hidden_dim), dtype=dtype, device="cuda")
+    w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype, device="cuda")
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device="cuda")
     score = torch.randn((token, E), device="cuda", dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
@@ -195,34 +187,64 @@ def test_fmoe(dtype, token, model_dim, hidden_dim, E, topk):
     # w2a = permute_weight_a(w2)
     w1a = w1
     w2a = w2
-    ref1, avg_a = vllm_moe(input,
-                           w1a,
-                           w2a,
-                           topk_weights,
-                           topk_ids)
+    avg_a = 1
+    # ref1, avg_a = vllm_moe(input,
+    #                        w1a,
+    #                        w2a,
+    #                        topk_weights,
+    #                        topk_ids)
     # print(f'{ref1=}')
-    # ref2 implement
-    ref2, avg_c = torch_moe(input,
-                            w1,
-                            w2,
-                            topk_weights,
-                            topk_ids)
-    # print(f'{ref2=}')
 
-    # b implement
-    w1b = permute_weight_b(w1)
-    w2b = permute_weight_b(w2)
-    out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids)
+    if not quant:
+        # ref2 implement
+        ref2, avg_c = torch_moe_test(input,
+                                     w1,
+                                     w2,
+                                     topk_weights,
+                                     topk_ids)
+        # print(f'{ref2=}')
 
-    # print(f'{out_b=}')
-    msg = f"[perf] {token=}, {model_dim=}, {hidden_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_a:.2f} us, asm_avg: {avg_b:.2f} us,smtorch_k_avg: {avg_c:.2f} us, uplift: {avg_a/avg_b-1:.1%}"
+        # b implement
+        w1b = permute_weight_b(w1)
+        w2b = permute_weight_b(w2)
+        out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids)
+        # print(f'{out_b=}')
+    else:
+        w1, fc1_scale = pertoken_quant(w1, torch.float)
+        w2, fc2_scale = pertoken_quant(w2, torch.float)
+
+        sp1 = (E, inter_dim)
+        sp2 = (E, model_dim)
+        # [expert, 1, model_dim]
+        # fc1_smooth_scale = torch.randn(sp2, dtype=torch.float, device="cuda")
+        fc1_smooth_scale = torch.ones(sp2, dtype=torch.float, device="cuda")
+        # [expert, 1, inter_dim]
+        fc2_smooth_scale = torch.ones(sp1, dtype=torch.float, device="cuda")
+
+        # ref2 implement
+        ref2, avg_c = torch_moe_test(input,
+                                     w1,
+                                     w2,
+                                     topk_weights,
+                                     topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
+        print(f'{ref2=}')
+
+        # b implement
+        w1b = permute_weight_b(w1)
+        w2b = permute_weight_b(w2)
+        out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
+                                    fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
+        print(f'{out_b=}')
+
+    msg = f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_a:.2f} us, asm_avg: {avg_b:.2f} us,smtorch_k_avg: {avg_c:.2f} us, uplift: {avg_a/avg_b-1:.1%}"
     # checkAllclose(ref1, ref2, rtol=0.05, atol=20)
     checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
 
 
-print('test test_fmoe')
+print('test test_fmoe 16 bit')
 for dtype in [torch.float16, torch.bfloat16][1:]:
-    for m in [1, 2, 4, 8, 16, 26, 32, 64, 128, 160, 192, 224, 256]:
+    for m in [1, 2, 4, 8, 16, 26, 32, 64, 128, 160, 192, 224, 256][-5:-4]:
         for dim in [4096, 8192, 16384, 32768][1:1+1]:
-            for hdim in [1024, 2048, 3584, 4096, 8192, 16384, 32768][2:1+2]:
+            for hdim in [1024, 2048, 3584, 4096, 8192, 16384, 32768][0:1]:
                 test_fmoe(dtype, m, dim, hdim, 32, 5)
+                # test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True)

@@ -4,14 +4,14 @@ import os
 from pathlib import Path
 
 import torch  # isort: split
-import hipbsolidxgemm
+import ater
 import pandas as pd
-import rocsolidxgemm
+import ater
 
 from GemmTuner import GemmTuner
 
-rocsolidxgemm.rocb_create_extension()
-hipbsolidxgemm.hipb_create_extension()
+ater.rocb_create_extension()
+ater.hipb_create_extension()
 
 
 def generate_mk_sets(model_dir, tp=1):

@@ -1,4 +1,6 @@
 from ater_ import *
+from hipbsolidxgemm_ import *
+from rocsolidxgemm_ import *
 import os
 import sys
 import logging
