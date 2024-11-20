@@ -47,6 +47,43 @@
   #define GCN_MFMA_INSTR1 __builtin_amdgcn_mfma_f32_16x16x4f32
   #define GCN_MFMA_INSTR __builtin_amdgcn_mfma_f32_4x4x4f16
 
+__device__
+uint16_t float_to_bf16_rta_asm(float f)
+{
+    union
+    {
+        float fp32;
+        struct
+        {
+            uint16_t lo;
+            uint16_t hi;
+        };
+    } u = {f};
+
+    const uint32_t low_nan = 0x7fff;
+    const uint32_t hi_nan  = 0x7fff0000;
+
+    using uint32x2_t = uint32_t __attribute__((ext_vector_type(2)));
+    uint32x2_t check_nan;
+
+#if 1
+    asm volatile("v_cmp_u_f32 %[s_cnan], %[v_x], %[v_x] \n"
+                 "v_add3_u32 %[v_x], %[v_x], %[v_blo], 1 \n"
+                 "v_cndmask_b32 %[v_x], %[v_x], %[v_bhi], %[s_cnan]"
+                 : [s_cnan] "+s"(check_nan), [v_x] "+v"(u.fp32)
+                 : [v_blo] "v"(low_nan), [v_bhi] "v"(hi_nan));
+#else
+    asm volatile(" \n"
+                 " \n"
+                 ""
+                 : [s_cnan] "+s"(check_nan), [v_x] "+v"(u.fp32)
+                 : [v_blo] "v"(low_nan), [v_bhi] "v"(hi_nan));
+#endif
+    // Note: in above code snipet, we use hi 16 bit
+    return u.hi;
+}
+
+
 using floatx4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 using float16x4 =
     __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
@@ -126,6 +163,7 @@ __device__ __forceinline__ T from_float(const float& inp) {
     return (_Float16)inp;
   } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
     return __float2bfloat16(inp);
+    // return __builtin_bit_cast(T, float_to_bf16_rta_asm(inp));
   } else {
     static_assert(false, "unsupported 16b dtype");
   }
@@ -149,7 +187,8 @@ __device__ __forceinline__ _B16x4 from_floatx4(const floatx4& inp) {
   } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
   #pragma unroll
     for (int i = 0; i < 4; i++) {
-      t16.b = __float2bfloat16(inp[i]);
+      // t16.b = __float2bfloat16(inp[i]);
+       t16.b = __builtin_bit_cast(T, float_to_bf16_rta_asm(inp[i]));
       ret[i] = t16.u;
     }
     return ret;
