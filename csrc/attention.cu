@@ -83,6 +83,12 @@ uint16_t float_to_bf16_rta_asm(float f)
     return u.hi;
 }
 
+__device__
+void max3_inplace(float& acc, float v0, float v1) {
+  asm volatile("v_max3_f32 %0, %0, %1, %2"
+                                 : "+v"(acc)
+                                 : "v"(v0), "v"(v1));
+}
 
 using floatx4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 using float16x4 =
@@ -408,7 +414,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
         Klocalb8[d] = *reinterpret_cast<const _B8x8*>(k_ptr3);
       }
     }
-
+#if 0
     float alibi_slope[QHLOOP];
     if (alibi_slopes != nullptr) {
   #pragma unroll
@@ -419,6 +425,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
                              : 0.f;
       }
     }
+#endif
 
     // fetch vphysical block numbers up front
     if constexpr (GQA_RATIO >= 12) {
@@ -577,6 +584,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
     }
 
     const int lane4_token_idx = 4 * (global_token_idx >> 2);
+#if 0
     const int alibi_offset = lane4_token_idx - context_len + 1;
     if (alibi_slopes != nullptr) {
   #pragma unroll
@@ -587,6 +595,9 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
         }
       }
     }
+#endif
+
+  (void)alibi_slopes;
 
   #pragma unroll
     for (int h = 0; h < QHLOOP; h++) {
