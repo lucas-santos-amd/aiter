@@ -35,6 +35,20 @@ def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype)
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad, moe_buf
 
 
+def permute_weight_asm(x: torch.Tensor) -> torch.Tensor:
+    # Hardcode BLOCK_K and BLOCK_N
+    BK = 64//x.element_size()
+    BN = 16
+    x_ = x
+    x_ = x_.view(x.shape[0],
+                 x.shape[1]//BN, BN,
+                 x.shape[2]//BK, 4, BK//4)
+    x_ = x_.permute(0, 1, 3, 4, 2, 5)
+    x_ = x_.contiguous()
+    x_ = x_.view(x.shape[0], x.shape[1], x.shape[2])
+    return x_
+
+
 def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
             # following for int8 quant
             fc1_scale=None,  # [expert, inter_dim, 1]

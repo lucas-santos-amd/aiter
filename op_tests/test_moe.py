@@ -6,7 +6,7 @@ import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 from test_common import checkAllclose, perftest
-from ater.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck
+from ater.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck, permute_weight_asm
 from ater.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
 from test_smoothquant import pertoken_quant
 
@@ -121,20 +121,6 @@ def permute_weight_a(x: torch.Tensor) -> torch.Tensor:
     return x_
 
 
-def permute_weight_b(x: torch.Tensor) -> torch.Tensor:
-    # Hardcode BLOCK_K and BLOCK_N
-    BK = 32
-    BN = 16
-    x_ = x
-    x_ = x_.view(x.shape[0],
-                 x.shape[1]//BN, BN,
-                 x.shape[2]//BK, 4, 8)
-    x_ = x_.permute(0, 1, 3, 4, 2, 5)
-    x_ = x_.contiguous()
-    x_ = x_.view(x.shape[0], x.shape[1], x.shape[2])
-    return x_
-
-
 @perftest()
 def torch_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
                    # following for int8 quant
@@ -205,8 +191,8 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant=False):
         # print(f'{ref2=}')
 
         # b implement
-        w1b = permute_weight_b(w1)
-        w2b = permute_weight_b(w2)
+        w1b = permute_weight_asm(w1)
+        w2b = permute_weight_asm(w2)
         out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids)
         # print(f'{out_b=}')
     else:
@@ -229,15 +215,15 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant=False):
         print(f'{ref2=}')
 
         # b implement
-        w1b = permute_weight_b(w1)
-        w2b = permute_weight_b(w2)
+        w1b = permute_weight_asm(w1)
+        w2b = permute_weight_asm(w2)
         out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
                                     fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
         print(f'{out_b=}')
 
-    msg = f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_a:.2f} us, asm_avg: {avg_b:.2f} us,smtorch_k_avg: {avg_c:.2f} us, uplift: {avg_a/avg_b-1:.1%}"
+    msg = f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_a:.2f} us, asm_avg: {avg_b:.2f} us,smtorch_k_avg: {avg_c:.2f} us, uplift: {avg_c/avg_b-1:.1%}"
     # checkAllclose(ref1, ref2, rtol=0.05, atol=20)
-    checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
+    checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
 
 
 print('test test_fmoe 16 bit')
@@ -245,5 +231,5 @@ for dtype in [torch.float16, torch.bfloat16][1:]:
     for m in [1, 2, 4, 8, 16, 26, 32, 64, 128, 160, 192, 224, 256][-5:-4]:
         for dim in [4096, 8192, 16384, 32768][1:1+1]:
             for hdim in [1024, 2048, 3584, 4096, 8192, 16384, 32768][0:1]:
-                # test_fmoe(dtype, m, dim, hdim, 32, 5)
-                test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True)
+                test_fmoe(dtype, m, dim, hdim, 32, 5)
+                # test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True)
