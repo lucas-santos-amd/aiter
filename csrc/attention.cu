@@ -18,6 +18,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <hip/hip_bf16.h>
+#include <limits>
 #include "hip_compat.h"
 
 #include <algorithm>
@@ -322,7 +323,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
   #pragma unroll
   for (int h = 0; h < QHLOOP; h++) {
     dout[h] = {0};
-    qk_max[h] = -FLT_MAX;
+    qk_max[h] = -std::numeric_limits<float>::infinity(); // -FLT_MAX;
   }
 
   const int wg_start_head_idx = blockIdx.z * GQA_RATIO;
@@ -601,13 +602,20 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
 
   #pragma unroll
     for (int h = 0; h < QHLOOP; h++) {
-      qk_max[h] = -FLT_MAX;
+      // qk_max[h] = -std::numeric_limits<float>::infinity()
+      #pragma unroll
+      for (int i = 0; i < 4; i++) {
+        dout[h][i] = (lane4_token_idx + i < context_len) ? dout[h][i] : -std::numeric_limits<float>::infinity();
+      }
+#if 0
   #pragma unroll
       for (int i = 0; i < 4; i++) {
-        qk_max[h] = (lane4_token_idx + i < context_len)
-                        ? fmaxf(qk_max[h], dout[h][i])
-                        : qk_max[h];
+        qk_max[h] = fmaxf(qk_max[h], dout[h][i])
       }
+#else
+    max3_inplace(qk_max[h], dout[h][0], dout[h][1]);
+    max3_inplace(qk_max[h], dout[h][2], dout[h][3]);
+#endif
   #pragma unroll
       for (int mask = WARP_SIZE / 2; mask >= 4; mask /= 2) {
         qk_max[h] = fmaxf(qk_max[h], __shfl_xor(qk_max[h], mask));
@@ -620,9 +628,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
       exp_sum[h] = 0.0f;
   #pragma unroll
       for (int i = 0; i < 4; i++) {
-        dout[h][i] = (lane4_token_idx + i < context_len)
-                         ? __expf(dout[h][i] - qk_max[h])
-                         : 0.0f;
+        dout[h][i] = __expf(dout[h][i] - qk_max[h]);
         exp_sum[h] += dout[h][i];
       }
   #pragma unroll
@@ -872,11 +878,32 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     for (int i = 0; i < NPAR_LOOPS; i++) {
       reg_max_logit[i] = max_logits_ptr[valid_partition[i]];
     }
+#if 0
     float max_logit = reg_max_logit[0];
   #pragma unroll
     for (int i = 1; i < NPAR_LOOPS; i++) {
       max_logit = fmaxf(max_logit, reg_max_logit[i]);
     }
+#else
+    float max_logit = [&] () {
+      if constexpr (NPAR_LOOPS % 2 == 0) {
+        float max_logit_ = -std::numeric_limits<float>::infinity();
+    #pragma unroll
+        for (int i = 0; i < NPAR_LOOPS; i+=2) {
+          max3_inplace(max_logit_, reg_max_logit[i], reg_max_logit[i+1]);
+        }
+        return max_logit_;
+      }
+      else {
+        float max_logit_ = reg_max_logit[0];
+      #pragma unroll
+        for (int i = 1; i < NPAR_LOOPS; i++) {
+          max_logit_ = fmaxf(max_logit_, reg_max_logit[i]);
+        }
+        return max_logit_;
+      }
+    }();
+#endif
 
   #pragma unroll
     for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
