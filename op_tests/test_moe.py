@@ -216,10 +216,9 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant=False):
         sp1 = (E, inter_dim)
         sp2 = (E, model_dim)
         # [expert, 1, model_dim]
-        # fc1_smooth_scale = torch.randn(sp2, dtype=torch.float, device="cuda")
-        fc1_smooth_scale = torch.ones(sp2, dtype=torch.float, device="cuda")
+        fc1_smooth_scale = torch.randn(sp2, dtype=torch.float, device="cuda")
         # [expert, 1, inter_dim]
-        fc2_smooth_scale = torch.ones(sp1, dtype=torch.float, device="cuda")
+        fc2_smooth_scale = torch.randn(sp1, dtype=torch.float, device="cuda")
 
         # ref2 implement
         ref2, avg_c = torch_moe_test(input,
@@ -246,5 +245,5 @@ for dtype in [torch.float16, torch.bfloat16][1:]:
     for m in [1, 2, 4, 8, 16, 26, 32, 64, 128, 160, 192, 224, 256][-5:-4]:
         for dim in [4096, 8192, 16384, 32768][1:1+1]:
             for hdim in [1024, 2048, 3584, 4096, 8192, 16384, 32768][0:1]:
-                test_fmoe(dtype, m, dim, hdim, 32, 5)
-                # test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True)
+                # test_fmoe(dtype, m, dim, hdim, 32, 5)
+                test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True)

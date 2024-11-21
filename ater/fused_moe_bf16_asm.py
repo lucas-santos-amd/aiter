@@ -14,8 +14,7 @@ def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype)
     M, topk = topk_ids.shape
     topk = topk_ids.shape[1]
     max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
-    max_num_m_blocks = int(
-        (max_num_tokens_padded+block_size-1)//block_size)
+    max_num_m_blocks = int((max_num_tokens_padded+block_size-1)//block_size)
     sorted_ids = torch.empty((max_num_tokens_padded, ),
                              dtype=torch.int32,
                              device=device)

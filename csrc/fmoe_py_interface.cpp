@@ -111,7 +111,7 @@ public:
                        std::optional<torch::Tensor> w2_smooth_qnt = std::nullopt //
     )
     {
-        int token_cnt = input.size(0);
+        int token_cnt = out.size(0);
         int dim = input.size(1);
         int sub_X_cnt = sorted_expert_ids.size(0);
         int eprt = w1.size(0);
