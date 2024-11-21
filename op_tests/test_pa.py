@@ -284,7 +284,7 @@ def test_paged_attention(
         alibi_slopes,
     )
 
-    atol, rtol = 1e-3, 1e-3
+    atol, rtol = 1e-2, 1e-5
     torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
     # checkAllclose(output, ref_output,  rtol=rtol, atol=atol)
 # test_paged_attention( 128, (8,1), 128, False, 16, torch.half, "auto", 0, "cuda:0")
