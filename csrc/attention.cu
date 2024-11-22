@@ -169,8 +169,8 @@ __device__ __forceinline__ T from_float(const float& inp) {
   if constexpr (std::is_same<T, _Float16>::value) {
     return (_Float16)inp;
   } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
-    return __float2bfloat16(inp);
-    // return __builtin_bit_cast(T, float_to_bf16_rta_asm(inp));
+    // return __float2bfloat16(inp);
+    return __builtin_bit_cast(T, float_to_bf16_rta_asm(inp));
   } else {
     static_assert(false, "unsupported 16b dtype");
   }
@@ -950,10 +950,10 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
       head_idx * max_num_partitions * HEAD_SIZE + threadIdx.x;
   constexpr int MAX_NPAR = 64;
   scalar_t tmps[MAX_NPAR];
-  const float dzero = 0.0f;
+  const scalar_t dzero = 0.0f;
   #pragma unroll
   for (int j = 0; j < MAX_NPAR; j++) {
-    tmps[j] = from_float<scalar_t>(dzero);
+    tmps[j] = dzero;
   }
   const int last_partition_offset = (num_partitions - 1) * HEAD_SIZE;
   const int num_partition_offset = (num_partitions)*HEAD_SIZE;
