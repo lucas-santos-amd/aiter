@@ -76,7 +76,7 @@ def test_Smoothquant_instance(dtype, m, n, xscaleType):
     b, yscale_b, avg_b = run_ck(input, x_scale=xscale)
 
     print(
-        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:.2f} us, ck avg: {avg_b:.2f} us, uplift: {avg_a/avg_b-1:.1%}")
+        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
 

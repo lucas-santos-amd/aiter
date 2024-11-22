@@ -177,7 +177,7 @@ def test_layernorm2d_instance(dtype, m, n):
     a, avg_a, *_ = run_torch(input, weight, bias, 1e-5)
     b, avg_b, *_ = run_ck(input, weight, bias, 1e-5)
     print(
-        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:.2f} us, ck avg: {avg_b:.2f} us, uplift: {avg_a/avg_b-1:.1%}")
+        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
     checkAllclose(a, b)
     print(f"[passed~]")
 
@@ -192,7 +192,7 @@ def test_layernorm2d_fuseAdd_instance(dtype, m, n):
     b, avg_b, res_b, *_ = run_ck(input, weight, bias, 1e-5, residual=res)
 
     print(
-        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:.2f} us, ck avg: {avg_b:.2f} us, uplift: {avg_a/avg_b-1:.1%}")
+        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
     checkAllclose(a, b, rtol=1e-2, atol=1e-1)
     checkAllclose(res_a, res_b)
     print(f" [passed~]")
@@ -208,7 +208,7 @@ def test_layernorm2d_fuseSmoothquant_instance(dtype, m, n, xscaleType, yscaleTyp
     b, avg_b, _, yscale_b = run_ck(input, weight, bias, 1e-5, x_scale=xscale, y_scale_dtype=yscaleType)
 
     print(
-        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:.2f} us, ck avg: {avg_b:.2f} us, uplift: {avg_a/avg_b-1:.1%}")
+        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
     print(f" [passed~]")
@@ -224,7 +224,7 @@ def test_layernorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType, yscal
     b, avg_b, res_b, yscale_b = run_ck(input, weight, bias, 1e-5, residual=res, x_scale=xscale, y_scale_dtype=yscaleType)
 
     print(
-        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:.2f} us, ck avg: {avg_b:.2f} us, uplift: {avg_a/avg_b-1:.1%}")
+        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(res_a, res_b)
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
@@ -240,7 +240,7 @@ def test_layernorm2d_fuseDynamicquant_instance(dtype, m, n, yscaleType):
     b, avg_b, _, yscale_b = run_ck(input, weight, bias, 1e-5,  y_scale_dtype=yscaleType)
 
     print(
-        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:.2f} us, ck avg: {avg_b:.2f} us, uplift: {avg_a/avg_b-1:.1%}")
+        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(yscale_a, yscale_b)
     print(f" [passed~]")
@@ -255,7 +255,7 @@ def test_layernorm2d_fuseAdd_Dynamicquant_instance(dtype, m, n, yscaleType):
     b, avg_b, res_b, yscale_b = run_ck(input, weight, bias, 1e-5, residual=res, y_scale_dtype=yscaleType)
 
     print(
-        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:.2f} us, ck avg: {avg_b:.2f} us, uplift: {avg_a/avg_b-1:.1%}")
+        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(res_a, res_b)
     checkAllclose(yscale_a, yscale_b)

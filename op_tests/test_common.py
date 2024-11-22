@@ -6,14 +6,16 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-03 15:53:32
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-11-22 16:49:03
+# @Last Modified At: 2024-11-22 16:59:25
 # @Description: This is description.
 
 import torch
+import torch.profiler as tpf
+import os
 import numpy as np
 import pandas as pd
 from ater import logger
-import torch.profiler as tpf
+
 num_iters = 100
 num_warmup = 20
 
@@ -39,7 +41,6 @@ def perftest(name=None):
 
 
 def get_trace_perf(prof):
-    print(vars(prof.key_averages()))
     df = []
     for el in prof.key_averages():
         if 'ProfilerStep*' not in el.key:
@@ -54,11 +55,12 @@ def get_trace_perf(prof):
     df = df[(df.self_cpu_time_total > 0) | (df.self_device_time_total > 0)]
 
     timerList = ['self_cpu_time_total', 'self_device_time_total', ]
-    df = df[cols].sort_values(timerList)
+    df = df[cols].sort_values(timerList, ignore_index=True)
     avg_name = '[avg ms/iter]'
     for el in timerList:
         df.at[avg_name, el] = df[el].sum()/num_iters
-    logger.info(f'{df}')
+    if int(os.environ.get('ATER_LOG_MORE', 0)):
+        logger.info(f'{df}')
     return df.at[avg_name, 'self_device_time_total']
 
 

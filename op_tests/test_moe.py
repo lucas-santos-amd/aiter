@@ -87,7 +87,7 @@ def test_moe_sort(dtype, token, model_dim, inter_dim, E, topk):
     # print(f'{moe_buf.max()=}')
 
     print(
-        f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch avg: {avg_a:.2f} us, ck avg: {avg_b:.2f} us, uplift: {avg_a/avg_b-1:.1%}")
+        f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
     if num_tokens_post_padded_a[0] != num_tokens_post_padded_b[0]:
         print("[F!!!]")
         return
@@ -221,7 +221,7 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant=False):
                                     fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
         print(f'{out_b=}')
 
-    msg = f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_a:.2f} us, asm_avg: {avg_b:.2f} us,smtorch_k_avg: {avg_c:.2f} us, uplift: {avg_c/avg_b-1:.1%}"
+    msg = f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_a:<8.2f} us, asm_avg: {avg_b:<8.2f} us,smtorch_k_avg: {avg_c:.2f} us, uplift: {avg_c/avg_b-1:.1%}"
     # checkAllclose(ref1, ref2, rtol=0.05, atol=20)
     checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
 
