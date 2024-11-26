@@ -33,7 +33,7 @@ print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True,
     with_stack=True, with_modules=True, record_shapes = True) as prof:
     output = torch.empty_like(tensor2)
-    ater.transpose_add(output, tensor1, tensor2, tensor1.stride(0), tensor1.stride(2))
+    ater.transpose_add(output, tensor1, tensor2)
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
 print(result_con== output)
