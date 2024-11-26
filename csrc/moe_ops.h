@@ -94,3 +94,5 @@ void moe_sorting_fwd(torch::Tensor &topk_ids,              // [m, topk]
                      torch::Tensor &moe_buf,               // [max_num_tokens_padded]
                      int num_experts,
                      int unit_size);
+
+void transpose_add(torch::Tensor &out, torch::Tensor &input0, torch::Tensor &input1, int stride0, int stride2);
