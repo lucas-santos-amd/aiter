@@ -37,7 +37,7 @@ def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype)
 
 def permute_weight_asm(x: torch.Tensor) -> torch.Tensor:
     # Hardcode BLOCK_K and BLOCK_N
-    BK = 64//x.element_size()
+    BK = 64//x.element_size() # 32 for bf16/fp16, 64 for bf8/fb8/int8
     BN = 16
     x_ = x
     x_ = x_.view(x.shape[0],

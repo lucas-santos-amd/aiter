@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-03 15:53:32
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-11-22 16:59:25
+# @Last Modified At: 2024-11-27 11:27:28
 # @Description: This is description.
 
 import torch
@@ -20,14 +20,28 @@ num_iters = 100
 num_warmup = 20
 
 
-def perftest(name=None):
+def perftest():
     def decorator(func):
         def wrapper(*args, **kwargs):
+            if int(os.environ.get('ATER_LOG_MORE', 0)):
+                latencies = []
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                for _ in range(num_iters+num_warmup):
+                    start_event.record()
+                    data = func(*args, **kwargs)
+                    end_event.record()
+                    end_event.synchronize()
+                    latencies.append(start_event.elapsed_time(end_event))
+                avg = np.mean(latencies[num_warmup:]) * 1000
+                logger.info(f'avg: {avg} ms/iter from cuda.Event')
             with tpf.profile(activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                              profile_memory=True,
                              with_stack=True,
                              with_modules=True,
                              record_shapes=True,
+                             #  on_trace_ready=tpf.tensorboard_trace_handler(
+                             #      './ater_logs/'),
                              schedule=tpf.schedule(wait=1,
                                                    warmup=num_warmup,
                                                    active=num_iters),) as prof:
