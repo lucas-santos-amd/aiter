@@ -56,6 +56,9 @@ namespace vllm
     const uint64_t stride_n = N * sizeof(_T);
     const uint64_t stride_k = K * sizeof(_T);
     const uint64_t stride_nk = N * K * sizeof(_T);
+    const uint64_t stride_0 = stride0 * sizeof(_T);
+    const uint64_t stride_2 = stride2 * sizeof(_T);
+
 
     // Walk destination tiles continuously for cache coherency
     constexpr uint32_t XCD = 8;
@@ -83,13 +86,13 @@ namespace vllm
       // Make sure WG isn't too large
       static_assert(vmem_per_thread >= 1);
 
-      const uint8_t *pat = (const uint8_t *)a + tj * BIG_TILE_SIZE * stride2 + ti * row_bytes + m * stride0;
+      const uint8_t *pat = (const uint8_t *)a + tj * BIG_TILE_SIZE * stride_2 + ti * row_bytes + m * stride_0;
 #pragma unroll
       for (uint32_t t = 0; t < vmem_per_thread; t++)
       {
         uint32_t col = threadIdx.x % vmem_per_row;
         uint32_t row = threadIdx.x / vmem_per_row + t * rows_per_wg;
-        uint64_t offset = row * stride2 + col * sizeof(__uint128_t);
+        uint64_t offset = row * stride_2 + col * sizeof(__uint128_t);
         const __uint128_t *pfa = (const __uint128_t *)(pat + offset);
         BLOCK_16B d;
         d.ow = *pfa;
@@ -132,13 +135,13 @@ namespace vllm
       // Make sure WG isn't too large
       static_assert(vmem_per_thread >= 1);
 
-      const uint8_t *pat = (const uint8_t *)a + tj * BIG_TILE_SIZE * stride2 + ti * row_bytes + m * stride0;
+      const uint8_t *pat = (const uint8_t *)a + tj * BIG_TILE_SIZE * stride_2 + ti * row_bytes + m * stride_0;
 #pragma unroll
       for (uint32_t t = 0; t < vmem_per_thread; t++)
       {
         uint32_t col = threadIdx.x % vmem_per_row;
         uint32_t row = threadIdx.x / vmem_per_row + t * rows_per_wg;
-        uint64_t offset = (col < max_part_n && row < max_part_k) ? row * stride2 + col * 2 : 0;
+        uint64_t offset = (col < max_part_n && row < max_part_k) ? row * stride_2 + col * 2 : 0;
         const _T *pfa = (const _T *)(pat + offset);
         sa[row][col] = *pfa;
       }
@@ -166,7 +169,8 @@ namespace vllm
 void transpose_add(
     torch::Tensor &output,
     torch::Tensor &input0,
-    torch::Tensor &input1)
+    torch::Tensor &input1,
+    int stride0, int stride2)
 {
   int M = input0.size(0);
   int N = input0.size(1);
@@ -178,25 +182,6 @@ void transpose_add(
   EL_TYPE *buf_a = reinterpret_cast<EL_TYPE *>(input0.data_ptr());
   EL_TYPE *buf_b = reinterpret_cast<EL_TYPE *>(input1.data_ptr());
   EL_TYPE *buf_c = reinterpret_cast<EL_TYPE *>(output.data_ptr());
-
-  int stride0 = sizeof(EL_TYPE);
-  int stride2 = sizeof(EL_TYPE);
-
-  bool is_conti = input0.is_contiguous() != input1.is_contiguous();
-  bool is_conti_0 = is_conti && !input0.is_contiguous();
-  bool is_conti_1 = is_conti && !input1.is_contiguous();
-  if (is_conti_0)
-  {
-    stride0 *= input0.stride(0);
-    stride2 *= input0.stride(2);
-  }
-  else if (is_conti_1)
-  {
-    stride0 *= input1.stride(0);
-    stride2 *= input1.stride(2);
-    EL_TYPE *buf_a = reinterpret_cast<EL_TYPE *>(input1.data_ptr());
-    EL_TYPE *buf_b = reinterpret_cast<EL_TYPE *>(input0.data_ptr());
-  }
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   vllm::add_tn_big_tile_kernel<EL_TYPE, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);

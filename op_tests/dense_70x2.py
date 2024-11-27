@@ -12,11 +12,13 @@ def my_tensor_add(input, other):
         is_permute &= input.is_contiguous() != other.is_contiguous()
 
     if is_permute:
-        if other.is_contiguous():
+        output = torch.zeros(input.size(), dtype=torch.float16, device="cuda")
+        if other.is_contiguous() and not input.is_contiguous():
             output = torch.empty_like(other)
-        elif input.is_contiguous():
+            ater.transpose_add(output, input, other, input.stride(0), input.stride(2))
+        elif input.is_contiguous() and not other.is_contiguous():
             output = torch.empty_like(input)
-        ater.transpose_add(output, input, other)
+            ater.transpose_add(output, other, input, other.stride(0), other.stride(2))
     else:
         output = torch.add(input, other)
     return output
