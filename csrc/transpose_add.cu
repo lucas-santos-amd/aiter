@@ -22,32 +22,32 @@
 #include "hip_compat.h"
 #include "dispatch_utils.h"
 
-#ifdef USE_ROCM
-#include <hip/hip_bf16.h>
-typedef __hip_bfloat16 nv_bfloat16;
+#ifndef USE_ROCM
+#include <cub/util_type.cuh>
+#include <cub/cub.cuh>
 #else
-#include <cuda_bf16.h>
+#include <hipcub/util_type.hpp>
+#include <hipcub/hipcub.hpp>
 #endif
-#include <cuda_fp16.h>
 
 namespace vllm
 {
+#define EL_TYPE c10::Half
 #define BIG_TILE_SIZE 64
+// pad LDS row by dword
+#define LDS_PAD (4 / sizeof(EL_TYPE))
+  constexpr uint32_t element_size = sizeof(EL_TYPE); // in bytes
+  constexpr uint32_t elements_in_16B = 16 / element_size;
+
+  union BLOCK_16B
+  {
+    EL_TYPE e[elements_in_16B];
+    __uint128_t ow;
+  };
 
   template <class _T, int _WG>
   __global__ void add_tn_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K, int stride0, int stride2)
   {
-    // pad LDS row by dword
-    constexpr uint32_t LDS_PAD = 4 / sizeof(_T);
-    constexpr uint32_t element_size = sizeof(_T); // in bytes
-    constexpr uint32_t elements_in_16B = 16 / element_size;
-
-    union BLOCK_16B
-    {
-      _T e[elements_in_16B];
-      __uint128_t ow;
-    };
-
     // Round up processing to next full tile
     const uint32_t n_tiles = (N + BIG_TILE_SIZE - 1) / BIG_TILE_SIZE;
     const uint32_t k_tiles = (K + BIG_TILE_SIZE - 1) / BIG_TILE_SIZE;
@@ -138,7 +138,7 @@ namespace vllm
       {
         uint32_t col = threadIdx.x % vmem_per_row;
         uint32_t row = threadIdx.x / vmem_per_row + t * rows_per_wg;
-        uint64_t offset = (col < max_part_n && row < max_part_k) ? row * stride2 + col * sizeof(_T) : 0;
+        uint64_t offset = (col < max_part_n && row < max_part_k) ? row * stride2 + col * 2 : 0;
         const _T *pfa = (const _T *)(pat + offset);
         sa[row][col] = *pfa;
       }
@@ -153,7 +153,7 @@ namespace vllm
         uint32_t row = threadIdx.x / vmem_per_row + t * rows_per_wg;
         if (col < max_part_k && row < max_part_n)
         {
-          uint64_t offset = row * stride_k + col * sizeof(_T);
+          uint64_t offset = row * stride_k + col * 2;
           const _T *pfb = (const _T *)(pb + offset);
           _T *pfc = (_T *)(pc + offset);
           *pfc = sa[col][row] + *pfb;
@@ -175,12 +175,12 @@ void transpose_add(
   int big_tile_wg = M * ((N + BIG_TILE_SIZE - 1) / BIG_TILE_SIZE) * ((K + BIG_TILE_SIZE - 1) / BIG_TILE_SIZE);
   const dim3 grid_dim(big_tile_wg, 1, 1);
   const dim3 block_dim(256, 1, 1);
-  void *buf_a = reinterpret_cast<void *>(input0.data_ptr());
-  void *buf_b = reinterpret_cast<void *>(input1.data_ptr());
-  void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+  EL_TYPE *buf_a = reinterpret_cast<EL_TYPE *>(input0.data_ptr());
+  EL_TYPE *buf_b = reinterpret_cast<EL_TYPE *>(input1.data_ptr());
+  EL_TYPE *buf_c = reinterpret_cast<EL_TYPE *>(output.data_ptr());
 
-  int stride0 = 1;
-  int stride2 = 1;
+  int stride0 = sizeof(EL_TYPE);
+  int stride2 = sizeof(EL_TYPE);
 
   bool is_conti = input0.is_contiguous() != input1.is_contiguous();
   bool is_conti_0 = is_conti && !input0.is_contiguous();
@@ -194,38 +194,10 @@ void transpose_add(
   {
     stride0 *= input1.stride(0);
     stride2 *= input1.stride(2);
-    void *buf_a = reinterpret_cast<void *>(input1.data_ptr());
-    void *buf_b = reinterpret_cast<void *>(input0.data_ptr());
+    EL_TYPE *buf_a = reinterpret_cast<EL_TYPE *>(input1.data_ptr());
+    EL_TYPE *buf_b = reinterpret_cast<EL_TYPE *>(input0.data_ptr());
   }
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  switch (input0.scalar_type())
-  {
-  case at::ScalarType::Float:
-  {
-    stride0 *= sizeof(float);
-    stride2 *= sizeof(float);
-    vllm::add_tn_big_tile_kernel<float, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
-    break;
-  }
-  case at::ScalarType::Half:
-  {
-    stride0 *= sizeof(half);
-    stride2 *= sizeof(half);
-    vllm::add_tn_big_tile_kernel<half, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
-    break;
-  }
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-  case at::ScalarType::BFloat16:
-  {
-    stride0 *= sizeof(nv_bfloat16);
-    stride2 *= sizeof(nv_bfloat16);
-    vllm::add_tn_big_tile_kernel<nv_bfloat16, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
-    break;
-  }
-#endif
-  default:
-    throw std::runtime_error(
-        "custom allreduce only supports float32, float16 and bfloat16");
-  }
+  vllm::add_tn_big_tile_kernel<EL_TYPE, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
 }
