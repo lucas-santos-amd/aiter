@@ -125,5 +125,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("fmoe", &fmoe);
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0);
       m.def("moe_sorting", &moe_sorting_fwd);
-      m.def("transpose_add", &transpose_add, "apply for add with transpose.");
 }
