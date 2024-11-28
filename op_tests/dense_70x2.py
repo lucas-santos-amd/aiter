@@ -3,24 +3,10 @@ from torch import nn
 import ater
 # import rocmKernels
 
-def my_tensor_add(input, other):
-    is_permute = False
-    if input.dim() == 3:
-        is_permute = True
-        is_permute &= input.dim() == other.dim()
-        is_permute &= input.size() == other.size()
-        is_permute &= input.is_contiguous() != other.is_contiguous()
+torch.add = ater.transpose_add
 
-    if is_permute:
-        if other.is_contiguous():
-            output = torch.empty_like(other)
-        elif input.is_contiguous():
-            output = torch.empty_like(input)
-        ater.transpose_add(output, input, other)
-    else:
-        output = torch.add(input, other)
-    return output
-  
+def my_tensor_add(input, other):
+    return torch.add(input, other)  
 
 def benchmark_torch_function(iters: int, function, *args) -> float:
     function(*args)

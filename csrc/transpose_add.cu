@@ -21,6 +21,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "hip_compat.h"
 #include "dispatch_utils.h"
+#include <torch/torch.h>
 
 #ifdef USE_ROCM
 #include <hip/hip_bf16.h>
@@ -163,69 +164,86 @@ namespace vllm
   }
 }
 
-void transpose_add(
-    torch::Tensor &output,
-    torch::Tensor &input0,
-    torch::Tensor &input1)
+torch::Tensor transpose_add(torch::Tensor &input, torch::Tensor &other)
 {
-  int M = input0.size(0);
-  int N = input0.size(1);
-  int K = input0.size(2);
-
-  int big_tile_wg = M * ((N + BIG_TILE_SIZE - 1) / BIG_TILE_SIZE) * ((K + BIG_TILE_SIZE - 1) / BIG_TILE_SIZE);
-  const dim3 grid_dim(big_tile_wg, 1, 1);
-  const dim3 block_dim(256, 1, 1);
-  void *buf_a = reinterpret_cast<void *>(input0.data_ptr());
-  void *buf_b = reinterpret_cast<void *>(input1.data_ptr());
-  void *buf_c = reinterpret_cast<void *>(output.data_ptr());
-
-  int stride0 = 1;
-  int stride2 = 1;
-
-  bool is_conti = input0.is_contiguous() != input1.is_contiguous();
-  bool is_conti_0 = is_conti && !input0.is_contiguous();
-  bool is_conti_1 = is_conti && !input1.is_contiguous();
-  if (is_conti_0)
+  int dim = input.dim();
+  bool is_support = input.is_contiguous() != other.is_contiguous();
+  is_support &= input.dim() == other.dim();
+  is_support &= dim == 3;
+  if (dim == 3)
   {
-    stride0 *= input0.stride(0);
-    stride2 *= input0.stride(2);
-  }
-  else if (is_conti_1)
-  {
-    stride0 *= input1.stride(0);
-    stride2 *= input1.stride(2);
-    void *buf_a = reinterpret_cast<void *>(input1.data_ptr());
-    void *buf_b = reinterpret_cast<void *>(input0.data_ptr());
+    is_support &= input.size(0) == other.size(0);
+    is_support &= input.size(1) == other.size(1);
+    is_support &= input.size(2) == other.size(2);
   }
 
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  switch (input0.scalar_type())
+  if (is_support)
   {
-  case at::ScalarType::Float:
-  {
-    stride0 *= sizeof(float);
-    stride2 *= sizeof(float);
-    vllm::add_tn_big_tile_kernel<float, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
-    break;
-  }
-  case at::ScalarType::Half:
-  {
-    stride0 *= sizeof(half);
-    stride2 *= sizeof(half);
-    vllm::add_tn_big_tile_kernel<half, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
-    break;
-  }
+    int M = input.size(0);
+    int N = input.size(1);
+    int K = input.size(2);
+
+    int big_tile_wg = M * ((N + BIG_TILE_SIZE - 1) / BIG_TILE_SIZE) * ((K + BIG_TILE_SIZE - 1) / BIG_TILE_SIZE);
+    const dim3 grid_dim(big_tile_wg, 1, 1);
+    const dim3 block_dim(256, 1, 1);
+
+    auto options =
+        torch::TensorOptions().dtype(input.dtype()).device("cuda");
+    auto output =
+        torch::empty(input.sizes(), options);
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+    int stride0 = 1;
+    int stride2 = 1;
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+
+    if (!input.is_contiguous())
+    {
+      stride0 *= input.stride(0);
+      stride2 *= input.stride(2);
+    }
+    else if (!other.is_contiguous())
+    {
+      stride0 *= other.stride(0);
+      stride2 *= other.stride(2);
+      void *buf_a = reinterpret_cast<void *>(other.data_ptr());
+      void *buf_b = reinterpret_cast<void *>(input.data_ptr());
+    }
+
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    switch (input.scalar_type())
+    {
+    case at::ScalarType::Float:
+    {
+      stride0 *= sizeof(float);
+      stride2 *= sizeof(float);
+      vllm::add_tn_big_tile_kernel<float, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
+      break;
+    }
+    case at::ScalarType::Half:
+    {
+      stride0 *= sizeof(half);
+      stride2 *= sizeof(half);
+      vllm::add_tn_big_tile_kernel<half, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
+      break;
+    }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-  case at::ScalarType::BFloat16:
-  {
-    stride0 *= sizeof(nv_bfloat16);
-    stride2 *= sizeof(nv_bfloat16);
-    vllm::add_tn_big_tile_kernel<nv_bfloat16, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
-    break;
-  }
+    case at::ScalarType::BFloat16:
+    {
+      stride0 *= sizeof(nv_bfloat16);
+      stride2 *= sizeof(nv_bfloat16);
+      vllm::add_tn_big_tile_kernel<nv_bfloat16, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
+      break;
+    }
 #endif
-  default:
-    throw std::runtime_error(
-        "custom allreduce only supports float32, float16 and bfloat16");
+    default:
+      output = at::add(input, other);
+    }
+    return output;
+  }
+  else
+  {
+    return at::add(input, other);
   }
 }
