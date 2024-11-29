@@ -145,7 +145,7 @@ if IS_ROCM:
     if int(os.environ.get("USE_CK_A8W8", 0)) == 1:
         generator_flag.append("-DUSE_CK_A8W8")
         renamed_ck_srcs += rename_cpp_to_cu(
-            [f"{this_dir}/csrc/ck_gemm_a8w8", f"{this_dir}/csrc/ck_gemm_a8w8/impl"])
+            [f"{this_dir}/csrc/ck_gemm_a8w8", f"{this_dir}/csrc/ck_gemm_a8w8/impl", f"{this_dir}/csrc/ck_gemm_a8w8/instances"])
     extra_compile_args = {
         "cxx": ["-O3", "-std=c++17"] + generator_flag,
         "nvcc":
