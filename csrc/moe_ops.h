@@ -96,3 +96,6 @@ void moe_sorting_fwd(torch::Tensor &topk_ids,              // [m, topk]
                      int unit_size);
 
 torch::Tensor transpose_add(torch::Tensor &input0, torch::Tensor &input1);
+torch::Tensor transpose_mul(torch::Tensor &input0, torch::Tensor &input1);
+torch::Tensor transpose_sub(torch::Tensor &input0, torch::Tensor &input1);
+torch::Tensor transpose_div(torch::Tensor &input0, torch::Tensor &input1);

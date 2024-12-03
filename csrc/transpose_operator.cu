@@ -17,8 +17,125 @@ namespace vllm
 {
 #define BIG_TILE_SIZE 64
 
-  template <class _T, int _WG>
-  __global__ void add_tn_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K, int stride0, int stride2)
+  template <typename T, typename Operation>
+  __device__ T performOperation(T a, T b);
+
+  template <typename Operation>
+  torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other);
+
+  struct AddOp
+  {
+    template <typename T>
+    __device__ static T apply(T a, T b) { return a + b; }
+    static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
+    {
+      return torch::add(input, other);
+    }
+  };
+
+  struct SubOp
+  {
+    template <typename T>
+    __device__ static T apply(T a, T b)
+    {
+      return a - b;
+    }
+    static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
+    {
+      return torch::sub(input, other);
+    }
+  };
+
+  struct MulOp
+  {
+    template <typename T>
+    __device__ static T apply(T a, T b) { return a * b; }
+    static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
+    {
+      return torch::mul(input, other);
+    }
+  };
+
+  struct DivOp
+  {
+    template <typename T>
+    __device__ static T apply(T a, T b)
+    {
+      // assert(b == static_cast<T>(0));
+      return a / b;
+    }
+    static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
+    {
+      return torch::div(input, other);
+    }
+  };
+
+  template <typename T, typename Operation>
+  __device__ T performOperation(T a, T b, bool order_flag)
+  {
+    if constexpr (std::is_same_v<Operation, AddOp>)
+    {
+      return Operation::apply(a, b);
+    }
+    else if constexpr (std::is_same_v<Operation, SubOp>)
+    {
+      if (!order_flag)
+      {
+        return Operation::apply(b, a);
+      }
+      else
+      {
+        return Operation::apply(a, b);
+      }
+    }
+    else if constexpr (std::is_same_v<Operation, MulOp>)
+    {
+      return Operation::apply(a, b);
+    }
+    else if constexpr (std::is_same_v<Operation, DivOp>)
+    {
+      if (!order_flag)
+      {
+        return Operation::apply(b, a);
+      }
+      else
+      {
+        return Operation::apply(a, b);
+      }
+    }
+    else
+    {
+      static_assert(false, "Unsupported operation");
+    }
+  }
+
+  template <typename Operation>
+  torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other)
+  {
+    if constexpr (std::is_same_v<Operation, AddOp>)
+    {
+      return Operation::compute(input, other);
+    }
+    else if constexpr (std::is_same_v<Operation, SubOp>)
+    {
+      return Operation::compute(input, other);
+    }
+    else if constexpr (std::is_same_v<Operation, MulOp>)
+    {
+      return Operation::compute(input, other);
+    }
+    else if constexpr (std::is_same_v<Operation, DivOp>)
+    {
+      return Operation::compute(input, other);
+    }
+    else
+    {
+      static_assert(false, "Unsupported operation");
+    }
+  }
+
+  template <class _T, int _WG, typename Operation>
+  __global__ void add_tn_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K, int stride0, int stride2, bool order_flag)
   {
     // pad LDS row by dword
     constexpr uint32_t LDS_PAD = 4 / sizeof(_T);
@@ -99,7 +216,7 @@ namespace vllm
 #pragma unroll
         for (uint32_t i = 0; i < elements_in_16B; i++)
         {
-          d.e[i] += sa[col * elements_in_16B + i][row];
+          d.e[i] = performOperation<_T, Operation>(sa[col * elements_in_16B + i][row], d.e[i], order_flag);
         }
         __uint128_t *pfc = (__uint128_t *)(pc + offset);
         *pfc = d.ow;
@@ -139,32 +256,46 @@ namespace vllm
           uint64_t offset = row * stride_k + col * sizeof(_T);
           const _T *pfb = (const _T *)(pb + offset);
           _T *pfc = (_T *)(pc + offset);
-          *pfc = sa[col][row] + *pfb;
+          *pfc = performOperation<_T, Operation>(sa[col][row], *pfb, order_flag);
         }
       }
     }
   }
 }
 
-torch::Tensor transpose_add(torch::Tensor &input, torch::Tensor &other)
+template <typename Operation>
+torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
 {
   int dim = input.dim();
   bool is_support = input.is_contiguous() != other.is_contiguous();
   is_support &= input.dim() == other.dim();
-  is_support &= dim == 3;
-  if (dim == 3)
+  int M = 1, N = 1, K = 1;
+  if (is_support && dim == 3)
   {
+    // avoid broadcast
     is_support &= input.size(0) == other.size(0);
     is_support &= input.size(1) == other.size(1);
     is_support &= input.size(2) == other.size(2);
+    int stride1 = input.is_contiguous() ? other.stride(1) : input.stride(1);
+    is_support &= stride1 == 1;
+    M = input.size(0);
+    N = input.size(1);
+    K = input.size(2);
+  }
+
+  if (is_support && dim == 2)
+  {
+    is_support &= input.size(0) == other.size(0);
+    is_support &= input.size(1) == other.size(1);
+    int stride0 = input.is_contiguous() ? other.stride(0) : input.stride(0);
+    is_support &= stride0 == 1;
+    M = 1;
+    N = input.size(0);
+    K = input.size(1);
   }
 
   if (is_support)
   {
-    int M = input.size(0);
-    int N = input.size(1);
-    int K = input.size(2);
-
     int big_tile_wg = M * ((N + BIG_TILE_SIZE - 1) / BIG_TILE_SIZE) * ((K + BIG_TILE_SIZE - 1) / BIG_TILE_SIZE);
     const dim3 grid_dim(big_tile_wg, 1, 1);
     const dim3 block_dim(256, 1, 1);
@@ -180,17 +311,36 @@ torch::Tensor transpose_add(torch::Tensor &input, torch::Tensor &other)
     void *buf_a = reinterpret_cast<void *>(input.data_ptr());
     void *buf_b = reinterpret_cast<void *>(other.data_ptr());
 
+    bool order_flag = true;
+
     if (!input.is_contiguous())
     {
-      stride0 *= input.stride(0);
-      stride2 *= input.stride(2);
+      if (dim == 3)
+      {
+        stride0 *= input.stride(0);
+        stride2 *= input.stride(2);
+      }
+      else if (dim == 2)
+      {
+        stride0 *= input.stride(0);
+        stride2 *= input.stride(1);
+      }
     }
     else if (!other.is_contiguous())
     {
-      stride0 *= other.stride(0);
-      stride2 *= other.stride(2);
+      if (dim == 3)
+      {
+        stride0 *= other.stride(0);
+        stride2 *= other.stride(2);
+      }
+      else if (dim == 2)
+      {
+        stride0 *= other.stride(0);
+        stride2 *= other.stride(1);
+      }
       void *buf_a = reinterpret_cast<void *>(other.data_ptr());
       void *buf_b = reinterpret_cast<void *>(input.data_ptr());
+      order_flag = false;
     }
 
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -200,14 +350,14 @@ torch::Tensor transpose_add(torch::Tensor &input, torch::Tensor &other)
     {
       stride0 *= sizeof(float);
       stride2 *= sizeof(float);
-      vllm::add_tn_big_tile_kernel<float, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
+      vllm::add_tn_big_tile_kernel<float, 256, Operation><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2, order_flag);
       break;
     }
     case at::ScalarType::Half:
     {
       stride0 *= sizeof(half);
       stride2 *= sizeof(half);
-      vllm::add_tn_big_tile_kernel<half, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
+      vllm::add_tn_big_tile_kernel<half, 256, Operation><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2, order_flag);
       break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
@@ -215,17 +365,37 @@ torch::Tensor transpose_add(torch::Tensor &input, torch::Tensor &other)
     {
       stride0 *= sizeof(nv_bfloat16);
       stride2 *= sizeof(nv_bfloat16);
-      vllm::add_tn_big_tile_kernel<nv_bfloat16, 256><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2);
+      vllm::add_tn_big_tile_kernel<nv_bfloat16, 256, Operation><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2, order_flag);
       break;
     }
 #endif
     default:
-      output = at::add(input, other);
+      output = vllm::aten_compute<Operation>(input, other);
     }
     return output;
   }
   else
   {
-    return at::add(input, other);
+    return vllm::aten_compute<Operation>(input, other);
   }
+}
+
+torch::Tensor transpose_add(torch::Tensor &input, torch::Tensor &other)
+{
+  return transpose_operation<vllm::AddOp>(input, other);
+}
+
+torch::Tensor transpose_sub(torch::Tensor &input, torch::Tensor &other)
+{
+  return transpose_operation<vllm::SubOp>(input, other);
+}
+
+torch::Tensor transpose_mul(torch::Tensor &input, torch::Tensor &other)
+{
+  return transpose_operation<vllm::MulOp>(input, other);
+}
+
+torch::Tensor transpose_div(torch::Tensor &input, torch::Tensor &other)
+{
+  return transpose_operation<vllm::DivOp>(input, other);
 }
