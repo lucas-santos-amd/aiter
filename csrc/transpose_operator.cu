@@ -70,8 +70,8 @@ namespace vllm
     }
   };
 
-  template <typename T, typename Operation>
-  __device__ T performOperation(T a, T b, bool order_flag)
+  template <typename T, typename Operation, bool order_flag>
+  __device__ T performOperation(T a, T b)
   {
     if constexpr (std::is_same_v<Operation, AddOp>)
     {
@@ -79,7 +79,7 @@ namespace vllm
     }
     else if constexpr (std::is_same_v<Operation, SubOp>)
     {
-      if (!order_flag)
+      if constexpr (!order_flag)
       {
         return Operation::apply(b, a);
       }
@@ -94,7 +94,7 @@ namespace vllm
     }
     else if constexpr (std::is_same_v<Operation, DivOp>)
     {
-      if (!order_flag)
+      if constexpr (!order_flag)
       {
         return Operation::apply(b, a);
       }
@@ -134,8 +134,8 @@ namespace vllm
     }
   }
 
-  template <class _T, int _WG, typename Operation>
-  __global__ void add_tn_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K, int stride0, int stride2, bool order_flag)
+  template <class _T, int _WG, typename Operation, bool order_flag>
+  __global__ void add_tn_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K, int stride0, int stride2)
   {
     // pad LDS row by dword
     constexpr uint32_t LDS_PAD = 4 / sizeof(_T);
@@ -216,7 +216,7 @@ namespace vllm
 #pragma unroll
         for (uint32_t i = 0; i < elements_in_16B; i++)
         {
-          d.e[i] = performOperation<_T, Operation>(sa[col * elements_in_16B + i][row], d.e[i], order_flag);
+          d.e[i] = performOperation<_T, Operation, order_flag>(sa[col * elements_in_16B + i][row], d.e[i]);
         }
         __uint128_t *pfc = (__uint128_t *)(pc + offset);
         *pfc = d.ow;
@@ -256,7 +256,7 @@ namespace vllm
           uint64_t offset = row * stride_k + col * sizeof(_T);
           const _T *pfb = (const _T *)(pb + offset);
           _T *pfc = (_T *)(pc + offset);
-          *pfc = performOperation<_T, Operation>(sa[col][row], *pfb, order_flag);
+          *pfc = performOperation<_T, Operation, order_flag>(sa[col][row], *pfb);
         }
       }
     }
@@ -306,13 +306,12 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
         torch::empty(input.sizes(), options);
     void *buf_c = reinterpret_cast<void *>(output.data_ptr());
 
-    int stride0 = 1;
-    int stride2 = 1;
+    int stride0 = input.element_size();
+    int stride2 = input.element_size();
     void *buf_a = reinterpret_cast<void *>(input.data_ptr());
     void *buf_b = reinterpret_cast<void *>(other.data_ptr());
 
     bool order_flag = true;
-
     if (!input.is_contiguous())
     {
       if (dim == 3)
@@ -328,6 +327,7 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
     }
     else if (!other.is_contiguous())
     {
+      order_flag = false;
       if (dim == 3)
       {
         stride0 *= other.stride(0);
@@ -338,39 +338,22 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
         stride0 *= other.stride(0);
         stride2 *= other.stride(1);
       }
-      void *buf_a = reinterpret_cast<void *>(other.data_ptr());
-      void *buf_b = reinterpret_cast<void *>(input.data_ptr());
-      order_flag = false;
     }
 
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    switch (input.scalar_type())
+    if (order_flag)
     {
-    case at::ScalarType::Float:
-    {
-      stride0 *= sizeof(float);
-      stride2 *= sizeof(float);
-      vllm::add_tn_big_tile_kernel<float, 256, Operation><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2, order_flag);
-      break;
+      VLLM_DISPATCH_FLOATING_TYPES(
+          input.scalar_type(), "add_tn_big_tile_kernel", [&]
+          { vllm::add_tn_big_tile_kernel<scalar_t, 256, Operation, true>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2); });
     }
-    case at::ScalarType::Half:
+    else
     {
-      stride0 *= sizeof(half);
-      stride2 *= sizeof(half);
-      vllm::add_tn_big_tile_kernel<half, 256, Operation><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2, order_flag);
-      break;
-    }
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-    case at::ScalarType::BFloat16:
-    {
-      stride0 *= sizeof(nv_bfloat16);
-      stride2 *= sizeof(nv_bfloat16);
-      vllm::add_tn_big_tile_kernel<nv_bfloat16, 256, Operation><<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, N, K, stride0, stride2, order_flag);
-      break;
-    }
-#endif
-    default:
-      output = vllm::aten_compute<Operation>(input, other);
+      VLLM_DISPATCH_FLOATING_TYPES(
+          input.scalar_type(), "add_tn_big_tile_kernel", [&]
+          { vllm::add_tn_big_tile_kernel<scalar_t, 256, Operation, false>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, N, K, stride0, stride2); });
     }
     return output;
   }
