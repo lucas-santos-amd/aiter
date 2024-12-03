@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 15:58:57
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-03 13:40:12
+# @Last Modified At: 2024-12-03 14:16:28
 # @Description: This is description.
 
 import os
@@ -43,7 +43,7 @@ def validate_and_update_archs():
 
 
 def check_and_set_ninja_worker():
-    max_num_jobs_cores = max(1, os.cpu_count()*0.8)
+    max_num_jobs_cores = int(max(1, os.cpu_count()*0.8))
     if int(os.environ.get("MAX_JOBS", '1')) < max_num_jobs_cores:
         import psutil
         # calculate the maximum allowed NUM_JOBS based on free memory
@@ -54,7 +54,8 @@ def check_and_set_ninja_worker():
 
         # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
         max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
-        os.environ["MAX_JOBS"] = str(max_jobs)
+        max_jobs = str(max_jobs)
+        os.environ["MAX_JOBS"] = max_jobs
 
 
 def rename_cpp_to_cu(els, dst):
@@ -131,7 +132,7 @@ def compile_ops(
                 flags_cc += flags_extra_cc
                 flags_hip += flags_extra_hip
                 validate_and_update_archs()
-                # check_and_set_ninja_worker()
+                check_and_set_ninja_worker()
 
                 if blob_gen_cmd:
                     blob_dir = f"{op_dir}/blob"
