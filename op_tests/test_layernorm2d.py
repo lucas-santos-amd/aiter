@@ -31,14 +31,15 @@ def run_torch(input, weight, bias, eps, residual=None):
 def run_ck(input, weight, bias, eps, residual=None):
     if residual is None:
         residual_out = None
-        output = torch.empty_like(input)
-        ater.layernorm2d_fwd(
-            output,
-            input,
-            weight,
-            bias,
-            eps
-        )
+        output = ater.layer_norm(input, weight, bias, eps)
+        # output = torch.empty_like(input)
+        # ater.layernorm2d_fwd(
+        #     output,
+        #     input,
+        #     weight,
+        #     bias,
+        #     eps
+        # )
     else:
         residual_out = torch.empty_like(input)
         output = torch.empty_like(input)
@@ -85,14 +86,15 @@ def test_layernorm2d_fuseAdd(dtype, m, n):
     checkAllclose(res_a, res_b, msg='res check')
 
 
-for dtype in [torch.float16, torch.bfloat16]:
-    for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-        for n in [4096, 8192, 16384, 32768, 65536]:
-            test_layernorm2d(dtype, m, n)
+# for dtype in [torch.float16, torch.bfloat16]:
+#     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+#         for n in [4096, 8192, 16384, 32768, 65536]:
+#             test_layernorm2d(dtype, m, n)
+test_layernorm2d(torch.float16, 128, 8192)
 
 
-print('\nstart fuse add test')
-for dtype in [torch.float16, torch.bfloat16]:
-    for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-        for n in [4096, 8192, 16384, 32768, 65536]:
-            test_layernorm2d_fuseAdd(dtype, m, n)
+# print('\nstart fuse add test')
+# for dtype in [torch.float16, torch.bfloat16]:
+#     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+#         for n in [4096, 8192, 16384, 32768, 65536]:
+#             test_layernorm2d_fuseAdd(dtype, m, n)

@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-11 18:48:26
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-11-20 16:22:11
+# @Last Modified At: 2024-12-03 18:22:58
 # @Description: This is description.
 
 import warnings
@@ -241,7 +241,7 @@ class NinjaBuildExtension(BuildExtension):
             max_num_jobs_memory = int(free_memory_gb / 9)
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-            max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
+            max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
             os.environ["MAX_JOBS"] = str(max_jobs)
 
         super().__init__(*args, **kwargs)

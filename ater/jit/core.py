@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 15:58:57
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-03 14:16:28
+# @Last Modified At: 2024-12-03 18:34:05
 # @Description: This is description.
 
 import os
@@ -16,7 +16,8 @@ import time
 import importlib
 from typing import List, Optional
 from torch.utils import cpp_extension
-from ater import logger
+import logging
+logger = logging.getLogger("ater")
 
 PYTHON = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
