@@ -99,6 +99,10 @@ def compile_ops(
                 loadName = func.__name__
 
             try:
+                if importlib.util.find_spec('ater_') is not None:
+                    import ater_
+                    if hasattr(ater_, fc_name):
+                        return getattr(ater_, fc_name)(*args, **kwargs)
                 module = importlib.import_module(f'{__package__}.{md_name}')
             except Exception as e:
                 op_dir = f'{bd_dir}/{md_name}'

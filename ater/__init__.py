@@ -5,9 +5,6 @@ if importlib.util.find_spec('hipbsolidxgemm_') is not None:
     from hipbsolidxgemm_ import *
 if importlib.util.find_spec('rocsolidxgemm_') is not None: 
     from rocsolidxgemm_ import *
-# from ater_ import *
-# from hipbsolidxgemm_ import *
-# from rocsolidxgemm_ import *
 from .ops.norm import *
 from .ops.smoothquant import *
 from .ops.gemm_op_a8w8 import *

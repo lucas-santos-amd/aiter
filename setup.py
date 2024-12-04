@@ -170,15 +170,15 @@ if IS_ROCM:
         f"{ck_dir}/example/ck_tile/13_moe_sorting",
         f"{ck_dir}/example/ck_tile/14_moe_smoothquant",
     ]
-
-    ext_modules.append(
-        CUDAExtension(
-            name=PACKAGE_NAME+'_',
-            sources=renamed_sources+renamed_ck_srcs,
-            extra_compile_args=extra_compile_args,
-            include_dirs=include_dirs,
+    if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
+        ext_modules.append(
+            CUDAExtension(
+                name=PACKAGE_NAME+'_',
+                sources=renamed_sources+renamed_ck_srcs,
+                extra_compile_args=extra_compile_args,
+                include_dirs=include_dirs,
+            )
         )
-    )
 
     # ########## gradlib for tuned GEMM start here
     renamed_sources = rename_cpp_to_cu([f"{this_dir}/gradlib/csrc"])
