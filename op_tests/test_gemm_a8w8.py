@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import sys
 import os
-from ater import gemm_op_a8w8
+import ater
 
 
 @perftest()
@@ -19,7 +19,7 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
 
 @perftest()
 def run_gemm_b(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
-    return gemm_op_a8w8.gemm_a8w8_bias(x, weight, x_scale, w_scale, bias, dtype = dtype)
+    return ater.gemm_a8w8_bias(x, weight, x_scale, w_scale, bias, dtype = dtype)
 
 
 def test_gemm(dtype, m, n, k):
