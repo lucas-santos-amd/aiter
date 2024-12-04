@@ -4,23 +4,8 @@ import ater
 # import rocmKernels
 
 def my_tensor_add(input, other):
-    is_permute = False
-    if input.dim() == 3:
-        is_permute = True
-        is_permute &= input.dim() == other.dim()
-        is_permute &= input.size() == other.size()
-        is_permute &= input.is_contiguous() != other.is_contiguous()
-
-    if is_permute:
-        if other.is_contiguous():
-            output = torch.empty_like(other)
-        elif input.is_contiguous():
-            output = torch.empty_like(input)
-        ater.transpose_add(output, input, other)
-    else:
-        output = torch.add(input, other)
-    return output
-  
+    return ater.transpose_add(input, other)
+torch.add = my_tensor_add
 
 def benchmark_torch_function(iters: int, function, *args) -> float:
     function(*args)
@@ -672,22 +657,22 @@ class ExportedModule(nn.Module):
         getitem_4145 = linear[:, 4096:4608]
         linear = None
         _holder__attr_2 = self._attr_2
-        add_42 = my_tensor_add(input=getitem_3224, other=_holder__attr_2)
+        add_42 = torch.add(input=getitem_3224, other=_holder__attr_2)
         getitem_3224 = _holder__attr_2 = None
         _holder__attr_3 = self._attr_3
-        add_43 = my_tensor_add(input=getitem_3223, other=_holder__attr_3)
+        add_43 = torch.add(input=getitem_3223, other=_holder__attr_3)
         getitem_3223 = _holder__attr_3 = None
         _holder__attr_4 = self._attr_4
-        add_44 = my_tensor_add(input=getitem_3222, other=_holder__attr_4)
+        add_44 = torch.add(input=getitem_3222, other=_holder__attr_4)
         getitem_3222 = _holder__attr_4 = None
         _holder__attr_5 = self._attr_5
-        add_45 = my_tensor_add(input=getitem_3221, other=_holder__attr_5)
+        add_45 = torch.add(input=getitem_3221, other=_holder__attr_5)
         getitem_3221 = _holder__attr_5 = None
         _holder__attr_6 = self._attr_6
-        add_46 = my_tensor_add(input=getitem_3220, other=_holder__attr_6)
+        add_46 = torch.add(input=getitem_3220, other=_holder__attr_6)
         getitem_3220 = _holder__attr_6 = None
         _holder__attr_7 = self._attr_7
-        add_47 = my_tensor_add(input=getitem_3219, other=_holder__attr_7)
+        add_47 = torch.add(input=getitem_3219, other=_holder__attr_7)
         getitem_3219 = _holder__attr_7 = None
         clamp_37 = torch.clamp(input=getitem_3717, min=-1000.1, max=1000.1)
         getitem_3717 = None
@@ -2042,17 +2027,17 @@ class ExportedModule(nn.Module):
         contiguous_20 = getitem_4174 = getitem_3797 = getitem_3798 = None
         getitem_3739 = size_73[1:]
         size_73 = None
-        add_48 = my_tensor_add(input=reshape_361, other=repeat)
+        add_48 = torch.add(input=reshape_361, other=repeat)
         reshape_361 = repeat = None
-        add_49 = my_tensor_add(input=reshape_362, other=repeat_1)
+        add_49 = torch.add(input=reshape_362, other=repeat_1)
         reshape_362 = repeat_1 = None
-        add_50 = my_tensor_add(input=reshape_363, other=repeat_2)
+        add_50 = torch.add(input=reshape_363, other=repeat_2)
         reshape_363 = repeat_2 = None
-        add_51 = my_tensor_add(input=reshape_364, other=repeat_3)
+        add_51 = torch.add(input=reshape_364, other=repeat_3)
         reshape_364 = repeat_3 = None
-        add_52 = my_tensor_add(input=reshape_365, other=repeat_4)
+        add_52 = torch.add(input=reshape_365, other=repeat_4)
         reshape_365 = repeat_4 = None
-        add_53 = my_tensor_add(input=reshape_366, other=repeat_5)
+        add_53 = torch.add(input=reshape_366, other=repeat_5)
         reshape_366 = repeat_5 = None
         _holder__attr_188 = self._attr_188
         _holder__attr_189 = self._attr_189
@@ -2218,17 +2203,17 @@ class ExportedModule(nn.Module):
             input=gelu_11, weight=_holder__attr_226, bias=_holder__attr_227
         )
         gelu_11 = _holder__attr_226 = _holder__attr_227 = None
-        add_54 = my_tensor_add(input=add_48, other=linear_226)
+        add_54 = torch.add(input=add_48, other=linear_226)
         add_48 = linear_226 = None
-        add_55 = my_tensor_add(input=add_49, other=linear_227)
+        add_55 = torch.add(input=add_49, other=linear_227)
         add_49 = linear_227 = None
-        add_56 = my_tensor_add(input=add_50, other=linear_228)
+        add_56 = torch.add(input=add_50, other=linear_228)
         add_50 = linear_228 = None
-        add_57 = my_tensor_add(input=add_51, other=linear_229)
+        add_57 = torch.add(input=add_51, other=linear_229)
         add_51 = linear_229 = None
-        add_58 = my_tensor_add(input=add_52, other=linear_230)
+        add_58 = torch.add(input=add_52, other=linear_230)
         add_52 = linear_230 = None
-        add_59 = my_tensor_add(input=add_53, other=linear_231)
+        add_59 = torch.add(input=add_53, other=linear_231)
         add_53 = linear_231 = None
         permute = add_54.permute([1, 0, 2])
         add_54 = None
@@ -2266,7 +2251,7 @@ class ExportedModule(nn.Module):
         matmul_17 = torch.matmul(input=clamp_59, other=_holder__attr_228)
         clamp_59 = _holder__attr_228 = None
         _holder__attr_229 = self._attr_229
-        add_60 = my_tensor_add(input=_holder__attr_229, other=matmul_17)
+        add_60 = torch.add(input=_holder__attr_229, other=matmul_17)
         _holder__attr_229 = matmul_17 = None
         permute_105 = add_60.permute([1, 0, 2])
         add_60 = None
@@ -2491,7 +2476,7 @@ class ExportedModule(nn.Module):
         linear_237 = _holder__attr_246 = _holder__attr_247 = None
         mul_72 = torch.mul(input=layer_norm_155, other=linear_238)
         linear_238 = None
-        add_61 = my_tensor_add(input=layer_norm_155, other=mul_72)
+        add_61 = torch.add(input=layer_norm_155, other=mul_72)
         layer_norm_155 = mul_72 = None
         _holder__attr_248 = self._attr_248
         _holder__attr_249 = self._attr_249
@@ -2539,7 +2524,7 @@ class ExportedModule(nn.Module):
             input=mul_74, weight=_holder__attr_256, bias=_holder__attr_257
         )
         mul_74 = _holder__attr_256 = _holder__attr_257 = None
-        add_62 = my_tensor_add(input=mul_73, other=linear_241)
+        add_62 = torch.add(input=mul_73, other=linear_241)
         mul_73 = linear_241 = None
         _holder__attr_258 = self._attr_258
         _holder__attr_259 = self._attr_259
@@ -2568,7 +2553,7 @@ class ExportedModule(nn.Module):
             shape=[-1, 64, 160],
         )
         cat_27 = None
-        add_63 = my_tensor_add(input=permute_78, other=reshape_659)
+        add_63 = torch.add(input=permute_78, other=reshape_659)
         permute_78 = reshape_659 = None
         size_123 = add_63.size()
         getitem_4098 = size_123[2:]
@@ -2698,7 +2683,7 @@ class ExportedModule(nn.Module):
         linear_247 = _holder__attr_280 = _holder__attr_281 = None
         mul_78 = torch.mul(input=layer_norm_162, other=linear_248)
         linear_248 = None
-        add_64 = my_tensor_add(input=layer_norm_162, other=mul_78)
+        add_64 = torch.add(input=layer_norm_162, other=mul_78)
         layer_norm_162 = mul_78 = None
         _holder__attr_282 = self._attr_282
         _holder__attr_283 = self._attr_283
@@ -2746,7 +2731,7 @@ class ExportedModule(nn.Module):
             input=mul_80, weight=_holder__attr_290, bias=_holder__attr_291
         )
         mul_80 = _holder__attr_290 = _holder__attr_291 = None
-        add_65 = my_tensor_add(input=mul_79, other=linear_251)
+        add_65 = torch.add(input=mul_79, other=linear_251)
         mul_79 = linear_251 = None
         _holder__attr_292 = self._attr_292
         _holder__attr_293 = self._attr_293
@@ -2775,7 +2760,7 @@ class ExportedModule(nn.Module):
             shape=[-1, 64, 160],
         )
         cat_30 = None
-        add_66 = my_tensor_add(input=getitem_4101, other=reshape_663)
+        add_66 = torch.add(input=getitem_4101, other=reshape_663)
         getitem_4101 = reshape_663 = None
         size_126 = add_66.size()
         getitem_4104 = size_126[2:]
@@ -2905,7 +2890,7 @@ class ExportedModule(nn.Module):
         linear_257 = _holder__attr_314 = _holder__attr_315 = None
         mul_84 = torch.mul(input=layer_norm_169, other=linear_258)
         linear_258 = None
-        add_67 = my_tensor_add(input=layer_norm_169, other=mul_84)
+        add_67 = torch.add(input=layer_norm_169, other=mul_84)
         layer_norm_169 = mul_84 = None
         _holder__attr_316 = self._attr_316
         _holder__attr_317 = self._attr_317
@@ -2953,7 +2938,7 @@ class ExportedModule(nn.Module):
             input=mul_86, weight=_holder__attr_324, bias=_holder__attr_325
         )
         mul_86 = _holder__attr_324 = _holder__attr_325 = None
-        add_68 = my_tensor_add(input=mul_85, other=linear_261)
+        add_68 = torch.add(input=mul_85, other=linear_261)
         mul_85 = linear_261 = None
         _holder__attr_326 = self._attr_326
         _holder__attr_327 = self._attr_327
@@ -2982,7 +2967,7 @@ class ExportedModule(nn.Module):
             shape=[-1, 64, 160],
         )
         cat_33 = None
-        add_69 = my_tensor_add(input=getitem_4107, other=reshape_667)
+        add_69 = torch.add(input=getitem_4107, other=reshape_667)
         getitem_4107 = reshape_667 = None
         size_129 = add_69.size()
         getitem_4110 = size_129[2:]
@@ -3112,7 +3097,7 @@ class ExportedModule(nn.Module):
         linear_267 = _holder__attr_348 = _holder__attr_349 = None
         mul_90 = torch.mul(input=layer_norm_176, other=linear_268)
         linear_268 = None
-        add_70 = my_tensor_add(input=layer_norm_176, other=mul_90)
+        add_70 = torch.add(input=layer_norm_176, other=mul_90)
         layer_norm_176 = mul_90 = None
         _holder__attr_350 = self._attr_350
         _holder__attr_351 = self._attr_351
@@ -3160,7 +3145,7 @@ class ExportedModule(nn.Module):
             input=mul_92, weight=_holder__attr_358, bias=_holder__attr_359
         )
         mul_92 = _holder__attr_358 = _holder__attr_359 = None
-        add_71 = my_tensor_add(input=mul_91, other=linear_271)
+        add_71 = torch.add(input=mul_91, other=linear_271)
         mul_91 = linear_271 = None
         _holder__attr_360 = self._attr_360
         _holder__attr_361 = self._attr_361
@@ -3189,7 +3174,7 @@ class ExportedModule(nn.Module):
             shape=[-1, 64, 160],
         )
         cat_36 = None
-        add_72 = my_tensor_add(input=getitem_4113, other=reshape_671)
+        add_72 = torch.add(input=getitem_4113, other=reshape_671)
         getitem_4113 = reshape_671 = None
         size_132 = add_72.size()
         getitem_4116 = size_132[2:]
@@ -3319,7 +3304,7 @@ class ExportedModule(nn.Module):
         linear_277 = _holder__attr_382 = _holder__attr_383 = None
         mul_96 = torch.mul(input=layer_norm_183, other=linear_278)
         linear_278 = None
-        add_73 = my_tensor_add(input=layer_norm_183, other=mul_96)
+        add_73 = torch.add(input=layer_norm_183, other=mul_96)
         layer_norm_183 = mul_96 = None
         _holder__attr_384 = self._attr_384
         _holder__attr_385 = self._attr_385
@@ -3367,7 +3352,7 @@ class ExportedModule(nn.Module):
             input=mul_98, weight=_holder__attr_392, bias=_holder__attr_393
         )
         mul_98 = _holder__attr_392 = _holder__attr_393 = None
-        add_74 = my_tensor_add(input=mul_97, other=linear_281)
+        add_74 = torch.add(input=mul_97, other=linear_281)
         mul_97 = linear_281 = None
         _holder__attr_394 = self._attr_394
         _holder__attr_395 = self._attr_395
@@ -3396,7 +3381,7 @@ class ExportedModule(nn.Module):
             shape=[-1, 64, 160],
         )
         cat_39 = None
-        add_75 = my_tensor_add(input=getitem_4119, other=reshape_675)
+        add_75 = torch.add(input=getitem_4119, other=reshape_675)
         getitem_4119 = reshape_675 = None
         size_135 = add_75.size()
         getitem_4122 = size_135[2:]
@@ -3526,7 +3511,7 @@ class ExportedModule(nn.Module):
         linear_287 = _holder__attr_416 = _holder__attr_417 = None
         mul_102 = torch.mul(input=layer_norm_190, other=linear_288)
         linear_288 = None
-        add_76 = my_tensor_add(input=layer_norm_190, other=mul_102)
+        add_76 = torch.add(input=layer_norm_190, other=mul_102)
         layer_norm_190 = mul_102 = None
         _holder__attr_418 = self._attr_418
         _holder__attr_419 = self._attr_419
@@ -3574,7 +3559,7 @@ class ExportedModule(nn.Module):
             input=mul_104, weight=_holder__attr_426, bias=_holder__attr_427
         )
         mul_104 = _holder__attr_426 = _holder__attr_427 = None
-        add_77 = my_tensor_add(input=mul_103, other=linear_291)
+        add_77 = torch.add(input=mul_103, other=linear_291)
         mul_103 = linear_291 = None
         _holder__attr_428 = self._attr_428
         _holder__attr_429 = self._attr_429
@@ -3603,7 +3588,7 @@ class ExportedModule(nn.Module):
             shape=[-1, 64, 160],
         )
         cat_42 = None
-        add_78 = my_tensor_add(input=getitem_4125, other=reshape_679)
+        add_78 = torch.add(input=getitem_4125, other=reshape_679)
         getitem_4125 = reshape_679 = None
         size_138 = add_78.size()
         getitem_4128 = size_138[2:]
@@ -3733,7 +3718,7 @@ class ExportedModule(nn.Module):
         linear_297 = _holder__attr_450 = _holder__attr_451 = None
         mul_108 = torch.mul(input=layer_norm_197, other=linear_298)
         linear_298 = None
-        add_79 = my_tensor_add(input=layer_norm_197, other=mul_108)
+        add_79 = torch.add(input=layer_norm_197, other=mul_108)
         layer_norm_197 = mul_108 = None
         _holder__attr_452 = self._attr_452
         _holder__attr_453 = self._attr_453
@@ -3781,7 +3766,7 @@ class ExportedModule(nn.Module):
             input=mul_110, weight=_holder__attr_460, bias=_holder__attr_461
         )
         mul_110 = _holder__attr_460 = _holder__attr_461 = None
-        add_80 = my_tensor_add(input=mul_109, other=linear_301)
+        add_80 = torch.add(input=mul_109, other=linear_301)
         mul_109 = linear_301 = None
         _holder__attr_462 = self._attr_462
         _holder__attr_463 = self._attr_463
@@ -3810,7 +3795,7 @@ class ExportedModule(nn.Module):
             shape=[-1, 64, 160],
         )
         cat_45 = None
-        add_81 = my_tensor_add(input=getitem_4131, other=reshape_683)
+        add_81 = torch.add(input=getitem_4131, other=reshape_683)
         getitem_4131 = reshape_683 = None
         size_141 = add_81.size()
         getitem_4134 = size_141[2:]
@@ -3929,7 +3914,7 @@ class ExportedModule(nn.Module):
         linear_307 = _holder__attr_484 = _holder__attr_485 = None
         mul_114 = torch.mul(input=layer_norm_204, other=linear_308)
         linear_308 = None
-        add_82 = my_tensor_add(input=layer_norm_204, other=mul_114)
+        add_82 = torch.add(input=layer_norm_204, other=mul_114)
         layer_norm_204 = mul_114 = None
         _holder__attr_486 = self._attr_486
         _holder__attr_487 = self._attr_487
@@ -3977,7 +3962,7 @@ class ExportedModule(nn.Module):
             input=mul_116, weight=_holder__attr_494, bias=_holder__attr_495
         )
         mul_116 = _holder__attr_494 = _holder__attr_495 = None
-        add_83 = my_tensor_add(input=mul_115, other=linear_311)
+        add_83 = torch.add(input=mul_115, other=linear_311)
         mul_115 = linear_311 = None
         _holder__attr_496 = self._attr_496
         _holder__attr_497 = self._attr_497

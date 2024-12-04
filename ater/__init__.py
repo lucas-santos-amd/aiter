@@ -7,7 +7,7 @@ import sys
 import logging
 import multiprocessing
 logger = logging.getLogger("ater")
-
+from . import transpose_operator
 
 def getLogger():
     global logger
