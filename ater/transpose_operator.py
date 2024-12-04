@@ -5,25 +5,25 @@ import torch.nn.functional as F
 
 MD_NAME = 'transpose_operator_module'
 
-@compile_ops(srcs=[f'{ATER_CSRC_DIR}/csrc/transpose_operator.cu'],
+@compile_ops(srcs=[f'{ATER_CSRC_DIR}/transpose_operator.cu'],
              md_name=MD_NAME)
 def transpose_add(
     input: Tensor,
     other: Tensor) -> Tensor: ...
 
-@compile_ops(srcs=[f'{ATER_CSRC_DIR}/csrc/transpose_operator.cu'],
+@compile_ops(srcs=[f'{ATER_CSRC_DIR}/transpose_operator.cu'],
              md_name=MD_NAME)
 def transpose_sub(
     input: Tensor,
     other: Tensor) -> Tensor: ...
 
-@compile_ops(srcs=[f'{ATER_CSRC_DIR}/csrc/transpose_operator.cu'],
+@compile_ops(srcs=[f'{ATER_CSRC_DIR}/transpose_operator.cu'],
              md_name=MD_NAME)
 def transpose_mul(
     input: Tensor,
     other: Tensor) -> Tensor: ...
 
-@compile_ops(srcs=[f'{ATER_CSRC_DIR}/csrc/transpose_operator.cu'],
+@compile_ops(srcs=[f'{ATER_CSRC_DIR}/transpose_operator.cu'],
              md_name=MD_NAME)
 def transpose_div(
     input: Tensor,
