@@ -33,8 +33,6 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
 {
     // TORCH_CHECK(scale_k == 1. && scale_v == 1., "only support 1.0 for now")
     torch::Tensor out = torch::empty_like(Q);
-    int i_perm = 0;
-    int o_perm = 0;
     int batch = Q.size(0);
     int nhead = Q.size(1);
     int nhead_k = V.size(1);
@@ -46,11 +44,11 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     naive_t.k_type = torchDTypeToStr(K.dtype());
     naive_t.v_type = torchDTypeToStr(V.dtype());
     naive_t.o_type = torchDTypeToStr(out.dtype());
-    naive_t.q_layout = i_perm == 1 ? "bhsd" : "bshd";
-    naive_t.k_layout = i_perm == 1 ? "bhsd" : "bshd";
-    naive_t.v_layout = i_perm == 1 ? "bhsd" : "bshd";
-    naive_t.o_layout = o_perm == 1 ? "bhsd" : "bshd";
-    naive_t.variation = 0; // TODO?
+    naive_t.q_layout = "bhsd";
+    naive_t.k_layout = "phsdx"; // TODO
+    naive_t.v_layout = "phds";  // TODO
+    naive_t.o_layout = "bhsd";
+    naive_t.variation = 2; // decode variation
 
     ck_tile::naive_attention_fwd_args naive_a;
     naive_a.q_ptr = Q.data_ptr();
@@ -63,8 +61,8 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     naive_a.hdim = hdim_q;
     naive_a.hdim_v = hdim_v; // could be cross-attn, where V and Q/K hdim are different
     naive_a.batch_q = batch;
-    naive_a.batch_kv = batch;
-    naive_a.batch_ratio_kv = 1; // batch_q / batch_kv
+    naive_a.batch_kv = 1;   // decode case batch-kv always 1
+    naive_a.batch_ratio_kv = batch; // batch_q / batch_kv
     naive_a.seqlen_q = 1;       // in decode case, this should be 1
     naive_a.seqlen_kv = 0;      // if context_len_ptr is not nullptr, ignore this field
     naive_a.nhead_q = nhead;
@@ -75,4 +73,5 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     ck_tile::stream_config naive_s{};
 
     naive_attention_fwd(naive_t, naive_a, naive_s);
+    return out;
 }
