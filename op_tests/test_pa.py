@@ -1,10 +1,11 @@
 import random
 from typing import List, Optional, Tuple, Union
 
-import pytest
 import torch
+import ater
 from ater import paged_attn as ops
-from torch.profiler import profile, record_function, ProfilerActivity
+from test_common import checkAllclose, perftest, tensor_dump, tensor_load
+
 uniform_range = (0.5, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
@@ -14,7 +15,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
 }
-# from test_common import checkAllclose
+
 
 def get_kv_cache_torch_dtype(
         cache_dtype: Optional[Union[str, torch.dtype]],
@@ -57,7 +58,6 @@ def kv_cache_factory(
             f"Does not support key cache of type fp8 with head_size {head_size}"
         )
 
-
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
 
     scale = head_size**-0.5
@@ -88,16 +88,18 @@ def kv_cache_factory(
                 f"Does not support value cache of type {cache_dtype}")
         value_caches.append(value_cache)
     return key_caches, value_caches
+
+
 FLOAT32_BYTES = torch.finfo(torch.float).bits // 8
 # This will change depending on the compute capability.
 # - 512 as a buffer
 MAX_SEQ_LEN = 65536
 # There may not be enough gpu memory due to large NUM_BLOCKS.
 # Reduce NUM_BLOCKS when it happens.
-NUM_BLOCKS = 4321  # Arbitrary values for testing
+NUM_BLOCKS = 32768  # Arbitrary values for testing
 PARTITION_SIZE = 512
 # flshattF and tritonflashattF supported: {torch.float16, torch.bfloat16}
-DTYPES =  [torch.half, torch.bfloat16]
+DTYPES = [torch.half, torch.bfloat16]
 NUM_GEN_SEQS = [7]  # Arbitrary values for testing
 NUM_PREFILL_SEQS = [3]  # Arbitrary values for testing
 NUM_HEADS = [(40, 40), (64, 8)]  # Arbitrary values for testing
@@ -130,17 +132,21 @@ def ref_masked_attention(
     return out
 
 
-def ref_single_query_cached_kv_attention(
-    output: torch.Tensor,
-    query: torch.Tensor,
-    num_queries_per_kv: int,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    scale: float,
-    alibi_slopes: Optional[torch.Tensor],
-) -> None:
+# @perftest()
+def run_native(query,
+               key_cache,
+               value_cache,
+               block_tables,
+               seq_lens,
+               max_seq_len,
+               kv_cache_dtype,
+               num_kv_heads,
+               scale,
+               alibi_slopes,
+               k_scale,
+               v_scale,
+               num_queries_per_kv):
+    output = torch.zeros_like(query)
     num_query_heads = query.shape[1]
     num_kv_heads = value_cache.shape[1]
     head_size = value_cache.shape[2]
@@ -184,9 +190,69 @@ def ref_single_query_cached_kv_attention(
         out = ref_masked_attention(q, keys, values, scale, alibi_bias)
         out = out.view(num_query_heads, head_size)
         output[i].copy_(out, non_blocking=True)
+    return output, 1
+
+
+@perftest()
+def run_ater(query,
+             key_cache,
+             value_cache,
+             block_tables,
+             seq_lens,
+             max_seq_len,
+             kv_cache_dtype,
+             num_kv_heads,
+             scale,
+             alibi_slopes,
+             k_scale,
+             v_scale,):
+    return ops.PagedAttention.forward_decode(
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        kv_cache_dtype,
+        num_kv_heads,
+        scale,
+        alibi_slopes,
+        k_scale,
+        v_scale,
+    )
+
+
+def dump_input(query: torch.Tensor,
+               key_cache: torch.Tensor,
+               value_cache: torch.Tensor,
+               block_tables: torch.Tensor,
+               seq_lens: torch.Tensor,
+               max_seq_len: int,
+               kv_cache_dtype: str,
+               num_kv_heads: int,
+               scale: float,
+               alibi_slopes: Optional[torch.Tensor],
+               k_scale: float,
+               v_scale: float,):
+    tensor_dump(query, 'Q')
+    # qbk = tensor_load('Q.bin')
+    # checkAllclose(query, qbk)
+    tensor_dump(key_cache, 'K_cache')
+    tensor_dump(value_cache, 'V_cache')
+    tensor_dump(block_tables, 'block_tables')
+    tensor_dump(seq_lens, 'seq_lens')
+
+
+def load_input():
+    return tensor_load('Q.bin'), tensor_load('K_cache.bin'), tensor_load('V_cache.bin'), tensor_load('block_tables.bin'), tensor_load('seq_lens.bin'),
+
+
+debug_mode = True
+# debug_mode = False
 
 
 def test_paged_attention(
+    ctx_lens: int,
     num_seqs: int,
     num_heads: Tuple[int, int],
     head_size: int,
@@ -196,6 +262,7 @@ def test_paged_attention(
     kv_cache_dtype: str,
     seed: int,
     device: str,
+    w8a16=False,
 ) -> None:
     torch.set_default_device(device)
     scale = float(1.0 / (head_size**0.5))
@@ -210,17 +277,17 @@ def test_paged_attention(
         alibi_slopes = torch.randn(num_query_heads, dtype=torch.float)
 
     # seq_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(num_seqs)]
-    seq_lens = [4097 for _ in range(num_seqs)]
-    seq_lens[-1] = 4097
+    seq_lens = [ctx_lens for _ in range(num_seqs)]
     max_seq_len = max(seq_lens)
     seq_lens = torch.tensor(seq_lens, dtype=torch.int)
 
     # Create the block tables.
     max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
+    num_blocks = max_num_blocks_per_seq*num_seqs
     block_tables_lst: List[List[int]] = []
     for _ in range(num_seqs):
         block_table = [
-            random.randint(0, NUM_BLOCKS - 1)
+            random.randint(0, num_blocks - 1)
             for _ in range(max_num_blocks_per_seq)
         ]
         block_tables_lst.append(block_table)
@@ -228,7 +295,7 @@ def test_paged_attention(
     block_tables = torch.tensor(block_tables_lst, dtype=torch.int)
 
     # Create the KV caches.
-    key_caches, value_caches = kv_cache_factory(NUM_BLOCKS, block_size, 1,
+    key_caches, value_caches = kv_cache_factory(num_blocks, block_size, 1,
                                                 num_kv_heads, head_size,
                                                 kv_cache_dtype, dtype, seed,
                                                 device)
@@ -237,56 +304,124 @@ def test_paged_attention(
     # Using default kv_scale
     k_scale = v_scale = 1.0
 
-    for _ in range(5):
-        # Call the paged attention kernel.
-        output = ops.PagedAttention.forward_decode(
-            query,
-            key_cache,
-            value_cache,
-            block_tables,
-            seq_lens,
-            max_seq_len,
-            kv_cache_dtype,
-            num_kv_heads,
-            scale,
-            alibi_slopes,
-            k_scale,
-            v_scale,
-        )
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True,
-        with_stack=True, with_modules=True, record_shapes = True) as prof:
-        for j in range(20):
-            output = ops.PagedAttention.forward_decode(
-                query,
-                key_cache,
-                value_cache,
-                block_tables,
-                seq_lens,
-                max_seq_len,
-                kv_cache_dtype,
-                num_kv_heads,
-                scale,
-                alibi_slopes,
-                k_scale,
-                v_scale,
-            )
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    ref_output = torch.zeros_like(query)
-    ref_single_query_cached_kv_attention(
-        ref_output,
+    out_ater, time_ater = run_ater(
         query,
-        num_queries_per_kv,
         key_cache,
         value_cache,
         block_tables,
         seq_lens,
+        max_seq_len,
+        kv_cache_dtype,
+        num_kv_heads,
         scale,
         alibi_slopes,
+        k_scale,
+        v_scale,
+    )
+
+    if w8a16:
+        # [num_blocks, num_kv_heads, head_size/x, block_size, x]
+        #   0,         1                 2              3     4
+        k16 = key_cache.permute(1, 2, 4, 0, 3).contiguous()
+        k16 = k16.view(num_kv_heads, head_size, num_blocks*block_size)
+        k8, K_qscale = ater.smoothquant_fwd_native(k16, torch.float)
+        k8 = k8.view(num_kv_heads,   # 0
+                     head_size//16,  # 1
+                     16,             # 2
+                     num_blocks,     # 3
+                     block_size)     # 4
+        k8 = k8.permute(3, 0, 1, 4, 2).contiguous()  # k8 for w8 pa
+
+        # [num_blocks, num_kv_heads, head_size, block_size]
+        #        0          1              2           3
+        v16 = value_cache.permute(1, 2, 0, 3).contiguous()
+        v16 = v16.view(num_kv_heads, head_size, num_blocks*block_size)
+        v8, V_qscale = ater.smoothquant_fwd_native(v16, torch.float)
+        v8 = v8.view(num_kv_heads,  # 0
+                     head_size,     # 1
+                     num_blocks,    # 2
+                     block_size)    # 3
+        v8 = v8.permute(2, 0, 1, 3).contiguous()  # v8 for w8 pa
+    if debug_mode:
+        if w8a16:
+            dump_input(query,
+                       key_cache,
+                       value_cache,
+                       block_tables,
+                       seq_lens,
+                       max_seq_len,
+                       kv_cache_dtype,
+                       num_kv_heads,
+                       scale,
+                       alibi_slopes,
+                       k_scale,
+                       v_scale,)
+            tensor_dump(k8, 'K_8')
+            tensor_dump(v8, 'V_8')
+            tensor_dump(K_qscale, 'K_qscale')
+            tensor_dump(V_qscale, 'V_qscale')
+        else:
+            dump_input(query,
+                       key_cache,
+                       value_cache,
+                       block_tables,
+                       seq_lens,
+                       max_seq_len,
+                       kv_cache_dtype,
+                       num_kv_heads,
+                       scale,
+                       alibi_slopes,
+                       k_scale,
+                       v_scale,)
+
+    # if w8a16:
+    #     # todo remove when w8a16 is ready
+    #     out_ater, time_ater = run_ater(
+    #         query,
+    #         k8.to(dtype),
+    #         v8.to(dtype),
+    #         block_tables,
+    #         seq_lens,
+    #         max_seq_len,
+    #         kv_cache_dtype,
+    #         num_kv_heads,
+    #         scale,
+    #         alibi_slopes,
+    #         k_scale,
+    #         v_scale,
+    #     )
+    if debug_mode:
+        tensor_dump(out_ater, 'out')
+        (query,
+         key_cache,
+         value_cache,
+         block_tables,
+         seq_lens) = load_input()
+    out_native, time_native = run_native(
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        kv_cache_dtype,
+        num_kv_heads,
+        scale,
+        alibi_slopes,
+        k_scale,
+        v_scale,
+        num_queries_per_kv,
     )
 
     atol, rtol = 1e-2, 1e-5
-    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
-    # checkAllclose(output, ref_output,  rtol=rtol, atol=atol)
+    msg = f"[perf] dim: {str((num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, {time_native=:<8.2f} us, {time_ater=:<8.2f} us, uplift: {time_native/time_ater-1:<5.1%}"
+    checkAllclose(out_native, out_ater, atol=atol, rtol=rtol, msg=msg)
+
+
 # test_paged_attention( 128, (8,1), 128, False, 16, torch.half, "auto", 0, "cuda:0")
-test_paged_attention( 128, (8,1), 128, False, 32, torch.bfloat16, "auto", 0, "cuda:0")
-test_paged_attention( 128, (8,1), 128, False, 16, torch.bfloat16, "auto", 0, "cuda:0")
+# test_paged_attention( 128, (8,1), 128, False, 32, torch.bfloat16, "auto", 0, "cuda:0")
+test_paged_attention(4096, 128, (8, 1), 128, False, 16,
+                     torch.bfloat16, "auto", 0, "cuda:0", w8a16=True)
+# # simple version
+# test_paged_attention(4096, 2, (8, 1), 128, False, 16,
+#                      torch.bfloat16, "auto", 0, "cuda:0", w8a16=True)

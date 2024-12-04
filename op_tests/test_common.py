@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-03 15:53:32
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-11-27 11:27:28
+# @Last Modified At: 2024-12-04 15:30:21
 # @Description: This is description.
 
 import torch
@@ -82,11 +82,11 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg=''):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     mask = ~isClose
     if isClose.all():
-        logger.info(f'{msg}[passed~]')
+        logger.info(f'{msg}[checkAllclose passed~]')
     else:
         percent = (a[mask]).numel()/a.numel()
         if percent > 0.01:
-            logger.info(f'''{msg}[failed!]
+            logger.info(f'''{msg}[checkAllclose failed!]
         a:  {a.shape}
             {a[mask]}
         b:  {b.shape}
@@ -95,6 +95,23 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg=''):
             {(a-b)[mask]}''')
         else:
             logger.info(
-                f'''{msg}[waring!] a and b results are not all close''')
+                f'''{msg}[checkAllclose waring!] a and b results are not all close''')
         logger.info(
             f'-->max delta:{(a-b).max()}, delta details: {percent:.1%} ({(a[mask]).numel()} of {a.numel()}) elements {atol=} {rtol=}')
+
+
+def tensor_dump(x: torch.tensor, name: str):
+    x_cpu = x.cpu().view(torch.uint8)
+    filename = f'{name}.bin'
+    x_cpu.numpy().tofile(filename)
+    logger.info(f'saving {filename} {x.shape}, {x.dtype}')
+
+    with open(f'{name}.meta', 'w') as f:
+        f.writelines([f'{el}\n' for el in [x.shape, x.dtype]])
+
+
+def tensor_load(filename: str):
+    DWs = np.fromfile(filename, dtype=np.uint32)
+    metafile = '.'.join(filename.split('.')[:-1])+'.meta'
+    shape, dtype = [eval(line.strip()) for line in open(metafile)]
+    return torch.tensor(DWs).view(dtype).view(shape)
