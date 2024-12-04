@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 15:58:57
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-03 18:34:05
+# @Last Modified At: 2024-12-04 21:55:44
 # @Description: This is description.
 
 import os
@@ -101,8 +101,8 @@ def compile_ops(
             try:
                 if importlib.util.find_spec('ater_') is not None:
                     import ater_
-                    if hasattr(ater_, fc_name):
-                        return getattr(ater_, fc_name)(*args, **kwargs)
+                    if hasattr(ater_, loadName):
+                        return getattr(ater_, loadName)(*args, **kwargs)
                 module = importlib.import_module(f'{__package__}.{md_name}')
             except Exception as e:
                 op_dir = f'{bd_dir}/{md_name}'

@@ -8,6 +8,7 @@ if importlib.util.find_spec('rocsolidxgemm_') is not None:
 from .ops.norm import *
 from .ops.smoothquant import *
 from .ops.gemm_op_a8w8 import *
+from .ops.attention import *
 import os
 import sys
 import logging

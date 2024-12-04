@@ -222,6 +222,35 @@ def run_ater(query,
     )
 
 
+@perftest()
+def run_ater_naive(query,
+                   key_cache,
+                   value_cache,
+                   block_tables,
+                   seq_lens,
+                   max_seq_len,
+                   kv_cache_dtype,
+                   num_kv_heads,
+                   scale,
+                   alibi_slopes,
+                   k_scale,
+                   v_scale,
+                   block_size):
+    return ater.pa_fwd_naive(
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        num_kv_heads,
+        scale,
+        k_scale,
+        v_scale,
+        block_size
+    )
+
+
 def dump_input(query: torch.Tensor,
                key_cache: torch.Tensor,
                value_cache: torch.Tensor,
@@ -318,6 +347,22 @@ def test_paged_attention(
         k_scale,
         v_scale,
     )
+    out_ater_naive, time_ater_naive = run_ater_naive(
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        kv_cache_dtype,
+        num_kv_heads,
+        scale,
+        alibi_slopes,
+        k_scale,
+        v_scale,
+        block_size
+    )
+    checkAllclose(out_ater_naive, out_ater)
 
     if w8a16:
         # [num_blocks, num_kv_heads, head_size/x, block_size, x]
@@ -421,7 +466,7 @@ def test_paged_attention(
 # test_paged_attention( 128, (8,1), 128, False, 16, torch.half, "auto", 0, "cuda:0")
 # test_paged_attention( 128, (8,1), 128, False, 32, torch.bfloat16, "auto", 0, "cuda:0")
 test_paged_attention(4096, 128, (8, 1), 128, False, 16,
-                     torch.bfloat16, "auto", 0, "cuda:0", w8a16=True)
+                     torch.bfloat16, "auto", 0, "cuda:0")
 # # simple version
 # test_paged_attention(4096, 2, (8, 1), 128, False, 16,
 #                      torch.bfloat16, "auto", 0, "cuda:0", w8a16=True)
