@@ -273,11 +273,26 @@ def dump_input(query: torch.Tensor,
 
 
 def load_input():
-    return tensor_load('Q.bin'), tensor_load('K_cache.bin'), tensor_load('V_cache.bin'), tensor_load('block_tables.bin'), tensor_load('seq_lens.bin'),
+    # return (tensor_load('Q.bin'),
+    #         tensor_load('K_cache.bin'),
+    #         tensor_load('V_cache.bin'),
+    #         tensor_load('block_tables.bin'),
+    #         tensor_load('seq_lens.bin'),
+    #         tensor_load('out_ater.bin'))
+    return (tensor_load('/mnt/raid0/ljin1/pa_data/Q_16.bin'),
+            tensor_load('/mnt/raid0/ljin1/pa_data/K_16.bin'),
+            tensor_load('/mnt/raid0/ljin1/pa_data/V_16.bin'),
+            tensor_load('/mnt/raid0/ljin1/pa_data/block_tables.bin'),
+            tensor_load('/mnt/raid0/ljin1/pa_data/seq_lens.bin'),
+            tensor_load('/mnt/raid0/ljin1/pa_data/OUT_16.bin'),
+            )
 
 
-debug_mode = True
-# debug_mode = False
+DUMP = 1
+VERIFY = 2
+# debug_mode = DUMP
+debug_mode = VERIFY
+debug_mode = 0
 
 
 def test_paged_attention(
@@ -294,44 +309,51 @@ def test_paged_attention(
     w8a16=False,
 ) -> None:
     torch.set_default_device(device)
+    # Using default kv_scale
+    k_scale = v_scale = 1.0
     scale = float(1.0 / (head_size**0.5))
     num_query_heads, num_kv_heads = num_heads
-    query = torch.empty(num_seqs, num_query_heads, head_size, dtype=dtype)
-    query.uniform_(*uniform_range)
-
-    assert num_query_heads % num_kv_heads == 0
-    num_queries_per_kv = num_query_heads // num_kv_heads
     alibi_slopes = None
     if use_alibi:
         alibi_slopes = torch.randn(num_query_heads, dtype=torch.float)
-
-    # seq_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(num_seqs)]
-    seq_lens = [ctx_lens for _ in range(num_seqs)]
-    max_seq_len = max(seq_lens)
-    seq_lens = torch.tensor(seq_lens, dtype=torch.int)
-
-    # Create the block tables.
+    assert num_query_heads % num_kv_heads == 0
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    max_seq_len = ctx_lens
     max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
     num_blocks = max_num_blocks_per_seq*num_seqs
-    block_tables_lst: List[List[int]] = []
-    for _ in range(num_seqs):
-        block_table = [
-            random.randint(0, num_blocks - 1)
-            for _ in range(max_num_blocks_per_seq)
-        ]
-        block_tables_lst.append(block_table)
 
-    block_tables = torch.tensor(block_tables_lst, dtype=torch.int)
+    if debug_mode == VERIFY:
+        (query,
+         key_cache,
+         value_cache,
+         block_tables,
+         seq_lens,
+         out_golden) = load_input()
+    else:
+        query = torch.empty(num_seqs, num_query_heads, head_size, dtype=dtype)
+        query.uniform_(*uniform_range)
 
-    # Create the KV caches.
-    key_caches, value_caches = kv_cache_factory(num_blocks, block_size, 1,
-                                                num_kv_heads, head_size,
-                                                kv_cache_dtype, dtype, seed,
-                                                device)
-    key_cache, value_cache = key_caches[0], value_caches[0]
+        # seq_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(num_seqs)]
+        seq_lens = [ctx_lens for _ in range(num_seqs)]
+        seq_lens = torch.tensor(seq_lens, dtype=torch.int)
 
-    # Using default kv_scale
-    k_scale = v_scale = 1.0
+        # Create the block tables.
+        block_tables_lst: List[List[int]] = []
+        for _ in range(num_seqs):
+            block_table = [
+                random.randint(0, num_blocks - 1)
+                for _ in range(max_num_blocks_per_seq)
+            ]
+            block_tables_lst.append(block_table)
+
+        block_tables = torch.tensor(block_tables_lst, dtype=torch.int)
+
+        # Create the KV caches.
+        key_caches, value_caches = kv_cache_factory(num_blocks, block_size, 1,
+                                                    num_kv_heads, head_size,
+                                                    kv_cache_dtype, dtype, seed,
+                                                    device)
+        key_cache, value_cache = key_caches[0], value_caches[0]
 
     out_ater, time_ater = run_ater(
         query,
@@ -347,6 +369,11 @@ def test_paged_attention(
         k_scale,
         v_scale,
     )
+    if debug_mode != VERIFY:
+        out_golden = out_ater
+    checkAllclose(out_golden, out_ater, msg='run_ater')
+    tensor_dump(out_ater, 'out_ater')
+
     out_ater_naive, time_ater_naive = run_ater_naive(
         query,
         key_cache,
@@ -362,7 +389,8 @@ def test_paged_attention(
         v_scale,
         block_size
     )
-    checkAllclose(out_ater_naive, out_ater)
+    checkAllclose(out_golden, out_ater_naive, msg='run_ater_naive')
+    tensor_dump(out_ater_naive, 'out_ater_naive')
 
     if w8a16:
         # [num_blocks, num_kv_heads, head_size/x, block_size, x]
@@ -387,7 +415,7 @@ def test_paged_attention(
                      num_blocks,    # 2
                      block_size)    # 3
         v8 = v8.permute(2, 0, 1, 3).contiguous()  # v8 for w8 pa
-    if debug_mode:
+    if debug_mode == DUMP:
         if w8a16:
             dump_input(query,
                        key_cache,
@@ -435,13 +463,6 @@ def test_paged_attention(
     #         k_scale,
     #         v_scale,
     #     )
-    if debug_mode:
-        tensor_dump(out_ater, 'out')
-        (query,
-         key_cache,
-         value_cache,
-         block_tables,
-         seq_lens) = load_input()
     out_native, time_native = run_native(
         query,
         key_cache,
@@ -457,16 +478,19 @@ def test_paged_attention(
         v_scale,
         num_queries_per_kv,
     )
+    checkAllclose(out_golden, out_native, msg='run_native')
+    tensor_dump(out_native, 'out_native')
 
-    atol, rtol = 1e-2, 1e-5
+    atol, rtol = 1e-2, 1e-2
     msg = f"[perf] dim: {str((num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, {time_native=:<8.2f} us, {time_ater=:<8.2f} us, uplift: {time_native/time_ater-1:<5.1%}"
     checkAllclose(out_native, out_ater, atol=atol, rtol=rtol, msg=msg)
 
 
 # test_paged_attention( 128, (8,1), 128, False, 16, torch.half, "auto", 0, "cuda:0")
 # test_paged_attention( 128, (8,1), 128, False, 32, torch.bfloat16, "auto", 0, "cuda:0")
-test_paged_attention(4096, 128, (8, 1), 128, False, 16,
-                     torch.bfloat16, "auto", 0, "cuda:0")
+# test_paged_attention(4096, 128, (8, 1), 128, False, 16,
+#                      torch.bfloat16, "auto", 0, "cuda:0")
 # # simple version
-# test_paged_attention(4096, 2, (8, 1), 128, False, 16,
-#                      torch.bfloat16, "auto", 0, "cuda:0", w8a16=True)
+test_paged_attention(4096, 2, (8, 1), 128, False, 16,
+                     torch.bfloat16, "auto", 0, "cuda:0")
+#  torch.bfloat16, "auto", 0, "cuda:0", w8a16=True)

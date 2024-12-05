@@ -6,7 +6,7 @@
  * @Email: lingpeng.jin@amd.com
  * @Create At: 2024-12-04 20:28:50
  * @Last Modified By: valarLip
- * @Last Modified At: 2024-12-04 22:01:11
+ * @Last Modified At: 2024-12-05 17:56:48
  * @Description: This is description.
  */
 
@@ -27,8 +27,9 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
                            const float scale_s,
                            const float scale_k,
                            const float scale_v,
-                           const int block_size
-                           // above are input
+                           const int block_size,
+                           std::optional<torch::Tensor> kv_qscale = std::nullopt // [nhead, 2(kv), hdim] used for kvcache dequant
+                                                                                 // above are input
 )
 {
     // TORCH_CHECK(scale_k == 1. && scale_v == 1., "only support 1.0 for now")
@@ -61,14 +62,16 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     naive_a.hdim = hdim_q;
     naive_a.hdim_v = hdim_v; // could be cross-attn, where V and Q/K hdim are different
     naive_a.batch_q = batch;
-    naive_a.batch_kv = 1;   // decode case batch-kv always 1
+    naive_a.batch_kv = 1;           // decode case batch-kv always 1
     naive_a.batch_ratio_kv = batch; // batch_q / batch_kv
-    naive_a.seqlen_q = 1;       // in decode case, this should be 1
-    naive_a.seqlen_kv = 0;      // if context_len_ptr is not nullptr, ignore this field
+    naive_a.seqlen_q = 1;           // in decode case, this should be 1
+    naive_a.seqlen_kv = 0;          // if context_len_ptr is not nullptr, ignore this field
     naive_a.nhead_q = nhead;
     naive_a.nhead_kv = nhead_k;
     naive_a.nhead_ratio_kv = naive_a.nhead_q / naive_a.nhead_kv; // nhead_q / nhead_kv
     naive_a.page_size = block_size;                              // if paged, the seqlen-kv for each block
+
+    naive_a.kvscale_ptr = kv_qscale ? kv_qscale.value().data_ptr() : nullptr; // [nhead, 2(kv), hdim] used for kvcache dequant
 
     ck_tile::stream_config naive_s{};
 

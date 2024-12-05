@@ -6,7 +6,7 @@
  * @Email: lingpeng.jin@amd.com
  * @Create At: 2024-12-04 21:32:40
  * @Last Modified By: valarLip
- * @Last Modified At: 2024-12-04 21:50:56
+ * @Last Modified At: 2024-12-05 15:01:58
  * @Description: This is description.
  */
 
@@ -24,11 +24,24 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
                            const float scale_s,
                            const float scale_k,
                            const float scale_v,
-                           const int block_size
+                           const int block_size,
+                           std::optional<torch::Tensor> kv_qscale = std::nullopt
                            // above are input
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.def("pa_fwd_naive", &pa_fwd_naive, "pa_fwd_naive");
+    m.def("pa_fwd_naive", &pa_fwd_naive, "pa_fwd_naive",
+          py::arg("Q"),
+          py::arg("K"),
+          py::arg("V"),
+          py::arg("block_tables"),
+          py::arg("context_lens"),
+          py::arg("max_seq_len"),
+          py::arg("num_kv_heads"),
+          py::arg("scale_s"),
+          py::arg("scale_k"),
+          py::arg("scale_v"),
+          py::arg("block_size"),
+          py::arg("kv_qscale") = std::nullopt);
 }
