@@ -1,8 +1,17 @@
-#include "moe_ops.h"
-#include "paged_attn_ops.h"
+#include "activation.h"
+#include "attention.h"
+#include "attention_ck.h"
 #include "cache.h"
+#include "custom_all_reduce.h"
+#include "custom.h"
+#include "moe_op.h"
+#include "moe_sorting.h"
+#include "norm.h"
+#include "pos_encoding.h"
+#include "rmsnorm.h"
+#include "smoothquant.h"
+#include "transpose_operator.h"
 #include <torch/extension.h>
-#include "ck_py_interface.h"
 #ifdef USE_CK_A8W8
 #include "gemm_a8w8.h"
 #endif
@@ -35,27 +44,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             "                Tensor? alibi_slopes,"
             "                str kv_cache_dtype,"
             "                float k_scale, float v_scale) -> ()");
-      m.def("paged_attention_v1", &paged_attention_v1,
-            "paged_attention_v1("
-            "    Tensor! out, Tensor query, Tensor key_cache,"
-            "    Tensor value_cache, int num_kv_heads, float scale,"
-            "    Tensor block_tables, Tensor seq_lens, int block_size,"
-            "    int max_seq_len, Tensor? alibi_slopes,"
-            "    str kv_cache_dtype, float k_scale, float v_scale,"
-            "    int tp_rank, int blocksparse_local_blocks,"
-            "    int blocksparse_vert_stride, int blocksparse_block_size,"
-            "    int blocksparse_head_sliding_step) -> ()");
-      m.def("paged_attention_v2", &paged_attention_v2,
-            "paged_attention_v2("
-            "    Tensor! out, Tensor! exp_sums, Tensor! max_logits,"
-            "    Tensor! tmp_out, Tensor query, Tensor key_cache,"
-            "    Tensor value_cache, int num_kv_heads, float scale,"
-            "    Tensor block_tables, Tensor seq_lens, int block_size,"
-            "    int max_seq_len, Tensor? alibi_slopes,"
-            "    str kv_cache_dtype, float k_scale, float v_scale,"
-            "    int tp_rank, int blocksparse_local_blocks,"
-            "    int blocksparse_vert_stride, int blocksparse_block_size,"
-            "    int blocksparse_head_sliding_step) -> ()");
 #ifdef USE_CK_A8W8
       m.def("gemm_a8w8", &gemm_a8w8, "gemm_a8w8", py::arg("XQ"), py::arg("WQ"),
             py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"), py::arg("bias") = std::nullopt);
@@ -119,12 +107,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("layernorm2d_fwd_with_add_dynamicquant", &layernorm2d_with_add_dynamicquant);
       m.def("smoothquant_fwd", &smoothquant_fwd);
       m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
+      m.def("moe_sorting", &moe_sorting_fwd);
+      m.def("pa_fwd_naive", &pa_fwd_naive, "pa_fwd_naive",
+            py::arg("Q"),
+            py::arg("K"),
+            py::arg("V"),
+            py::arg("block_tables"),
+            py::arg("context_lens"),
+            py::arg("max_seq_len"),
+            py::arg("num_kv_heads"),
+            py::arg("scale_s"),
+            py::arg("scale_k"),
+            py::arg("scale_v"),
+            py::arg("block_size"),
+            py::arg("kv_qscale") = std::nullopt);
       // ck staff end
 #endif
 
       m.def("fmoe", &fmoe);
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0);
-      m.def("moe_sorting", &moe_sorting_fwd);
       m.def("transpose_add", &transpose_add, "apply for add with transpose.");
       m.def("transpose_mul", &transpose_mul, "apply for mul with transpose.");
       m.def("transpose_sub", &transpose_sub, "apply for sub with transpose.");

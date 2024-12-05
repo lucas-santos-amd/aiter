@@ -17,7 +17,7 @@ MD_NAME = 'module_attention'
 
 
 @compile_ops(srcs=[f'{ATER_CSRC_DIR}/py_itfs_ck/attention_kernels.cu',
-                   f'{ATER_CSRC_DIR}/py_itfs_ck/attention_pybind.cu'],
+                   f'{ATER_CSRC_DIR}/pybind/attention_ck_pybind.cu'],
              md_name=MD_NAME)
 def pa_fwd_naive(
     query: torch.Tensor,

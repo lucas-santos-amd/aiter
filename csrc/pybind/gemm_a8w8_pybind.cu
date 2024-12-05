@@ -1,12 +1,4 @@
-#include <torch/extension.h>
-
-torch::Tensor gemm_a8w8(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor> bias);
+#include "gemm_a8w8.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {

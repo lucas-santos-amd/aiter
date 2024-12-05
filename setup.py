@@ -134,43 +134,51 @@ if IS_ROCM:
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
-    renamed_sources = rename_cpp_to_cu([f"{this_dir}/csrc"])
-    renamed_ck_srcs = rename_cpp_to_cu(
-        [  # f'for other kernels'
-            f"{blob_dir}",
-            f"{ck_dir}/example/ck_tile/12_smoothquant/instances/",
-            f"{ck_dir}/example/ck_tile/13_moe_sorting/",
-            f"{ck_dir}/example/ck_tile/14_moe_smoothquant/instances/",
-        ])
-    if int(os.environ.get("USE_CK_A8W8", 0)) == 1:
-        generator_flag.append("-DUSE_CK_A8W8")
-        renamed_ck_srcs += rename_cpp_to_cu(
-            [f"{this_dir}/csrc/ck_gemm_a8w8", f"{this_dir}/csrc/ck_gemm_a8w8/impl", f"{this_dir}/csrc/ck_gemm_a8w8/instances"])
-    extra_compile_args = {
-        "cxx": ["-O3", "-std=c++17"] + generator_flag,
-        "nvcc":
-            [
-                "-O3", "-std=c++17",
-                "-DUSE_PROF_API=1",
-                "-D__HIP_PLATFORM_HCC__=1",
-                "-D__HIP_PLATFORM_AMD__=1",
-                "-U__HIP_NO_HALF_CONVERSIONS__",
-                "-U__HIP_NO_HALF_OPERATORS__",
-        ]
-            + generator_flag
-            + cc_flag,
-    }
-
-    include_dirs = [
-        f"{this_dir}/build",
-        f"{ck_dir}/include",
-        f"{ck_dir}/library/include",
-        f"{ck_dir}/example/ck_tile/02_layernorm2d",
-        f"{ck_dir}/example/ck_tile/12_smoothquant",
-        f"{ck_dir}/example/ck_tile/13_moe_sorting",
-        f"{ck_dir}/example/ck_tile/14_moe_smoothquant",
-    ]
     if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
+        renamed_sources = rename_cpp_to_cu(
+            [
+                f"{this_dir}/csrc",
+                f"{this_dir}/csrc/include",
+                f"{this_dir}/csrc/kernels",
+                f"{this_dir}/csrc/py_itfs_ck",
+                f"{this_dir}/csrc/py_itfs_cu",
+            ]
+        )
+        renamed_ck_srcs = rename_cpp_to_cu(
+            [  # f'for other kernels'
+                f"{blob_dir}",
+                f"{ck_dir}/example/ck_tile/12_smoothquant/instances/",
+                f"{ck_dir}/example/ck_tile/13_moe_sorting/",
+                f"{ck_dir}/example/ck_tile/14_moe_smoothquant/instances/",
+            ])
+        if int(os.environ.get("USE_CK_A8W8", 0)) == 1:
+            generator_flag.append("-DUSE_CK_A8W8")
+            renamed_ck_srcs += rename_cpp_to_cu(
+                [f"{this_dir}/csrc/ck_gemm_a8w8", f"{this_dir}/csrc/ck_gemm_a8w8/impl", f"{this_dir}/csrc/ck_gemm_a8w8/instances"])
+        extra_compile_args = {
+            "cxx": ["-O3", "-std=c++17"] + generator_flag,
+            "nvcc":
+                [
+                    "-O3", "-std=c++17",
+                    "-DUSE_PROF_API=1",
+                    "-D__HIP_PLATFORM_HCC__=1",
+                    "-D__HIP_PLATFORM_AMD__=1",
+                    "-U__HIP_NO_HALF_CONVERSIONS__",
+                    "-U__HIP_NO_HALF_OPERATORS__",
+            ]
+                + generator_flag
+                + cc_flag,
+        }
+
+        include_dirs = [
+            f"{this_dir}/build",
+            f"{ck_dir}/include",
+            f"{ck_dir}/library/include",
+            f"{ck_dir}/example/ck_tile/02_layernorm2d",
+            f"{ck_dir}/example/ck_tile/12_smoothquant",
+            f"{ck_dir}/example/ck_tile/13_moe_sorting",
+            f"{ck_dir}/example/ck_tile/14_moe_smoothquant",
+        ]
         ext_modules.append(
             CUDAExtension(
                 name=PACKAGE_NAME+'_',
@@ -241,7 +249,8 @@ class NinjaBuildExtension(BuildExtension):
             max_num_jobs_memory = int(free_memory_gb / 9)
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-            max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
+            max_jobs = int(
+                max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
             os.environ["MAX_JOBS"] = str(max_jobs)
 
         super().__init__(*args, **kwargs)

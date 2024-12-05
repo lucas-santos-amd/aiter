@@ -1,3 +1,5 @@
+#pragma once
+
 #include <torch/extension.h>
 
 void moe_sorting_fwd(torch::Tensor &topk_ids,              // [m, topk]
@@ -9,9 +11,3 @@ void moe_sorting_fwd(torch::Tensor &topk_ids,              // [m, topk]
                      torch::Tensor &moe_buf,               // [max_num_tokens_padded]
                      int num_experts,
                      int unit_size);
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
-{
-    m.def("smoothquant_fwd", &smoothquant_fwd);
-    m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
-}

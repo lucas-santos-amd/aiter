@@ -159,7 +159,7 @@ def compile_ops(
                     extra_ldflags=extra_ldflags,
                     extra_include_paths=extra_include_paths,
                     build_directory=opbd_dir,
-                    verbose=verbose,
+                    verbose=verbose or int(os.getenv("ATER_LOG_MORE")) > 0,
                     with_cuda=True,
                     is_python_module=True,
                 )

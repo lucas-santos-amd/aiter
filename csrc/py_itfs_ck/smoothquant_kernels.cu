@@ -12,7 +12,7 @@ void smoothquant_fwd(torch::Tensor &out,     // [m ,n]
 {
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
-                "ck layernorm2d only support fp16 and bf16 data type");
+                "ck smoothquant only support fp16 and bf16 data type");
 
     std::string dtype_str = torchDTypeToStr(input.dtype());
     int n = input.size(-1);
@@ -39,7 +39,7 @@ void moe_smoothquant_fwd(torch::Tensor &out,      // [topk * tokens, hidden_size
 {
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
-                "ck layernorm2d only support fp16 and bf16 data type");
+                "ck smoothquant only support fp16 and bf16 data type");
 
     std::string dtype_str = torchDTypeToStr(input.dtype());
     int n = input.size(-1);
