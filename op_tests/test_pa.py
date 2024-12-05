@@ -6,7 +6,7 @@ import ater
 from ater import paged_attn as ops
 from test_common import checkAllclose, perftest, tensor_dump, tensor_load
 
-uniform_range = (0.5, 1)
+uniform_range = (0, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
     "bfloat16": torch.bfloat16,
@@ -273,26 +273,26 @@ def dump_input(query: torch.Tensor,
 
 
 def load_input():
-    # return (tensor_load('Q.bin'),
-    #         tensor_load('K_cache.bin'),
-    #         tensor_load('V_cache.bin'),
-    #         tensor_load('block_tables.bin'),
-    #         tensor_load('seq_lens.bin'),
-    #         tensor_load('out_ater.bin'))
-    return (tensor_load('/mnt/raid0/ljin1/pa_data/Q_16.bin'),
-            tensor_load('/mnt/raid0/ljin1/pa_data/K_16.bin'),
-            tensor_load('/mnt/raid0/ljin1/pa_data/V_16.bin'),
-            tensor_load('/mnt/raid0/ljin1/pa_data/block_tables.bin'),
-            tensor_load('/mnt/raid0/ljin1/pa_data/seq_lens.bin'),
-            tensor_load('/mnt/raid0/ljin1/pa_data/OUT_16.bin'),
+    return (tensor_load('Q.bin'),
+            tensor_load('K_cache.bin'),
+            tensor_load('V_cache.bin'),
+            tensor_load('block_tables.bin'),
+            tensor_load('seq_lens.bin'),
+            tensor_load('out_ater.bin'))
+    return (tensor_load('/mnt/raid0/ljin1/pa_data/x8/Q_16.bin'),
+            tensor_load('/mnt/raid0/ljin1/pa_data/x8/K_16.bin'),
+            tensor_load('/mnt/raid0/ljin1/pa_data/x8/V_16.bin'),
+            tensor_load('/mnt/raid0/ljin1/pa_data/x8/block_tables.bin'),
+            tensor_load('/mnt/raid0/ljin1/pa_data/x8/seq_lens.bin'),
+            tensor_load('/mnt/raid0/ljin1/pa_data/x8/OUT_16.bin'),
             )
 
 
 DUMP = 1
 VERIFY = 2
-# debug_mode = DUMP
-debug_mode = VERIFY
-debug_mode = 0
+debug_mode = DUMP
+# debug_mode = VERIFY
+# debug_mode = 0
 
 
 def test_paged_attention(
@@ -321,6 +321,7 @@ def test_paged_attention(
     max_seq_len = ctx_lens
     max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
     num_blocks = max_num_blocks_per_seq*num_seqs
+    print(f'{debug_mode=}')
 
     if debug_mode == VERIFY:
         (query,
@@ -371,7 +372,7 @@ def test_paged_attention(
     )
     if debug_mode != VERIFY:
         out_golden = out_ater
-    checkAllclose(out_golden, out_ater, msg='run_ater')
+    checkAllclose(out_golden, out_ater, msg='golden vs ater_shomy')
     tensor_dump(out_ater, 'out_ater')
 
     out_ater_naive, time_ater_naive = run_ater_naive(
@@ -389,7 +390,7 @@ def test_paged_attention(
         v_scale,
         block_size
     )
-    checkAllclose(out_golden, out_ater_naive, msg='run_ater_naive')
+    checkAllclose(out_golden, out_ater_naive, msg='golden vs ck_naive')
     tensor_dump(out_ater_naive, 'out_ater_naive')
 
     if w8a16:
@@ -478,7 +479,7 @@ def test_paged_attention(
         v_scale,
         num_queries_per_kv,
     )
-    checkAllclose(out_golden, out_native, msg='run_native')
+    checkAllclose(out_golden, out_native, msg='golden vs torch_native')
     tensor_dump(out_native, 'out_native')
 
     atol, rtol = 1e-2, 1e-2
