@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 15:58:57
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-04 21:55:44
+# @Last Modified At: 2024-12-05 20:51:14
 # @Description: This is description.
 
 import os
@@ -159,7 +159,7 @@ def compile_ops(
                     extra_ldflags=extra_ldflags,
                     extra_include_paths=extra_include_paths,
                     build_directory=opbd_dir,
-                    verbose=verbose or int(os.getenv("ATER_LOG_MORE")) > 0,
+                    verbose=verbose or int(os.getenv("ATER_LOG_MORE", 0)) > 0,
                     with_cuda=True,
                     is_python_module=True,
                 )
