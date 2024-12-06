@@ -37,8 +37,18 @@ def layer_norm(
 ) -> Tensor: ...
 
 
+@compile_ops(fc_name="layernorm2d_fwd", **compile_ops_)
+def layernorm2d_fwd(
+    input: Tensor,
+    # normalized_shape: List[int],
+    weight: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    eps: float = 1e-5,
+) -> Tensor: ...
+
+
 @compile_ops(**compile_ops_)
-def layernorm2d_with_add(
+def layernorm2d_fwd_with_add(
     out: Tensor,
     input: Tensor,
     residual_in: Tensor,
@@ -50,7 +60,7 @@ def layernorm2d_with_add(
 
 
 @compile_ops(**compile_ops_)
-def layernorm2d_with_smoothquant(
+def layernorm2d_fwd_with_smoothquant(
     out: Tensor,
     input: Tensor,
     xscale: Tensor,
@@ -62,7 +72,7 @@ def layernorm2d_with_smoothquant(
 
 
 @compile_ops(**compile_ops_)
-def layernorm2d_with_add_smoothquant(
+def layernorm2d_fwd_with_add_smoothquant(
     out: Tensor,
     input: Tensor,
     residual_in: Tensor,
@@ -76,7 +86,7 @@ def layernorm2d_with_add_smoothquant(
 
 
 # @compile_ops(**compile_ops_)
-# def layernorm2d_with_dynamicquant(
+# def layernorm2d_fwd_with_dynamicquant(
 #     out: Tensor,
 #     input: Tensor,
 #     yscale: Tensor,
@@ -85,7 +95,7 @@ def layernorm2d_with_add_smoothquant(
 #     epsilon: float):...
 
 # @compile_ops(**compile_ops_)
-# def layernorm2d_with_add_dynamicquant(
+# def layernorm2d_fwd_with_add_dynamicquant(
 #     out: Tensor,
 #     input: Tensor,
 #     residual_in: Tensor,
