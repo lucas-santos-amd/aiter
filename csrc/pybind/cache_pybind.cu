@@ -9,11 +9,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             "Tensor block_mapping) -> ()");
 
       m.def("reshape_and_cache", &reshape_and_cache,
-            "reshape_and_cache(Tensor key, Tensor value,"
-            "                  Tensor! key_cache, Tensor! value_cache,"
-            "                  Tensor slot_mapping,"
-            "                  str kv_cache_dtype,"
-            "                  float k_scale, float v_scale) -> ()");
+            "reshape_and_cache");
       m.def("reshape_and_cache_flash", &reshape_and_cache_flash,
             "reshape_and_cache_flash(Tensor key, Tensor value,"
             "                        Tensor! key_cache,"

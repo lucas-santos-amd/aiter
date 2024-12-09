@@ -145,6 +145,7 @@ class PagedAttention:
         kv_cache_dtype: str,
         k_scale: float,
         v_scale: float,
+        asm_layout=False
     ) -> None:
         ops.reshape_and_cache(
             key,
@@ -155,6 +156,7 @@ class PagedAttention:
             kv_cache_dtype,
             k_scale,
             v_scale,
+            asm_layout
         )
 
     @staticmethod

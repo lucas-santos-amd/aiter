@@ -19,7 +19,7 @@ void reshape_and_cache(torch::Tensor &key, torch::Tensor &value,
                        torch::Tensor &key_cache, torch::Tensor &value_cache,
                        torch::Tensor &slot_mapping,
                        const std::string &kv_cache_dtype, const double k_scale,
-                       const double v_scale);
+                       const double v_scale, const bool asm_layout);
 
 void reshape_and_cache_flash(torch::Tensor &key, torch::Tensor &value,
                              torch::Tensor &key_cache,
