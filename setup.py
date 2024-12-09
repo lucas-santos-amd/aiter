@@ -152,9 +152,14 @@ if IS_ROCM:
                 f"{ck_dir}/example/ck_tile/14_moe_smoothquant/instances/",
             ])
         if int(os.environ.get("USE_CK_A8W8", 0)) == 1:
+            ck_gemm_a8w8_dir = os.path.join(blob_dir, "ck_gemm_a8w8")
+            if os.path.exists(ck_gemm_a8w8_dir):
+                shutil.rmtree(ck_gemm_a8w8_dir)
+            os.mkdir(ck_gemm_a8w8_dir)
+            os.system(f'{sys.executable} {this_dir}/csrc/ck_gemm_a8w8/gen_instances.py --working_path {ck_gemm_a8w8_dir}')
             generator_flag.append("-DUSE_CK_A8W8")
             renamed_ck_srcs += rename_cpp_to_cu(
-                [f"{this_dir}/csrc/ck_gemm_a8w8", f"{this_dir}/csrc/ck_gemm_a8w8/impl", f"{this_dir}/csrc/ck_gemm_a8w8/instances"])
+                [f"{this_dir}/csrc/ck_gemm_a8w8", f"{ck_gemm_a8w8_dir}", f"{ck_gemm_a8w8_dir}/impl", f"{ck_gemm_a8w8_dir}/instances"])
         extra_compile_args = {
             "cxx": ["-O3", "-std=c++17"] + generator_flag,
             "nvcc":

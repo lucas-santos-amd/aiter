@@ -50,7 +50,7 @@ RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
   else if (M < 64 && N > 2048 && K > 2048)
   {
     // Kernel that works well for small M but larger N and K.
-    return a8w8_rowwise_64x16x16x256_16x16_1x1_16x4x1_16x4x1_1x4x1x16_4x4x1_1x1_intrawave_v1<DDataType, EDataType>;
+    return a8w8_rowwise_64x16x16x256_16x16_1x1_16x4x1_16x4x1_1x16x1x4_4x4x1_1x1_intrawave_v1<DDataType, EDataType>;
   }
   else if (M < 64)
   {
