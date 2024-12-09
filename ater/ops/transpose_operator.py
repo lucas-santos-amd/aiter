@@ -3,11 +3,12 @@ from typing import List, Optional
 from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR
 import torch.nn.functional as F
 
-MD_NAME = "transpose_operator_module"
+MD_NAME = "module_transpose_operator"
 
 compile_ops_ = {
     "srcs": [
-        f"{ATER_CSRC_DIR}/py_itfs_ck/transpose_operator_pybind.cu",
+        f"{ATER_CSRC_DIR}/pybind/transpose_operator_pybind.cu",
+        f"{ATER_CSRC_DIR}/include/transpose_operator.h.cu",
         f"{ATER_CSRC_DIR}/kernels/transpose_operator.cu",
     ],
     "md_name": MD_NAME,
