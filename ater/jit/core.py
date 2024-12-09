@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 15:58:57
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-05 20:51:14
+# @Last Modified At: 2024-12-09 18:29:49
 # @Description: This is description.
 
 import os
@@ -99,11 +99,14 @@ def compile_ops(
                 loadName = func.__name__
 
             try:
+                module = None
                 if importlib.util.find_spec('ater_') is not None:
                     import ater_
                     if hasattr(ater_, loadName):
-                        return getattr(ater_, loadName)(*args, **kwargs)
-                module = importlib.import_module(f'{__package__}.{md_name}')
+                        module = ater_
+                if module is None:
+                    module = importlib.import_module(
+                        f'{__package__}.{md_name}')
             except Exception as e:
                 op_dir = f'{bd_dir}/{md_name}'
                 logger.info(f'start build [{md_name}] under {op_dir}')

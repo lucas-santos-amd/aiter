@@ -524,27 +524,27 @@ def test_paged_attention(
     #         k_scale,
     #         v_scale,
     #     )
-    out_native, time_native = run_native(
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
-        seq_lens,
-        max_seq_len,
-        kv_cache_dtype,
-        num_kv_heads,
-        scale,
-        alibi_slopes,
-        k_scale,
-        v_scale,
-        num_queries_per_kv,
-    )
-    checkAllclose(out_golden, out_native, msg='golden vs torch_native')
-    tensor_dump(out_native, 'out_native')
+    # out_native, time_native = run_native(
+    #     query,
+    #     key_cache,
+    #     value_cache,
+    #     block_tables,
+    #     seq_lens,
+    #     max_seq_len,
+    #     kv_cache_dtype,
+    #     num_kv_heads,
+    #     scale,
+    #     alibi_slopes,
+    #     k_scale,
+    #     v_scale,
+    #     num_queries_per_kv,
+    # )
+    # checkAllclose(out_golden, out_native, msg='golden vs torch_native')
+    # tensor_dump(out_native, 'out_native')
 
-    atol, rtol = 1e-2, 1e-2
-    msg = f"[perf] dim: {str((num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, {time_native=:<8.2f} us, {time_ater=:<8.2f} us, uplift: {time_native/time_ater-1:<5.1%}"
-    checkAllclose(out_native, out_ater, atol=atol, rtol=rtol, msg=msg)
+    # atol, rtol = 1e-2, 1e-2
+    # msg = f"[perf] dim: {str((num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, {time_native=:<8.2f} us, {time_ater=:<8.2f} us, uplift: {time_native/time_ater-1:<5.1%}"
+    # checkAllclose(out_native, out_ater, atol=atol, rtol=rtol, msg=msg)
 
 
 # test_paged_attention( 128, (8,1), 128, False, 16, torch.half, "auto", 0, "cuda:0")

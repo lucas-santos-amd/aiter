@@ -32,7 +32,7 @@ def reshape_and_cache(
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
-    asm_layout: bool=False
+    asm_layout: bool
 ): ...
 
 

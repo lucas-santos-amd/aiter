@@ -187,11 +187,12 @@ __global__ void reshape_and_cache_kernel(
                                           x_idx * block_size * x +
                                                 block_offset * x + 
                                                           x_offset;
+    int64_t tgt_value_idx;
     if constexpr (asmLayout)
     { //[num_blocks, num_heads, block_size/X, head_size, X]
       const int x_idx_v = block_offset / x;
       const int x_offset_v = block_offset % x;
-      const int64_t tgt_value_idx =
+      tgt_value_idx =
           block_idx * num_heads * head_size * block_size +
                        head_idx * head_size * block_size +
                                  x_idx_v * head_size * x +
@@ -200,7 +201,7 @@ __global__ void reshape_and_cache_kernel(
     }
     else
     { //[num_blocks, num_heads, head_size, block_size]
-      const int64_t tgt_value_idx =
+      tgt_value_idx =
           block_idx * num_heads * head_size * block_size +
                        head_idx * head_size * block_size +
                                 head_offset * block_size +
