@@ -10,9 +10,9 @@ compile_ops_ = {
         f"{ATER_CSRC_DIR}/pybind/moe_op_pybind.cu",
         f"{ATER_CSRC_DIR}/kernels/topk_softmax_kernels.cu",
         f"{ATER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu",
-        f"{ATER_CSRC_DIR}/py_itfs_cu/fmoe_py_interface.cpp",
+        f"{ATER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cpp",
     ],
-    "flags_extra_hip": [f'-DFMOE_HSACO=\\"{ATER_ROOT_DIR}/hsa/\\"'],
+    "flags_extra_hip": [f'-DATER_ASM_DIR=\\"{ATER_ROOT_DIR}/hsa/\\"'],
     "md_name": MD_NAME,
 }
 

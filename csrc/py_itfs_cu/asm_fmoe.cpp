@@ -91,7 +91,7 @@ private:
 public:
     FMoeKernel(const char *name, const char *hsaco)
     {
-        HIP_CALL(hipModuleLoad(&module, (std::string(FMOE_HSACO) + hsaco).c_str()));
+        HIP_CALL(hipModuleLoad(&module, (std::string(ATER_ASM_DIR) + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
     };
 

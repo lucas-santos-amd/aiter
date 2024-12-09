@@ -6,13 +6,13 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-12-04 21:35:47
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-04 21:43:26
+# @Last Modified At: 2024-12-09 13:06:47
 # @Description: This is description.
 
 import os
 import torch
 from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR
+from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, ATER_ROOT_DIR
 MD_NAME = 'module_attention'
 
 
@@ -32,3 +32,15 @@ def pa_fwd_naive(
     alibi_slopes: Optional[torch.Tensor],
     k_scale: float,
     v_scale: float) -> torch.Tensor: ...
+
+
+@compile_ops(srcs=[f'{ATER_CSRC_DIR}/py_itfs_cu/asm_pa.cpp',
+                   f'{ATER_CSRC_DIR}/pybind/attention_asm_pybind.cu'],
+             flags_extra_hip=[f'-DATER_ASM_DIR=\\"{ATER_ROOT_DIR}/hsa/\\"'],
+             md_name=f"{MD_NAME}_asm")
+def pa_fwd_asm(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor) -> torch.Tensor: ...
