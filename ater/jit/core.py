@@ -17,6 +17,10 @@ import importlib
 from typing import List, Optional
 from torch.utils import cpp_extension
 import logging
+PREBUILD_KERNELS = False
+if importlib.util.find_spec('ater_') is not None:
+    import ater_
+    PREBUILD_KERNELS = True
 logger = logging.getLogger("ater")
 
 PYTHON = sys.executable
@@ -100,8 +104,7 @@ def compile_ops(
 
             try:
                 module = None
-                if importlib.util.find_spec('ater_') is not None:
-                    import ater_
+                if PREBUILD_KERNELS:
                     if hasattr(ater_, loadName):
                         module = ater_
                 if module is None:

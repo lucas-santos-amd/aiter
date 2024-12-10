@@ -166,6 +166,7 @@ if IS_ROCM:
                 [
                     "-O3", "-std=c++17",
                     "-DUSE_PROF_API=1",
+                    "-DENABLE_FP8",
                     "-D__HIP_PLATFORM_HCC__=1",
                     "-D__HIP_PLATFORM_AMD__=1",
                     "-U__HIP_NO_HALF_CONVERSIONS__",
