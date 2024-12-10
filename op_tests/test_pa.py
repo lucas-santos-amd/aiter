@@ -6,7 +6,7 @@ import ater
 from ater import paged_attn as ops
 from test_common import checkAllclose, perftest, tensor_dump, tensor_load
 
-uniform_range = (0, 1)
+uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
     "bfloat16": torch.bfloat16,
