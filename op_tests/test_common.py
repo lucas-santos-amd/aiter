@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-03 15:53:32
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-05 21:21:53
+# @Last Modified At: 2024-12-10 14:11:39
 # @Description: This is description.
 
 import torch
@@ -16,11 +16,8 @@ import numpy as np
 import pandas as pd
 from ater import logger
 
-num_iters = 100
-num_warmup = 20
 
-
-def perftest():
+def perftest(num_iters=100, num_warmup=20):
     def decorator(func):
         def wrapper(*args, **kwargs):
             if int(os.environ.get('ATER_LOG_MORE', 0)):
@@ -48,13 +45,13 @@ def perftest():
                 for _ in range(1+num_iters+num_warmup):
                     data = func(*args, **kwargs)
                     prof.step()
-            avg = get_trace_perf(prof)
+            avg = get_trace_perf(prof, num_iters)
             return data, avg
         return wrapper
     return decorator
 
 
-def get_trace_perf(prof):
+def get_trace_perf(prof, num_iters):
     df = []
     for el in prof.key_averages():
         if 'ProfilerStep*' not in el.key:

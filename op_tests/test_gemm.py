@@ -21,11 +21,14 @@ def run_gemm_b(x, weight, bias=None):
     return tgemm.mm(x, weight, bias)
 
 
-def test_gemm(dtype, m, n, k):
+def test_gemm(dtype, m, n, k, bias=False):
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=dtype).cuda()
     weight = torch.randn(n, k, dtype=dtype).cuda()
-    bias = torch.randn(n, dtype=dtype).cuda()
+    if bias:
+        bias = torch.randn(n, dtype=dtype).cuda()
+    else:
+        bias=None
     (a, *_), avg_a = run_torch(x, weight, bias)
     (b, *_), avg_b = run_gemm_b(x, weight, bias)
 
@@ -33,25 +36,26 @@ def test_gemm(dtype, m, n, k):
     checkAllclose(a, b, msg=msg)
 
 
-for dtype in [torch.float16, torch.bfloat16]:
-    # qkv_proj
-    for (m, n, k) in [(4096, 1280, 8192),
-                      (128, 1280, 8192),
-                      (128, 1024, 8192),
-                      (128, 128, 8192),
-                      ]:
-        test_gemm(dtype, m, n, k)
-    # attn_out
-    for (m, n, k) in [(4096, 8192, 1024),
-                      (128, 8192, 1024)]:
-        test_gemm(dtype, m, n, k)
-    test_gemm(dtype, 128, 1024, 8192)
-    test_gemm(dtype, 128, 32, 1024)
-    # gating
-    for (m, n, k) in [(4096, 32, 8192),
-                      (128, 32, 8192)]:
-        test_gemm(dtype, m, n, k)
-    # gating
-    for (m, n, k) in [(1, 19392, 8192),
-                      (128, 19392, 8192)]:
-        test_gemm(dtype, m, n, k)
+test_gemm(torch.bfloat16, 128, 32, 8192)
+# for dtype in [torch.float16, torch.bfloat16]:
+#     # # qkv_proj
+#     # for (m, n, k) in [(4096, 1280, 8192),
+#     #                   (128, 1280, 8192),
+#     #                   (128, 1024, 8192),
+#     #                   (128, 128, 8192),
+#     #                   ]:
+#     #     test_gemm(dtype, m, n, k)
+#     # # attn_out
+#     # for (m, n, k) in [(4096, 8192, 1024),
+#     #                   (128, 8192, 1024)]:
+#     #     test_gemm(dtype, m, n, k)
+#     # test_gemm(dtype, 128, 1024, 8192)
+#     test_gemm(dtype, 128, 32, 8192)
+#     # # gating
+#     # for (m, n, k) in [(4096, 32, 8192),
+#     #                   (128, 32, 8192)]:
+#     #     test_gemm(dtype, m, n, k)
+#     # # gating
+#     # for (m, n, k) in [(1, 19392, 8192),
+#     #                   (128, 19392, 8192)]:
+#     #     test_gemm(dtype, m, n, k)

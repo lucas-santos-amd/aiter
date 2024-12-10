@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-12-04 21:35:47
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-09 13:06:47
+# @Last Modified At: 2024-12-10 14:43:14
 # @Description: This is description.
 
 import os
@@ -45,13 +45,17 @@ def pa_fwd_asm(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor) -> torch.Tensor: ...
 
+
+MD_NAME = "module_pa"
+
+
 @compile_ops(
     srcs=[
         f"{ATER_CSRC_DIR}/pybind/attention_pybind.cu",
         f"{ATER_CSRC_DIR}/kernels/attention.cu",
     ],
-    flags_extra_hip = ["-DENABLE_FP8"],
-    md_name="module_pa",
+    flags_extra_hip=['-DENABLE_FP8'],
+    md_name=MD_NAME,
 )
 def paged_attention_rocm(
     out: torch.Tensor,
