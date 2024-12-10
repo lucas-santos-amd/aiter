@@ -44,3 +44,34 @@ def pa_fwd_asm(
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor) -> torch.Tensor: ...
+
+@compile_ops(
+    srcs=[
+        f"{ATER_CSRC_DIR}/pybind/attention_pybind.cu",
+        f"{ATER_CSRC_DIR}/kernels/attention.cu",
+    ],
+    flags_extra_hip = ["-DENABLE_FP8"],
+    md_name="module_pa",
+)
+def paged_attention_rocm(
+    out: torch.Tensor,
+    exp_sums: torch.Tensor,
+    block_mapping: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_size: int,
+    max_context_len: int,
+    alibi_slopes: Optional[torch.Tensor],
+    kv_cache_dtype: str,
+    k_scale: float,
+    v_scale: float,
+    fp8_out_scale: Optional[torch.Tensor],
+    partition_size: int,
+): ...

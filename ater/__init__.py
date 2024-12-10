@@ -12,7 +12,6 @@ from .ops.gemm_op_a8w8 import *
 from .ops.transpose_operator import *
 from .ops.activation import *
 from .ops.attention import *
-from .ops.paged_attention import *
 from .ops.custom import *
 from .ops.custom_all_reduce import *
 from .ops.moe_op import *
