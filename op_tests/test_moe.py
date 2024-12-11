@@ -6,8 +6,9 @@ import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 from test_common import checkAllclose, perftest
-from ater.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck, permute_weight_asm
+from ater.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck
 from ater.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
+from ater.ops.shuffle import shuffle_weight
 from test_smoothquant import pertoken_quant
 
 BLOCK_SIZE_M = 32
@@ -191,8 +192,8 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant=False):
         # print(f'{ref2=}')
 
         # b implement
-        w1b = permute_weight_asm(w1)
-        w2b = permute_weight_asm(w2)
+        w1b = shuffle_weight(w1)
+        w2b = shuffle_weight(w2)
         out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids)
         # print(f'{out_b=}')
     else:
@@ -215,8 +216,8 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant=False):
         print(f'{ref2=}')
 
         # b implement
-        w1b = permute_weight_asm(w1)
-        w2b = permute_weight_asm(w2)
+        w1b = shuffle_weight(w1)
+        w2b = shuffle_weight(w2)
         out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
                                     fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
         print(f'{out_b=}')
