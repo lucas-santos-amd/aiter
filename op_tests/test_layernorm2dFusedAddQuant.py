@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 import ater
 import argparse
+from test_common import checkAllclose, perftest
 
 num_iters = 100
 num_warmup = 20
@@ -29,144 +30,112 @@ def pertoken_quant(hidden_states_input, y_scale_dtype, x_scale = None):
     # hidden_states now is int8 will feed to next layer as intput
     # per_token_scale will be used as dequant factor later layer
 
-
+@perftest()
 def run_torch(input, weight, bias, eps, residual=None, x_scale = None, y_scale_dtype = None):
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    latencies = []
-    for i in range(num_iters+num_warmup):
-        start_event.record()
+    if residual is None:
+        residual_out = None
+        output = F.layer_norm(
+            input=input,
+            normalized_shape=(input.shape[-1],),
+            weight=weight,
+            bias=bias,
+            eps=eps
+        )
+    else:
+        residual_out = input + residual
+        output = F.layer_norm(
+            input=residual_out,
+            normalized_shape=(input.shape[-1],),
+            weight=weight,
+            bias=bias,
+            eps=eps
+        )
+    if y_scale_dtype is None:
+        y_scale = None
+    else:
+        output, y_scale = pertoken_quant(output, y_scale_dtype, x_scale=x_scale)
+    return output, residual_out, y_scale
+
+@perftest()
+def run_ck(input, weight, bias, eps, residual=None, x_scale = None, y_scale_dtype = None):
+    if y_scale_dtype is None:
+        y_scale = None
         if residual is None:
             residual_out = None
-            output = F.layer_norm(
-                input=input,
-                normalized_shape=(input.shape[-1],),
-                weight=weight,
-                bias=bias,
-                eps=eps
+            output = torch.empty_like(input)
+            ater.layer_norm(
+                input,
+                weight,
+                bias,
+                eps
             )
-        else:
-            residual_out = input + residual
-            output = F.layer_norm(
-                input=residual_out,
-                normalized_shape=(input.shape[-1],),
-                weight=weight,
-                bias=bias,
-                eps=eps
+        elif residual is not None:
+            residual_out = torch.empty_like(input)
+            output = torch.empty_like(input)
+            ater.layernorm2d_fwd_with_add(
+                output,
+                input,
+                residual,
+                residual_out,
+                weight,
+                bias,
+                eps
             )
-        if y_scale_dtype is None:
-            y_scale = None
-        else:
-            output, y_scale = pertoken_quant(output, y_scale_dtype, x_scale=x_scale)
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
-    avg = np.mean(latencies[num_warmup:]) * 1000  # us
-    # print(f"run_torch avg time: {avg} us")
-    return output, avg, residual_out, y_scale
-
-
-def run_ck(input, weight, bias, eps, residual=None, x_scale = None, y_scale_dtype = None):
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    latencies = []
-    for i in range(num_iters+num_warmup):
-        start_event.record()
-        if y_scale_dtype is None:
-            y_scale = None
-            if residual is None:
-                residual_out = None
-                output = torch.empty_like(input)
-                ater.layernorm2d_fwd(
-                    output,
-                    input,
-                    weight,
-                    bias,
-                    eps
-                )
-            elif residual is not None:
-                residual_out = torch.empty_like(input)
-                output = torch.empty_like(input)
-                ater.layernorm2d_fwd_with_add(
-                    output,
-                    input,
-                    residual,
-                    residual_out,
-                    weight,
-                    bias,
-                    eps
-                )
-        elif x_scale is None:
-            y_scale = torch.empty(input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
-            output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
-            if residual is None:
-                residual_out = None
-                ater.layernorm2d_fwd_with_dynamicquant(
-                    output,
-                    input,
-                    y_scale,
-                    weight,
-                    bias,
-                    eps
-                )
-            elif residual is not None:
-                residual_out = torch.empty_like(input)
-                ater.layernorm2d_fwd_with_add_dynamicquant(
-                    output,
-                    input,
-                    residual,
-                    residual_out,
-                    y_scale,
-                    weight,
-                    bias,
-                    eps
-                )
-        else:
-            y_scale = torch.empty(input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
-            output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
-            if residual is None:
-                residual_out = None
-                ater.layernorm2d_fwd_with_smoothquant(
-                    output,
-                    input,
-                    x_scale,
-                    y_scale,
-                    weight,
-                    bias,
-                    eps
-                )
-            elif residual is not None:
-                residual_out = torch.empty_like(input)
-                ater.layernorm2d_fwd_with_add_smoothquant(
-                    output,
-                    input,
-                    residual,
-                    residual_out,
-                    x_scale,
-                    y_scale,
-                    weight,
-                    bias,
-                    eps
-                )
+    elif x_scale is None:
+        y_scale = torch.empty(input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
+        output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
+        if residual is None:
+            residual_out = None
+            ater.layernorm2d_fwd_with_dynamicquant(
+                output,
+                input,
+                y_scale,
+                weight,
+                bias,
+                eps
+            )
+        elif residual is not None:
+            residual_out = torch.empty_like(input)
+            ater.layernorm2d_fwd_with_add_dynamicquant(
+                output,
+                input,
+                residual,
+                residual_out,
+                y_scale,
+                weight,
+                bias,
+                eps
+            )
+    else:
+        y_scale = torch.empty(input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
+        output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
+        if residual is None:
+            residual_out = None
+            ater.layernorm2d_fwd_with_smoothquant(
+                output,
+                input,
+                x_scale,
+                y_scale,
+                weight,
+                bias,
+                eps
+            )
+        elif residual is not None:
+            residual_out = torch.empty_like(input)
+            ater.layernorm2d_fwd_with_add_smoothquant(
+                output,
+                input,
+                residual,
+                residual_out,
+                x_scale,
+                y_scale,
+                weight,
+                bias,
+                eps
+            )
         
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
-    avg = np.mean(latencies[num_warmup:]) * 1000  # us
-    # print(f"run_ck    avg time: {avg} us")
-    return output, avg, residual_out, y_scale
+    return output, residual_out, y_scale
 
-
-def checkAllclose(a, b, rtol=1e-2, atol=1e-2):
-    assert torch.allclose(
-        a, b, rtol, atol), f'''torch and ck results are not close\ntorch: {a.shape}\n{a}\nck: {b.shape}\n{b}\nmax delta:{(a-b).max()}
-        delta details: 
-          a: 
-            {a[(a-b)>atol]}
-          b: 
-            {b[(a-b)>atol]}
-      dtlta: 
-            {(a-b)[(a-b)>atol]}'''
 
 
 def test_layernorm2d_instance(dtype, m, n):
@@ -174,8 +143,8 @@ def test_layernorm2d_instance(dtype, m, n):
     input = torch.randn(dim, dtype=dtype, device="cuda")
     weight = torch.randn(n, dtype=dtype, device="cuda")
     bias = torch.randn(n, dtype=dtype, device="cuda")
-    a, avg_a, *_ = run_torch(input, weight, bias, 1e-5)
-    b, avg_b, *_ = run_ck(input, weight, bias, 1e-5)
+    (a, *_), avg_a = run_torch(input, weight, bias, 1e-5)
+    (b, *_), avg_b = run_ck(input, weight, bias, 1e-5)
     print(
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
     checkAllclose(a, b)
@@ -188,8 +157,8 @@ def test_layernorm2d_fuseAdd_instance(dtype, m, n):
     weight = torch.randn(n, dtype=dtype, device="cuda")
     bias = torch.randn(n, dtype=dtype, device="cuda")
     res = torch.randn(dim, dtype=dtype, device="cuda")
-    a, avg_a, res_a, *_ = run_torch(input, weight, bias, 1e-5, residual=res)
-    b, avg_b, res_b, *_ = run_ck(input, weight, bias, 1e-5, residual=res)
+    (a, res_a, *_), avg_a = run_torch(input, weight, bias, 1e-5, residual=res)
+    (b, res_b, *_), avg_b = run_ck(input, weight, bias, 1e-5, residual=res)
 
     print(
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
@@ -204,8 +173,8 @@ def test_layernorm2d_fuseSmoothquant_instance(dtype, m, n, xscaleType, yscaleTyp
     weight = torch.randn(n, dtype=dtype, device="cuda")
     bias = torch.randn(n, dtype=dtype, device="cuda")
     xscale = torch.randn(n, dtype=xscaleType, device="cuda")
-    a, avg_a, _, yscale_a = run_torch(input, weight, bias, 1e-5, x_scale=xscale, y_scale_dtype=yscaleType)
-    b, avg_b, _, yscale_b = run_ck(input, weight, bias, 1e-5, x_scale=xscale, y_scale_dtype=yscaleType)
+    (a, _, yscale_a), avg_a = run_torch(input, weight, bias, 1e-5, x_scale=xscale, y_scale_dtype=yscaleType)
+    (b, _, yscale_b), avg_b = run_ck(input, weight, bias, 1e-5, x_scale=xscale, y_scale_dtype=yscaleType)
 
     print(
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
@@ -220,8 +189,8 @@ def test_layernorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType, yscal
     bias = torch.randn(n, dtype=dtype, device="cuda")
     res = torch.randn(dim, dtype=dtype, device="cuda")
     xscale = torch.randn(n, dtype=xscaleType, device="cuda")
-    a, avg_a, res_a, yscale_a = run_torch(input, weight, bias, 1e-5, residual=res, x_scale=xscale, y_scale_dtype=yscaleType)
-    b, avg_b, res_b, yscale_b = run_ck(input, weight, bias, 1e-5, residual=res, x_scale=xscale, y_scale_dtype=yscaleType)
+    (a, res_a, yscale_a), avg_a = run_torch(input, weight, bias, 1e-5, residual=res, x_scale=xscale, y_scale_dtype=yscaleType)
+    (b, res_b, yscale_b), avg_b = run_ck(input, weight, bias, 1e-5, residual=res, x_scale=xscale, y_scale_dtype=yscaleType)
 
     print(
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
@@ -236,8 +205,8 @@ def test_layernorm2d_fuseDynamicquant_instance(dtype, m, n, yscaleType):
     input = torch.randn(dim, dtype=dtype, device="cuda")
     weight = torch.randn(n, dtype=dtype, device="cuda")
     bias = torch.randn(n, dtype=dtype, device="cuda")
-    a, avg_a, _, yscale_a = run_torch(input, weight, bias, 1e-5, y_scale_dtype=yscaleType)
-    b, avg_b, _, yscale_b = run_ck(input, weight, bias, 1e-5,  y_scale_dtype=yscaleType)
+    (a, _, yscale_a), avg_a = run_torch(input, weight, bias, 1e-5, y_scale_dtype=yscaleType)
+    (b, _, yscale_b), avg_b = run_ck(input, weight, bias, 1e-5,  y_scale_dtype=yscaleType)
 
     print(
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
@@ -251,8 +220,8 @@ def test_layernorm2d_fuseAdd_Dynamicquant_instance(dtype, m, n, yscaleType):
     weight = torch.randn(n, dtype=dtype, device="cuda")
     bias = torch.randn(n, dtype=dtype, device="cuda")
     res = torch.randn(dim, dtype=dtype, device="cuda")
-    a, avg_a, res_a, yscale_a = run_torch(input, weight, bias, 1e-5, residual=res, y_scale_dtype=yscaleType)
-    b, avg_b, res_b, yscale_b = run_ck(input, weight, bias, 1e-5, residual=res, y_scale_dtype=yscaleType)
+    (a, res_a, yscale_a), avg_a = run_torch(input, weight, bias, 1e-5, residual=res, y_scale_dtype=yscaleType)
+    (b, res_b, yscale_b), avg_b = run_ck(input, weight, bias, 1e-5, residual=res, y_scale_dtype=yscaleType)
 
     print(
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
@@ -296,7 +265,7 @@ def test_layernorm2d_fuseDynamicquant():
     for scaleType in [ torch.float32]:
         for dtype in [torch.float16, torch.bfloat16]:
             for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-                for n in [4096, 8192]:
+                for n in [1024, 2048]:
                     test_layernorm2d_fuseDynamicquant_instance(dtype, m, n, yscaleType=scaleType)
 
 def test_layernorm2d_fuseAdd_Dynamicquant():
@@ -304,7 +273,7 @@ def test_layernorm2d_fuseAdd_Dynamicquant():
     for scaleType in [torch.float32]:
         for dtype in [torch.float16, torch.bfloat16]:
             for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-                for n in [4096, 8192]:
+                for n in [1024, 2048]:
                     test_layernorm2d_fuseAdd_Dynamicquant_instance(dtype, m, n, yscaleType=scaleType)
 
 if __name__ == "__main__":

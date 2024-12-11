@@ -1,5 +1,6 @@
 #pragma once
 #include <torch/all.h>
+#include <torch/extension.h>
 torch::Tensor gemm_a8w8(
     // void gemm_a8w8(
     torch::Tensor &XQ,

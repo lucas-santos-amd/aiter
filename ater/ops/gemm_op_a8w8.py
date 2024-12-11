@@ -10,9 +10,8 @@ MD_NAME = "module_gemm_a8w8"
     srcs=[
         f"{ATER_CSRC_DIR}/pybind/gemm_a8w8_pybind.cu",
         f"{ATER_CSRC_DIR}/ck_gemm_a8w8",
-        f"{ATER_CSRC_DIR}/ck_gemm_a8w8/instances",
-        f"{ATER_CSRC_DIR}/ck_gemm_a8w8/impl",
     ],
+    blob_gen_cmd =  f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}}",
     md_name=MD_NAME,
     fc_name="gemm_a8w8",
 )

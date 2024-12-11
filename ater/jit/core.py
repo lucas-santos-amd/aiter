@@ -63,7 +63,7 @@ def check_and_set_ninja_worker():
         os.environ["MAX_JOBS"] = max_jobs
 
 
-def rename_cpp_to_cu(els, dst):
+def rename_cpp_to_cu(els, dst, recurisve = False):
     def do_rename_and_mv(name, src, dst, ret):
         newName = name
         if name.endswith(".cpp") or name.endswith(".cu"):
@@ -77,6 +77,8 @@ def rename_cpp_to_cu(els, dst):
         if os.path.isdir(el):
             for entry in os.listdir(el):
                 if os.path.isdir(f'{el}/{entry}'):
+                    if recurisve:
+                        ret += rename_cpp_to_cu([f'{el}/{entry}'], dst, recurisve)
                     continue
                 do_rename_and_mv(entry, el, dst, ret)
         else:
@@ -150,7 +152,7 @@ def compile_ops(
                     os.makedirs(blob_dir, exist_ok=True)
                     os.system(f'{PYTHON} {blob_gen_cmd.format(blob_dir)}')
 
-                    sources += rename_cpp_to_cu([blob_dir], src_dir)
+                    sources += rename_cpp_to_cu([blob_dir], src_dir, recurisve=True)              
                 extra_include_paths = [
                     f"{CK_DIR}/include",
                     f"{CK_DIR}/library/include",
