@@ -20,7 +20,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
                                              // or[num_batch, seqlen, num_kv_heads, head_size]
                            torch::Tensor &V, //   [num_blocks, num_kv_heads, head_size, block_size]
                                              // or[num_batch*seqlen, num_kv_heads, head_size]
-                           torch::Tensor &block_tables,
+                           torch::Tensor &block_tables, // [num_seqs, max_num_blocks_per_seq]
                            torch::Tensor &context_lens,
                            const int max_seq_len,
                            const int num_kv_heads,
@@ -39,6 +39,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     int nhead_k = V.size(1);
     int hdim_q = Q.size(2);
     int hdim_v = V.size(2);
+    int max_num_blocks_per_seq = block_tables.size(1);
 
     ck_tile::naive_attention_fwd_traits naive_t;
     naive_t.q_type = torchDTypeToStr(Q.dtype());
@@ -46,7 +47,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     naive_t.v_type = torchDTypeToStr(V.dtype());
     naive_t.o_type = torchDTypeToStr(out.dtype());
     naive_t.q_layout = "bhsd";
-    naive_t.k_layout = "phsdx"; // TODO
+    naive_t.k_layout = "phdsx"; // TODO
     naive_t.v_layout = "phds";  // TODO
     naive_t.o_layout = "bhsd";
     naive_t.variation = 2; // decode variation
@@ -72,6 +73,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     naive_a.page_size = block_size;                              // if paged, the seqlen-kv for each block
 
     naive_a.kvscale_ptr = kv_qscale ? kv_qscale.value().data_ptr() : nullptr; // [nhead, 2(kv), hdim] used for kvcache dequant
+    naive_a.max_pages_per_seq = max_num_blocks_per_seq;
 
     ck_tile::stream_config naive_s{};
 
