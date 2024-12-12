@@ -7,8 +7,8 @@ MD_NAME = "module_rmsnorm"
 
 compile_ops_ = {
     "srcs": [
-        f"{ATER_CSRC_DIR}/pybind/rmsnorm_kernels.cu",
-        f"{ATER_CSRC_DIR}/py_itfs_cu/rmsnorm_pybind.cu",
+        f"{ATER_CSRC_DIR}/pybind/rmsnorm_pybind.cu",
+        f"{ATER_CSRC_DIR}/kernels/rmsnorm_kernels.cu",
     ],
     "md_name": MD_NAME,
 }

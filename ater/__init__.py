@@ -18,6 +18,7 @@ from .ops.moe_op import *
 from .ops.moe_sorting import *
 from .ops.pos_encoding import *
 from .ops.cache import *
+from .ops.rmsnorm import *
 import os
 import sys
 import logging
