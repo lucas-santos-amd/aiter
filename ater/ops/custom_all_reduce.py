@@ -6,7 +6,6 @@ import torch.nn.functional as F
 MD_NAME = "module_custom_all_reduce"
 
 
-
 @compile_ops("module_custom_all_reduce")
 def init_custom_ar(
     out: Tensor, exp_sums: Tensor, handles, offsets, rank: int, full_nvlink: bool
@@ -23,8 +22,29 @@ def all_reduce_unreg(_fa: int, inp: Tensor,
 
 
 @compile_ops("module_custom_all_reduce")
-def all_reduce_asm(_fa: int, inp: Tensor,
-                   reg_buffer: Tensor, reg_sig: Tensor) -> Tensor: ...
+def all_reduce_asm_(inp: Tensor,
+                    ca: int, reg_sig: Tensor, reg_buffer: Tensor, isGraph: bool) -> Tensor: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def all_reduce_rmsnorm_(
+    input: Tensor,
+    residual_in: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    epsilon: float,
+    ca: int, reg_sig: Tensor, reg_buffer: Tensor, isGraph: bool) -> List[Tensor]: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def all_reduce_rmsnorm_quant_(
+    input: Tensor,
+    residual_in: Tensor,
+    weight: Tensor,
+    xscale: Tensor,
+    bias: Tensor,
+    epsilon: float,
+    ca: int, reg_sig: Tensor, reg_buffer: Tensor, isGraph: bool) -> List[Tensor]: ...
 
 
 @compile_ops("module_custom_all_reduce")
