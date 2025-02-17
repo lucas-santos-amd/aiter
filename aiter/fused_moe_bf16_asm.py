@@ -34,6 +34,7 @@ def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype,
     moe_buf = torch.empty((M, model_dim),
                           dtype=moebuf_dtype,
                           device=device)
+
     aiter.moe_sorting_fwd(topk_ids, topk_weights, sorted_ids, sorted_weights,  sorted_expert_ids,
                           num_tokens_post_pad, moe_buf, num_experts, BLOCK_SIZE_M, expert_mask)
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad, moe_buf

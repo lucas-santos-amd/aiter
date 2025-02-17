@@ -145,11 +145,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("smoothquant_fwd", &smoothquant_fwd);
       m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
       m.def("moe_sorting_fwd", &moe_sorting_fwd,
-          py::arg("topk_ids"), py::arg("topk_weights"), 
-          py::arg("sorted_token_ids"), py::arg("sorted_weights"), 
-          py::arg("sorted_expert_ids"), py::arg("total_tokens_post_pad"), 
-          py::arg("moe_buf"), py::arg("num_experts"), 
-          py::arg("unit_size"), py::arg("local_expert_mask")= std::nullopt);
+            py::arg("topk_ids"), py::arg("topk_weights"),
+            py::arg("sorted_token_ids"), py::arg("sorted_weights"),
+            py::arg("sorted_expert_ids"), py::arg("total_tokens_post_pad"),
+            py::arg("moe_buf"), py::arg("num_experts"),
+            py::arg("unit_size"), py::arg("local_expert_mask") = std::nullopt);
       m.def("pa_fwd_naive", &pa_fwd_naive, "pa_fwd_naive",
             py::arg("Q"),
             py::arg("K"),
@@ -180,6 +180,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("fc2_smooth_scale") = std::nullopt);
       m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);
       m.def("fmoe_fp8_g1u1_a16", &fmoe_fp8_g1u1_a16);
+      m.def("fmoe_fp8_blockscale_g1u1", &fmoe_fp8_blockscale_g1u1,
+            py::arg("out"), py::arg("input"),
+            py::arg("gate"), py::arg("down"),
+            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),
+            py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),
+            py::arg("topk"),
+            py::arg("fc1_scale"), py::arg("fc2_scale"),
+            py::arg("fc1_smooth_scale"), py::arg("fc2_smooth_scale") = std::nullopt,
+            py::arg("fc_scale_blkn") = std::128, py::arg("fc_scale_blkk") = std::128);
       m.def("add", &aiter_add, "apply for add with transpose and broadcast.");
       m.def("mul", &aiter_mul, "apply for mul with transpose and broadcast.");
       m.def("sub", &aiter_sub, "apply for sub with transpose and broadcast.");
