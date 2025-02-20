@@ -640,20 +640,20 @@ void fmoe_fp8_g1u1_a16(torch::Tensor &out,                    // [token_cnt, dim
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
-    int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
+    //int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
 
-    if (selectedTile == 512)
+    if (inter_dim %512==0)
     {
         static FMoeKernel impl_512("fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co", 512);
         impl_ptr = &impl_512;
     }
-    else if (selectedTile == 320)
+    else if (inter_dim %320==0)
     {
         static FMoeKernel impl_320("fmoe_fp8_g1u1_smf_subGU_320", "fmoe_fp8_g1u1_smf_subGU_320.co", 320);
         impl_ptr = &impl_320;
     }
     else
-        TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+        TORCH_CHECK(false, __func__, " Unsupported selectedTile " + std::to_string(selectedTile) + ", which should be divisible by 320 or 512");
 
     impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
                                                      input,
