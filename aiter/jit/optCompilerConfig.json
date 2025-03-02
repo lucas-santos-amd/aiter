@@ -372,7 +372,7 @@
         ],
         "isASM": "False",
         "verbose": "False",
-        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 10 --output_dir {{}}'"
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 100 --output_dir {{}}'"
     },
     "module_mha_varlen_fwd": {
         "srcs": [
@@ -392,8 +392,8 @@
         "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 11 --output_dir {{}}'",
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 11 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 200 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --output_dir {{}}'"
         ]
     },
     "module_mha_bwd": {
@@ -413,7 +413,7 @@
         ],
         "isASM": "False",
         "verbose": "False",
-        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 10 --output_dir {{}}'"
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 300 --output_dir {{}}'"
     },
     "module_mha_varlen_bwd": {
         "srcs": [
@@ -432,6 +432,6 @@
         ],
         "isASM": "False",
         "verbose": "False",
-        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 11 --output_dir {{}}'"
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 400 --output_dir {{}}'"
     }
 }
