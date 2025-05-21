@@ -26,7 +26,7 @@ def _per_token_quant(
 
     qx = x * scale_recip
 
-    tl.store(y_scale_ptr + row_idx, scale_out.to(y_scale_ptr.dtype.element_ty))
+    tl.store(y_scale_ptr + row_idx, scale_out.to(y_scale_ptr.type.element_ty))
 
     return qx
 
@@ -247,7 +247,7 @@ def _fused_add_layernorm_kernel(
 
 
 @triton.jit
-def quant_layernorm_kernel(
+def _quant_layernorm_kernel(
     # Pointers to matrices
     x_ptr,
     y_ptr,
@@ -384,7 +384,7 @@ def quant_layernorm_kernel(
 
         y_block = _per_token_quant(aux_block, y_scale_ptr, row_max, row, DTYPE_MAX)
 
-        tl.store(y_ptr_start + col_offsets, y_block)
+        tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty))
 
     col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < n_cols
@@ -392,7 +392,7 @@ def quant_layernorm_kernel(
 
     y_block = _per_token_quant(aux_block, y_scale_ptr, row_max, row, DTYPE_MAX)
 
-    tl.store(y_ptr_start + col_offsets, y_block, mask=mask)
+    tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty), mask=mask)
 
 
 def get_dtype_max(dtype):
@@ -470,7 +470,6 @@ def layernorm2d_fwd_with_smoothquant(
     x_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 
-    out = torch.empty_like(input)
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -481,9 +480,7 @@ def layernorm2d_fwd_with_smoothquant(
     DTYPE_MAX = get_dtype_max(out.dtype)
 
     # Auxiliary tensor to store the RMSNorm output as fp32 before applying the quantization when using the blocked approach
-    aux = None
-    if USE_BLOCKED:
-        aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
+    aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
     _quant_layernorm_kernel[(M,)](
         input,
@@ -498,7 +495,7 @@ def layernorm2d_fwd_with_smoothquant(
         aux.stride(0),
         M,
         N,
-        eps,
+        epsilon,
         DTYPE_MAX,
         IS_SMOOTH,
         BLOCK_SIZE,
@@ -517,7 +514,6 @@ def layernorm2d_fwd_with_dynamicquant(
     x_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 
-    out = torch.empty_like(input)
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -529,9 +525,7 @@ def layernorm2d_fwd_with_dynamicquant(
     DTYPE_MAX = get_dtype_max(out.dtype)
 
     # Auxiliary tensor to store the RMSNorm output as fp32 before applying the quantization when using the blocked approach
-    aux = None
-    if USE_BLOCKED:
-        aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
+    aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
     _quant_layernorm_kernel[(M,)](
         input,
@@ -546,10 +540,10 @@ def layernorm2d_fwd_with_dynamicquant(
         aux.stride(0),
         M,
         N,
-        eps,
+        epsilon,
         DTYPE_MAX,
         IS_SMOOTH,
         BLOCK_SIZE,
     )
 
-    return out
+    return out, aux.to(input.dtype)
