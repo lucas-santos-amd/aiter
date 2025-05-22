@@ -335,7 +335,7 @@ def _quant_layernorm_kernel(
 
     row_max = 0.0
 
-    # Normalize and store
+    # Normalize and write output temporarily as fp32
     loop_num_l = loop_num
     for b in range(0, loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -356,7 +356,7 @@ def _quant_layernorm_kernel(
         aux_ptrs = aux_ptr_start + col_offsets
         tl.store(aux_ptrs, y_block)
 
-    # For last iteration, do masked load and store
+    # For last iteration, do masked load
     col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < n_cols
     w_block = tl.load(w_ptr + col_offsets, mask=mask, other=0.0)
@@ -375,6 +375,7 @@ def _quant_layernorm_kernel(
 
     tl.store(aux_ptr_start + col_offsets, y_block, mask=mask)
 
+    # Apply quantization and write output
     loop_num_l = loop_num
     for b in range(0, loop_num_l):
         col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -384,6 +385,7 @@ def _quant_layernorm_kernel(
 
         tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty))
 
+    # For last iteration, do masked load and store
     col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < n_cols
     aux_block = tl.load(aux_ptr_start + col_offsets, mask=mask, other=0.0)
