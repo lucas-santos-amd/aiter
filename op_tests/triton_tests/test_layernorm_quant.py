@@ -40,15 +40,12 @@ def run_torch(
 def run_triton(
     input, weight, bias, eps, residual=None, x_scale=None, y_scale_dtype=None
 ):
-    aux = None
     if x_scale is None:
         y_scale = torch.empty(input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
         output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
         if residual is None:
             residual_out = None
-            _, aux = layernorm2d_fwd_with_dynamicquant(
-                output, input, y_scale, weight, bias, eps
-            )
+            layernorm2d_fwd_with_dynamicquant(output, input, y_scale, weight, bias, eps)
         elif residual is not None:
             residual_out = torch.empty_like(input)
             layernorm2d_fwd_with_add_dynamicquant(
@@ -76,25 +73,29 @@ def run_triton(
                 eps,
             )
 
-    return output, residual_out, y_scale, aux
+    return output, residual_out, y_scale
 
 
 def get_vals():
 
+    # vals = [
+    # (1823, 781),
+    # (2, 128),
+    # (1, 4),
+    # (128, 2),
+    # (1, 128),
+    # (8192, 8192),
+    # (4096, 8192),
+    # (359, 1),
+    # (1, 359),
+    # (1, 131072),
+    # (1, 89999),
+    # ]
     vals = [
-        (1823, 781),
-        (2, 128),
-        (1, 4),
-        (128, 2),
-        (1, 128),
-        (8192, 8192),
-        (4096, 8192),
-        (359, 1),
-        (1, 359),
-        (1, 131072),
-        (1, 89999),
+        (m, n)
+        for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        for n in [4096, 8192, 16384, 32768, 65536]
     ]
-
     return vals
 
 
@@ -156,20 +157,10 @@ def test_layernorm_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-5):
 
     # forward pass
     y_torch, _, y_scale_torch = run_torch(x, w, b, eps, y_scale_dtype=scale_dtype)
-    y_triton, _, y_scale_triton, aux = run_triton(
-        x, w, b, eps, y_scale_dtype=scale_dtype
-    )
+    y_triton, _, y_scale_triton = run_triton(x, w, b, eps, y_scale_dtype=scale_dtype)
 
-    aux_torch = F.layer_norm(
-        input=x,
-        normalized_shape=(x.shape[-1],),
-        weight=w,
-        bias=b,
-        eps=eps,
-    )
-    triton.testing.assert_close(aux, aux_torch, atol=1e-3, rtol=1e-3)
-    # triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
-    # triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
+    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
 
 
 # # pytest

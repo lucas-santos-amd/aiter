@@ -278,13 +278,15 @@ def _quant_layernorm_kernel(
     Note: this is Triton jited function and not meant to be called directly. Call layer_norm function
     below
 
-    Applies Layer Normalization over a mini-batch of inputs.
+    Applies Layer Normalization over a mini-batch of inputs and quantizes the result.
 
     Key parameters:
     - X: The input tensor to be normalized with shape (M, N).
     - Y: The output tensor with the same shape as the input one.
     - W: The learnable weights tensor with shape (N, ).
     - B: The learnable bias tensor with shape (N, ).
+    - X_scale: The tensor to be multiplied by the LayerNorm output if IS_SMOOTH is true, with shape (n_cols, ).
+    - Y_scale: The tensor where the scale for each row will be stored with shape (n_rows, ).
     """
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
@@ -354,8 +356,6 @@ def _quant_layernorm_kernel(
         aux_ptrs = aux_ptr_start + col_offsets
         tl.store(aux_ptrs, y_block)
 
-        # tl.store(y_ptr_start + col_offsets, y_block)
-
     # For last iteration, do masked load and store
     col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < n_cols
@@ -374,8 +374,6 @@ def _quant_layernorm_kernel(
     row_max = max(row_max, blk_max)
 
     tl.store(aux_ptr_start + col_offsets, y_block, mask=mask)
-
-    # tl.store(y_ptr_start + col_offsets, y_block, mask=mask)
 
     loop_num_l = loop_num
     for b in range(0, loop_num_l):
@@ -546,4 +544,4 @@ def layernorm2d_fwd_with_dynamicquant(
         BLOCK_SIZE,
     )
 
-    return out, aux.to(input.dtype)
+    return out
