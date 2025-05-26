@@ -22,11 +22,15 @@ def _per_token_quant(
     scale_out = row_max / DTYPE_MAX
     scale_out = tl.where(scale_out == 0, 1.0, scale_out)
 
-    scale_recip = 1 / scale_out
+    # scale_recip = 1 / scale_out
 
-    qx = x * scale_recip
+    # qx = x * scale_recip
+    qx = x / scale_out
 
+    qx = tl.floor(qx + 0.5)
+    qx = tl.clamp(qx, -DTYPE_MAX, DTYPE_MAX)
     tl.store(y_scale_ptr + row_idx, scale_out.to(y_scale_ptr.type.element_ty))
+    # tl.store(y_scale_ptr + row_idx, row_max.to(y_scale_ptr.type.element_ty))
 
     return qx
 
@@ -333,7 +337,8 @@ def _quant_layernorm_kernel(
     var = tl.sum(_var, axis=0) / n_cols
     rstd = tl.rsqrt(var + eps)
 
-    row_max = 0.0
+    # row_max: tl.float32 = 0.0
+    row_max = tl.zeros((), dtype=tl.float32)
 
     # Normalize and write output temporarily as fp32
     loop_num_l = loop_num
@@ -546,4 +551,4 @@ def layernorm2d_fwd_with_dynamicquant(
         BLOCK_SIZE,
     )
 
-    return out
+    return out, aux.to(input.dtype)
