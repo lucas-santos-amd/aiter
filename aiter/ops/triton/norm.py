@@ -20,15 +20,16 @@ def _per_token_quant(
     """
 
     scale_out = row_max / DTYPE_MAX
+    # scale_out = row_max / 127
     scale_out = tl.where(scale_out == 0, 1.0, scale_out)
 
-    # scale_recip = 1 / scale_out
+    scale_recip = 1 / scale_out
 
-    # qx = x * scale_recip
-    qx = x / scale_out
+    qx = x * scale_recip
+    # qx = x / scale_out
 
-    qx = tl.floor(qx + 0.5)
-    qx = tl.clamp(qx, -DTYPE_MAX, DTYPE_MAX)
+    # qx = tl.floor(qx + 0.5)
+    # qx = tl.clamp(qx, -DTYPE_MAX, DTYPE_MAX)
     tl.store(y_scale_ptr + row_idx, scale_out.to(y_scale_ptr.type.element_ty))
     # tl.store(y_scale_ptr + row_idx, row_max.to(y_scale_ptr.type.element_ty))
 
@@ -337,8 +338,7 @@ def _quant_layernorm_kernel(
     var = tl.sum(_var, axis=0) / n_cols
     rstd = tl.rsqrt(var + eps)
 
-    # row_max: tl.float32 = 0.0
-    row_max = tl.zeros((), dtype=tl.float32)
+    row_max: tl.float32 = 0.0
 
     # Normalize and write output temporarily as fp32
     loop_num_l = loop_num
@@ -360,6 +360,7 @@ def _quant_layernorm_kernel(
 
         aux_ptrs = aux_ptr_start + col_offsets
         tl.store(aux_ptrs, y_block)
+        # tl.store(aux_ptrs, y_block.to(aux_ptr.type.element_ty))
 
     # For last iteration, do masked load
     col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -367,7 +368,8 @@ def _quant_layernorm_kernel(
     w_block = tl.load(w_ptr + col_offsets, mask=mask, other=0.0)
     b_block = tl.load(b_ptr + col_offsets, mask=mask, other=0.0)
     x_block = tl.load(x_ptr_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
-    y_block = (x_block - mean) * rstd
+    # y_block = (x_block - mean) * rstd
+    y_block = tl.where(col_offsets < n_cols, (x_block - mean) * rstd, 0.0)
     y_block = y_block * w_block + b_block
 
     if IS_SMOOTH:
@@ -379,6 +381,7 @@ def _quant_layernorm_kernel(
     row_max = max(row_max, blk_max)
 
     tl.store(aux_ptr_start + col_offsets, y_block, mask=mask)
+    # tl.store(aux_ptr_start + col_offsets, y_block.to(aux_ptr.type.element_ty), mask=mask)
 
     # Apply quantization and write output
     loop_num_l = loop_num
@@ -387,6 +390,10 @@ def _quant_layernorm_kernel(
         aux_block = tl.load(aux_ptr_start + col_offsets)  # Unmasked loads
 
         y_block = _per_token_quant(aux_block, y_scale_ptr, row_max, row, DTYPE_MAX)
+        # scale_out = row_max / DTYPE_MAX
+        # scale_out = tl.where(scale_out == 0, 1.0, scale_out)
+        # scale_recip = 1 / scale_out
+        # y_block = aux_block * scale_recip
 
         tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty))
 
@@ -396,6 +403,11 @@ def _quant_layernorm_kernel(
     aux_block = tl.load(aux_ptr_start + col_offsets, mask=mask, other=0.0)
 
     y_block = _per_token_quant(aux_block, y_scale_ptr, row_max, row, DTYPE_MAX)
+    # scale_out = row_max / DTYPE_MAX
+    # scale_out = tl.where(scale_out == 0, 1.0, scale_out)
+    # scale_recip = 1 / scale_out
+    # y_block = aux_block * scale_recip
+    # tl.store(y_scale_ptr + row, scale_out.to(y_scale_ptr.type.element_ty))
 
     tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty), mask=mask)
 

@@ -8,6 +8,86 @@ from aiter.ops.triton.norm import (
     layernorm2d_fwd_with_smoothquant,
 )
 
+import random
+
+seed = random.randint(0, 2**32 - 1)
+# seed = 0
+
+import triton.language as tl
+
+
+@triton.jit
+def broadcast_div_kernel(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    N,
+    stride_am,
+    stride_an,
+    stride_cm,
+    stride_cn,
+    stride_bm,
+    BLOCK_N: tl.constexpr,
+):
+
+    pid_m = tl.program_id(0)  # bloco processando a linha m
+
+    # Offset do inicio da linha m
+    row_offset_A = A_ptr + pid_m * stride_am
+    row_offset_C = C_ptr + pid_m * stride_cm
+
+    # B e 1D: shape (M,)
+    b = tl.load(B_ptr + pid_m * stride_bm)
+
+    # Processar a linha em blocos de tamanho BLOCK_N
+    for col_start in range(0, N, BLOCK_N):
+        offsets_n = col_start + tl.arange(0, BLOCK_N)
+        mask = offsets_n < N
+
+        # Pointers para A e C
+        A_ptrs = row_offset_A + offsets_n * stride_an
+        C_ptrs = row_offset_C + offsets_n * stride_cn
+
+        # Load A
+        A = tl.load(A_ptrs, mask=mask)
+
+        # b_recip = 1 / b
+        # C = A * b_recip
+        C = A / b
+
+        # Store result
+        tl.store(C_ptrs, C.to(C_ptr.type.element_ty), mask=mask)
+
+
+def broadcast_div(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    # assert A.ndim == 2 and B.ndim == 1, "A must be 2D and B must be 1D"
+    # assert A.shape[0] == B.shape[0], "A and B must have the same first dimension"
+    # assert A.is_cuda and B.is_cuda, "Tensors must be on CUDA device."
+
+    M, N = A.shape
+    C = torch.empty_like(A)
+    C = torch.empty(A.shape, dtype=torch.int8, device="cuda")
+
+    # BLOCK_N = 128
+    BLOCK_N = triton.next_power_of_2(N)
+
+    grid = (M,)
+
+    broadcast_div_kernel[grid](
+        A,
+        B,
+        C,
+        N,
+        A.stride(0),
+        A.stride(1),
+        C.stride(0),
+        C.stride(1),
+        B.stride(0),
+        BLOCK_N=BLOCK_N,
+    )
+
+    return C
+
 
 def get_dtype_max(dtype):
     try:
@@ -43,18 +123,16 @@ def pertoken_quant(
         per_token_scale[per_token_scale == 0] = 1
 
     # quant hidden_states
-    # y = (hidden_states / per_token_scale).to(dtype=quant_dtype)
-    y = torch.round(hidden_states / per_token_scale)
-    print((y > 127).sum(), (y < -128).sum())
-    y = torch.clamp(y, -128, 127).to(torch.int8)
+    y = (hidden_states / per_token_scale).to(dtype=quant_dtype)
+    # y = (hidden_states / per_token_scale)
+
+    # y = torch.round(hidden_states / per_token_scale)
+    # print((y > 127).sum(), (y < -128).sum())
+    # y = torch.clamp(y, -128, 127).to(torch.int8)
+    # y = torch.clamp(y, -128, 127)
     y_scale = per_token_scale.to(scale_dtype)
     return y, y_scale, per_token_amax
 
-
-import random
-
-seed = random.randint(0, 2**32 - 1)
-seed = 0
 
 # def torch_layernorm(x, g, b, out_dtype=torch.float16, epsilon=1e-6):
 # M, N = x.shape
@@ -116,6 +194,7 @@ def run_triton(
     if x_scale is None:
         y_scale = torch.empty(input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
         output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
+        # output = torch.empty(input.shape, dtype=torch.float32, device="cuda")
         if residual is None:
             residual_out = None
             _, aux = layernorm2d_fwd_with_dynamicquant(
@@ -159,8 +238,8 @@ def get_vals():
         # (1, 4),
         # (128, 2),
         # (1, 128),
-        (8192, 8192),
-        (4096, 8192),
+        # (8192, 8192),
+        # (4096, 8192),
         # (359, 1),
         # (1, 359),
         # (1, 131072),
@@ -202,7 +281,6 @@ def get_vals():
 # w = torch.rand(w_shape, device="cuda", dtype=dtype)
 # x_scale = torch.rand(w_shape, device="cuda", dtype=scale_dtype)
 
-# # forward pass
 # y_torch, _, y_scale_torch = run_torch(
 # x, w, b, eps, x_scale=x_scale, y_scale_dtype=scale_dtype
 # )
@@ -271,7 +349,7 @@ def test_layernorm_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
     # bias=b,
     # eps=eps,
     # )
-    # y_triton, _, y_scale_triton = pertoken_quant(aux_triton, x_scale=None)
+    # y_triton, y_scale_triton, row_max_triton = pertoken_quant(aux_triton, scale=y_scale_triton, x_scale=None)
 
     xq_dequant = y_triton.to(torch.int32) * y_scale_triton
     xq_dequant = xq_dequant.to(dtype)
@@ -285,17 +363,31 @@ def test_layernorm_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
         atol = 1e-2
         rtol = 1e-2
 
-    # torch.set_printoptions(precision=6)
-    # print(torch.max(aux_torch - aux_triton))
-    # print(aux_torch)
-    # print(aux_triton)
-    # print(y_torch)
-    # print(y_triton)
+    # y_triton_2 = broadcast_div(aux_triton, y_scale_triton)
 
-    # print(y_triton[torch.abs(y_triton - y_torch) > 1])
-    # print(y_torch[torch.abs(y_triton - y_torch) > 1])
+    # torch.set_printoptions(precision=6)
+    # threshold = 120
+    # print("\nLayerNorm outputs where the final result didn't match:")
+    # print("Triton:", aux_triton[torch.abs(y_triton - y_torch) > threshold])
+    # print("Torch:", aux_torch[torch.abs(y_triton - y_torch) > threshold])
+    # print("\nScales where the final result didn't match:")
+    # print(
+    # "Triton:",
+    # y_scale_torch[(torch.abs(y_triton - y_torch) > threshold).any(dim=1)].view(-1),
+    # )
+    # print(
+    # "Torch:",
+    # y_scale_triton[(torch.abs(y_triton - y_torch) > threshold).any(dim=1)].view(-1),
+    # )
+    # print("\nQuantized outputs that didn't match:")
+    # print("Triton:", y_triton[torch.abs(y_triton - y_torch) > threshold])
+    # print("Torch:", y_torch[torch.abs(y_triton - y_torch) > threshold])
+
+    # index_cond = (torch.abs(y_triton - y_torch) > threshold)
+    # indexes = torch.nonzero(index_cond)
+    # print("\nIndexes ", indexes)
     # triton.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
     triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    # triton.testing.assert_close(y_triton_2, y_torch, atol=1, rtol=0)
     # triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
-    # triton.testing.assert_close(y_scale_triton, row_max_torch, atol=1e-5, rtol=1e-5)
     # triton.testing.assert_close(aux_torch, aux_triton, atol=atol, rtol=rtol)
