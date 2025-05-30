@@ -1,23 +1,237 @@
 import triton
+import triton.language as tl
 import torch
 import torch.nn.functional as F
 import pytest
-import aiter
-from aiter.ops.triton.norm import (
-    layernorm2d_fwd_with_dynamicquant,
-    layernorm2d_fwd_with_smoothquant,
-)
+from typing import Optional
 
-import random
 
-seed = random.randint(0, 2**32 - 1)
-# seed = 0
-
-import triton.language as tl
+def get_dtype_max(dtype):
+    if torch.is_floating_point(torch.tensor([], dtype=dtype)):
+        return torch.finfo(dtype).max
+    else:
+        return torch.iinfo(dtype).max
 
 
 @triton.jit
-def broadcast_div_kernel(
+def _triton_per_token_quant(
+    x,
+    y_scale_ptr,
+    row_max,
+    row_idx,
+    DTYPE_MAX: tl.constexpr,
+):
+    """
+    #TODO: Add Doc
+    """
+
+    scale_out = row_max / DTYPE_MAX
+    scale_out = tl.where(scale_out == 0, 1.0, scale_out)
+
+    scale_recip = 1 / scale_out
+    qx = x * scale_recip
+
+    tl.store(y_scale_ptr + row_idx, scale_out.to(y_scale_ptr.type.element_ty))
+    return qx
+
+
+@triton.jit
+def _quant_layernorm_kernel(
+    # Pointers to matrices
+    x_ptr,
+    y_ptr,
+    w_ptr,
+    b_ptr,
+    x_scale_ptr,
+    y_scale_ptr,
+    # Auxiliary tensor to store intermediate data
+    aux_ptr,
+    # The stride variables represent how much to increase the ptr by when
+    # moving by 1 element in a particular dimension. E.g. `x_row_stride` is
+    # how much to increase `x_ptr` by to get the element one row down.
+    x_row_stride,
+    y_row_stride,
+    aux_row_stride,
+    # Matrix dimensions
+    n_rows,
+    n_cols,
+    # Epsilon to avoid division by zero
+    eps,
+    # Dtype max for quantization
+    DTYPE_MAX: tl.constexpr,
+    # Meta-parameters
+    IS_SMOOTH: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Note: this is Triton jited function and not meant to be called directly. Call layer_norm function
+    below
+
+    Applies Layer Normalization over a mini-batch of inputs and quantizes the result.
+
+    Key parameters:
+    - X: The input tensor to be normalized with shape (M, N).
+    - Y: The output tensor with the same shape as the input one.
+    - W: The learnable weights tensor with shape (N, ).
+    - B: The learnable bias tensor with shape (N, ).
+    - X_scale: The tensor to be multiplied by the LayerNorm output if IS_SMOOTH is true, with shape (n_cols, ).
+    - Y_scale: The tensor where the scale for each row will be stored with shape (n_rows, ).
+    """
+    # Map the program id to the row of X and Y it should compute.
+    row = tl.program_id(0)
+    x_ptr_start = x_ptr + (row * x_row_stride)
+    y_ptr_start = y_ptr + (row * y_row_stride)
+    aux_ptr_start = aux_ptr + (row * aux_row_stride)
+
+    loop_num = tl.cdiv(n_cols, BLOCK_SIZE) - 1
+
+    # Calculate mean
+    mean = 0
+    _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    loop_num_l = loop_num
+    for b in range(0, loop_num_l):
+        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
+        _mean += x_block
+
+    # For last iteration, do masked load
+    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x_block = tl.load(
+        x_ptr_start + col_offsets, mask=col_offsets < n_cols, other=0.0
+    ).to(tl.float32)
+    _mean += x_block
+    mean = tl.sum(_mean, axis=0) / n_cols
+
+    # Calculate variance
+    _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    loop_num_l = loop_num
+    for b in range(0, loop_num_l):
+        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
+        x_block = x_block - mean
+        _var += x_block * x_block
+
+    # For last iteration, do masked load
+    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x_block = tl.load(
+        x_ptr_start + col_offsets, mask=col_offsets < n_cols, other=0.0
+    ).to(tl.float32)
+    x_block = tl.where(col_offsets < n_cols, x_block - mean, 0.0)
+    _var += x_block * x_block
+
+    var = tl.sum(_var, axis=0) / n_cols
+    rstd = tl.rsqrt(var + eps)
+
+    row_max: tl.float32 = 0.0
+
+    # Normalize and write output temporarily as fp32
+    loop_num_l = loop_num
+    for b in range(0, loop_num_l):
+        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        w_block = tl.load(w_ptr + col_offsets)
+        b_block = tl.load(b_ptr + col_offsets)
+        x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)
+        y_block = (x_block - mean) * rstd
+        y_block = y_block * w_block + b_block
+
+        if IS_SMOOTH:
+            x_scale_ptrs = x_scale_ptr + col_offsets
+            x_scale = tl.load(x_scale_ptrs)
+            y_block *= x_scale
+
+        blk_max = tl.max(tl.abs(y_block), axis=-1)
+        row_max = max(row_max, blk_max)
+
+        aux_ptrs = aux_ptr_start + col_offsets
+        tl.store(aux_ptrs, y_block)
+
+    # For last iteration, do masked load
+    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+    w_block = tl.load(w_ptr + col_offsets, mask=mask, other=0.0)
+    b_block = tl.load(b_ptr + col_offsets, mask=mask, other=0.0)
+    x_block = tl.load(x_ptr_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
+    y_block = tl.where(col_offsets < n_cols, (x_block - mean) * rstd, 0.0)
+    y_block = y_block * w_block + b_block
+
+    if IS_SMOOTH:
+        x_scale_ptrs = x_scale_ptr + col_offsets
+        x_scale = tl.load(x_scale_ptrs, mask=mask, other=0.0)
+        y_block *= x_scale
+
+    blk_max = tl.max(tl.abs(y_block), axis=-1)
+    row_max = max(row_max, blk_max)
+
+    tl.store(aux_ptr_start + col_offsets, y_block, mask=mask)
+
+    # Apply quantization and write output
+    loop_num_l = loop_num
+    for b in range(0, loop_num_l):
+        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        aux_block = tl.load(aux_ptr_start + col_offsets)  # Unmasked loads
+
+        y_block = _triton_per_token_quant(
+            aux_block, y_scale_ptr, row_max, row, DTYPE_MAX
+        )
+        tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty))
+
+    # For last iteration, do masked load and store
+    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+    aux_block = tl.load(aux_ptr_start + col_offsets, mask=mask, other=0.0)
+
+    y_block = _triton_per_token_quant(aux_block, y_scale_ptr, row_max, row, DTYPE_MAX)
+
+    tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty), mask=mask)
+
+
+def layernorm2d_fwd_with_dynamicquant(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    yscale: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    epsilon: float = 1e-5,
+    x_bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+
+    M, N = input.shape
+
+    # Less than 64KB per feature: enqueue fused kernel
+    MAX_FUSED_SIZE = 65536 // input.element_size()
+    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
+
+    xscale = None
+    IS_SMOOTH = False
+    DTYPE_MAX = get_dtype_max(out.dtype)
+
+    # Auxiliary tensor to store the RMSNorm output as fp32 before applying the quantization when using the blocked approach
+    aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
+
+    _quant_layernorm_kernel[(M,)](
+        input,
+        out,
+        weight,
+        bias,
+        xscale,
+        yscale,
+        aux,
+        input.stride(0),
+        out.stride(0),
+        aux.stride(0),
+        M,
+        N,
+        epsilon,
+        DTYPE_MAX,
+        IS_SMOOTH,
+        BLOCK_SIZE,
+    )
+
+    return out, aux.to(input.dtype)
+
+
+@triton.jit
+def standalone_triton_quant_kernel(
     A_ptr,
     B_ptr,
     C_ptr,
@@ -29,51 +243,33 @@ def broadcast_div_kernel(
     stride_bm,
     BLOCK_N: tl.constexpr,
 ):
-
-    pid_m = tl.program_id(0)  # bloco processando a linha m
-
-    # Offset do inicio da linha m
+    pid_m = tl.program_id(0)
     row_offset_A = A_ptr + pid_m * stride_am
     row_offset_C = C_ptr + pid_m * stride_cm
-
-    # B e 1D: shape (M,)
     b = tl.load(B_ptr + pid_m * stride_bm)
-
-    # Processar a linha em blocos de tamanho BLOCK_N
     for col_start in range(0, N, BLOCK_N):
         offsets_n = col_start + tl.arange(0, BLOCK_N)
         mask = offsets_n < N
-
-        # Pointers para A e C
         A_ptrs = row_offset_A + offsets_n * stride_an
         C_ptrs = row_offset_C + offsets_n * stride_cn
-
-        # Load A
         A = tl.load(A_ptrs, mask=mask)
 
-        # b_recip = 1 / b
-        # C = A * b_recip
-        C = A / b
+        b_recip = 1 / b
+        C = A * b_recip
 
-        # Store result
         tl.store(C_ptrs, C.to(C_ptr.type.element_ty), mask=mask)
 
 
-def broadcast_div(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    # assert A.ndim == 2 and B.ndim == 1, "A must be 2D and B must be 1D"
-    # assert A.shape[0] == B.shape[0], "A and B must have the same first dimension"
-    # assert A.is_cuda and B.is_cuda, "Tensors must be on CUDA device."
-
+def standalone_triton_quant(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     M, N = A.shape
     C = torch.empty_like(A)
     C = torch.empty(A.shape, dtype=torch.int8, device="cuda")
 
-    # BLOCK_N = 128
     BLOCK_N = triton.next_power_of_2(N)
 
     grid = (M,)
 
-    broadcast_div_kernel[grid](
+    standalone_triton_quant_kernel[grid](
         A,
         B,
         C,
@@ -89,15 +285,7 @@ def broadcast_div(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return C
 
 
-def get_dtype_max(dtype):
-    try:
-        dtypeMax = torch.finfo(dtype).max
-    except:
-        dtypeMax = torch.iinfo(dtype).max
-    return dtypeMax
-
-
-def pertoken_quant(
+def torch_pertoken_quant(
     x,
     scale=None,
     x_scale=None,  # smooth_scale
@@ -124,31 +312,9 @@ def pertoken_quant(
 
     # quant hidden_states
     y = (hidden_states / per_token_scale).to(dtype=quant_dtype)
-    # y = (hidden_states / per_token_scale)
 
-    # y = torch.round(hidden_states / per_token_scale)
-    # print((y > 127).sum(), (y < -128).sum())
-    # y = torch.clamp(y, -128, 127).to(torch.int8)
-    # y = torch.clamp(y, -128, 127)
     y_scale = per_token_scale.to(scale_dtype)
-    return y, y_scale, per_token_amax
-
-
-# def torch_layernorm(x, g, b, out_dtype=torch.float16, epsilon=1e-6):
-# M, N = x.shape
-# x_f32 = x.float()
-# g_f32 = g.float()
-# b_f32 = b.float()
-
-# mean = torch.mean(x_f32, dim=-1, keepdim=True)  # shape: (M, 1)
-# var = torch.var(x_f32, dim=-1, unbiased=False, keepdim=True)  # shape: (M, 1)
-# # inv_std = 1.0 / torch.sqrt(var + epsilon)  # shape: (M, 1)
-# inv_std = torch.rsqrt(var + epsilon)  # shape: (M, 1)
-
-# norm_x = (x_f32 - mean) * inv_std  # shape: (M, N)
-# out = norm_x * g_f32 + b_f32  # broadcast g and b from (N,) to (M, N)
-
-# return out.to(out_dtype)
+    return y, y_scale
 
 
 def run_torch(
@@ -163,7 +329,6 @@ def run_torch(
             bias=bias,
             eps=eps,
         )
-        # output = torch_layernorm(input, weight, bias, out_dtype=torch.float16, epsilon=eps)
     else:
         residual_out = input + residual
         output = F.layer_norm(
@@ -177,14 +342,11 @@ def run_torch(
     if y_scale_dtype is None:
         y_scale = None
     else:
-        # output, y_scale = aiter.pertoken_quant(
-        # output, x_scale=x_scale, quant_dtype=torch.int8
-        # )
-        output, y_scale, row_max = pertoken_quant(
+        output, y_scale = torch_pertoken_quant(
             output, x_scale=x_scale, quant_dtype=torch.int8
         )
     # return output, residual_out, y_scale
-    return output, residual_out, y_scale, aux, row_max
+    return output, residual_out, y_scale, aux
 
 
 def run_triton(
@@ -194,7 +356,6 @@ def run_triton(
     if x_scale is None:
         y_scale = torch.empty(input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
         output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
-        # output = torch.empty(input.shape, dtype=torch.float32, device="cuda")
         if residual is None:
             residual_out = None
             _, aux = layernorm2d_fwd_with_dynamicquant(
@@ -233,76 +394,27 @@ def run_triton(
 def get_vals():
 
     vals = [
-        (1823, 781),
+        (1823, 781),  # -> FAIL
+        # (8192, 8192), # -> FAIL
+        # (4096, 8192), # -> FAIL
         # (2, 128),
         # (1, 4),
         # (128, 2),
         # (1, 128),
-        # (8192, 8192),
-        # (4096, 8192),
         # (359, 1),
         # (1, 359),
         # (1, 131072),
         # (1, 89999),
         # (10000, 10000),
-        # (3, 7),
     ]
 
-    # Test cases for the CK unit tests
+    # Test cases for the CK unit tests, everything works for these
     # vals += [
     # (m, n)
     # for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]
     # for n in [1024, 2048, 4096, 8192, 16384, 32768, 65536]
     # ]
     return vals
-
-
-# pytest
-# @pytest.mark.parametrize("dtype_str", ["fp32", "fp16", "bf16"])
-# @pytest.mark.parametrize("scale_dtype_str", ["fp32"])
-# @pytest.mark.parametrize(
-# "M, N",
-# [(shape) for shape in get_vals()],
-# )
-# def test_layernorm_smoothquant(M, N, dtype_str, scale_dtype_str, eps=1e-5):
-# arg_to_torch_dtype = {
-# "fp16": torch.float16,
-# "bf16": torch.bfloat16,
-# "fp32": torch.float32,
-# }
-# dtype = arg_to_torch_dtype[dtype_str]
-# scale_dtype = arg_to_torch_dtype[scale_dtype_str]
-# # torch.manual_seed(0)
-# torch.manual_seed(seed)
-
-# x = torch.randn(M, N, device="cuda", dtype=dtype)
-# w_shape = (N,)
-# b = torch.rand(w_shape, device="cuda", dtype=dtype)
-# w = torch.rand(w_shape, device="cuda", dtype=dtype)
-# x_scale = torch.rand(w_shape, device="cuda", dtype=scale_dtype)
-
-# y_torch, _, y_scale_torch = run_torch(
-# x, w, b, eps, x_scale=x_scale, y_scale_dtype=scale_dtype
-# )
-# y_triton, _, y_scale_triton = run_triton(
-# x, w, b, eps, x_scale=x_scale, y_scale_dtype=scale_dtype
-# )
-
-# xq_dequant = y_triton.to(torch.int32) * y_scale_triton
-# xq_dequant = xq_dequant.to(dtype)
-# ref_xq_dequant = y_torch.to(torch.int32) * y_scale_torch
-# ref_xq_dequant = xq_dequant.to(dtype)
-
-# if dtype == torch.float32:
-# atol = 1e-5
-# rtol = 1e-5
-# else:
-# atol = 1e-2
-# rtol = 1e-2
-
-# triton.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
-# triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
-# triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
 
 
 # @pytest.mark.parametrize("dtype_str", ["fp32", "fp16", "bf16"])
@@ -320,41 +432,30 @@ def test_layernorm_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
     }
     dtype = arg_to_torch_dtype[dtype_str]
     scale_dtype = arg_to_torch_dtype[scale_dtype_str]
-    # torch.manual_seed(0)
-    torch.manual_seed(seed)
+    torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
-    # x = torch.tensor([[0.0001, 10000, 0.0001, 10000],
-    # [0.0001, 10000, 0.0001, 10000],
-    # [0.0001, 10000, 0.0001, 10000],
-    # [0.0001, 10000, 0.0001, 10000]], device="cuda", dtype=dtype)
+
     w_shape = (N,)
     b = torch.rand(w_shape, device="cuda", dtype=dtype)
     w = torch.rand(w_shape, device="cuda", dtype=dtype)
 
     # forward pass
     # y_torch, _, y_scale_torch = run_torch(x, w, b, eps, y_scale_dtype=scale_dtype)
-    y_torch, _, y_scale_torch, aux_torch, row_max_torch = run_torch(
+    y_torch, _, y_scale_torch, x_normed_torch = run_torch(
         x, w, b, eps, y_scale_dtype=scale_dtype
     )
     # y_triton, _, y_scale_triton = run_triton(x, w, b, eps, y_scale_dtype=scale_dtype)
-    y_triton, _, y_scale_triton, aux_triton = run_triton(
+    y_triton, _, y_scale_triton, x_normed_triton = run_triton(
         x, w, b, eps, y_scale_dtype=scale_dtype
     )
 
-    # aux_torch = F.layer_norm(
-    # input=x,
-    # normalized_shape=(x.shape[-1],),
-    # weight=w,
-    # bias=b,
-    # eps=eps,
-    # )
-    # y_triton, y_scale_triton, row_max_triton = pertoken_quant(aux_triton, scale=y_scale_triton, x_scale=None)
+    # Passing the triton layernorm output and scale to the torch quant function yields the correct result
+    # Just uncomment the line below to verify
+    # y_triton, y_scale_triton = torch_pertoken_quant(x_normed_triton, scale=y_scale_triton, x_scale=None)
 
-    xq_dequant = y_triton.to(torch.int32) * y_scale_triton
-    xq_dequant = xq_dequant.to(dtype)
-    ref_xq_dequant = y_torch.to(torch.int32) * y_scale_torch
-    ref_xq_dequant = xq_dequant.to(dtype)
+    # Passing the triton layernorm output and scale to a separate triton quant kernel also returns the correct result
+    y_triton_standalone = standalone_triton_quant(x_normed_triton, y_scale_triton)
 
     if dtype == torch.float32:
         atol = 1e-5
@@ -363,31 +464,36 @@ def test_layernorm_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
         atol = 1e-2
         rtol = 1e-2
 
-    # y_triton_2 = broadcast_div(aux_triton, y_scale_triton)
+    # This section prints the values for the layernorm outputs, scales and quantized results where
+    # the absolute difference between the triton and torch quantized output is greater than a set threshold,
+    # showing that the values of the layernorm output and scales are equivalent in the same indexes where
+    # the quantized results differ.
+    torch.set_printoptions(precision=5)
+    threshold = 120
+    condition = torch.abs(y_triton - y_torch) > threshold
+    print(
+        f"\nLayerNorm outputs where the quantized output error is greater than {threshold}:"
+    )
+    print("Triton:", x_normed_triton[condition])
+    print("Torch:", x_normed_torch[condition])
+    print(f"\nScales where the quantized output error is greater than {threshold}:")
+    print(
+        "Triton:",
+        y_scale_torch[(condition).any(dim=1)].view(-1),
+    )
+    print(
+        "Torch:",
+        y_scale_triton[(condition).any(dim=1)].view(-1),
+    )
+    print(f"\nQuantized outputs where the error is greater than {threshold}:")
+    print("Triton:", y_triton[condition])
+    print("Torch:", y_torch[condition])
 
-    # torch.set_printoptions(precision=6)
-    # threshold = 120
-    # print("\nLayerNorm outputs where the final result didn't match:")
-    # print("Triton:", aux_triton[torch.abs(y_triton - y_torch) > threshold])
-    # print("Torch:", aux_torch[torch.abs(y_triton - y_torch) > threshold])
-    # print("\nScales where the final result didn't match:")
-    # print(
-    # "Triton:",
-    # y_scale_torch[(torch.abs(y_triton - y_torch) > threshold).any(dim=1)].view(-1),
-    # )
-    # print(
-    # "Torch:",
-    # y_scale_triton[(torch.abs(y_triton - y_torch) > threshold).any(dim=1)].view(-1),
-    # )
-    # print("\nQuantized outputs that didn't match:")
-    # print("Triton:", y_triton[torch.abs(y_triton - y_torch) > threshold])
-    # print("Torch:", y_torch[torch.abs(y_triton - y_torch) > threshold])
-
-    # index_cond = (torch.abs(y_triton - y_torch) > threshold)
-    # indexes = torch.nonzero(index_cond)
-    # print("\nIndexes ", indexes)
-    # triton.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
+    # Compares the scales (PASS)
+    triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
+    # Compares the LayerNorm outputs (PASS)
+    triton.testing.assert_close(x_normed_torch, x_normed_triton, atol=atol, rtol=rtol)
+    # Compares the standalone quant triton kernel (PASS)
+    triton.testing.assert_close(y_triton_standalone, y_torch, atol=1, rtol=0)
+    # Compares the layernorm fused with quant triton kernel (FAIL)
     triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
-    # triton.testing.assert_close(y_triton_2, y_torch, atol=1, rtol=0)
-    # triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
-    # triton.testing.assert_close(aux_torch, aux_triton, atol=atol, rtol=rtol)
