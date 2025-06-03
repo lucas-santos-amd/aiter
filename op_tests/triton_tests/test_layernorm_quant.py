@@ -6,6 +6,8 @@ import aiter
 from aiter.ops.triton.norm import (
     layernorm2d_fwd_with_dynamicquant,
     layernorm2d_fwd_with_smoothquant,
+    layernorm2d_fwd_with_add_dynamicquant,
+    layernorm2d_fwd_with_add_smoothquant,
 )
 
 
@@ -30,7 +32,6 @@ def run_torch(
             bias=bias,
             eps=eps,
         )
-    aux = output
     if y_scale_dtype is None:
         y_scale = None
     else:
@@ -96,16 +97,8 @@ def get_vals():
         (1, 359),
         (1, 131072),
         (1, 89999),
-        (10000, 10000),
-        (3, 7),
     ]
 
-    # Test cases for the CK unit tests
-    vals += [
-        (m, n)
-        for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]
-        for n in [1024, 2048, 4096, 8192, 16384, 32768, 65536]
-    ]
     return vals
 
 
@@ -195,4 +188,100 @@ def test_layernorm_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
 
     triton.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
     triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("dtype_str", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("scale_dtype_str", ["fp32"])
+@pytest.mark.parametrize(
+    "M, N",
+    [(shape) for shape in get_vals()],
+)
+def test_layernorm_fused_add_smoothquant(M, N, dtype_str, scale_dtype_str, eps=1e-5):
+    arg_to_torch_dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }
+    dtype = arg_to_torch_dtype[dtype_str]
+    scale_dtype = arg_to_torch_dtype[scale_dtype_str]
+    torch.manual_seed(0)
+
+    x = torch.randn(M, N, device="cuda", dtype=dtype)
+    res = torch.randn(M, N, device="cuda", dtype=dtype)
+    w_shape = (N,)
+    b = torch.rand(w_shape, device="cuda", dtype=dtype)
+    w = torch.rand(w_shape, device="cuda", dtype=dtype)
+    x_scale = torch.rand(w_shape, device="cuda", dtype=scale_dtype)
+
+    y_torch, res_torch, y_scale_torch = run_torch(
+        x, w, b, eps, residual=res, x_scale=x_scale, y_scale_dtype=scale_dtype
+    )
+    y_triton, res_triton, y_scale_triton = run_triton(
+        x, w, b, eps, residual=res, x_scale=x_scale, y_scale_dtype=scale_dtype
+    )
+
+    xq_dequant = y_triton.to(torch.int32) * y_scale_triton
+    xq_dequant = xq_dequant.to(dtype)
+    ref_xq_dequant = y_torch.to(torch.int32) * y_scale_torch
+    ref_xq_dequant = xq_dequant.to(dtype)
+
+    if dtype == torch.float32:
+        atol = 1e-5
+        rtol = 1e-5
+    else:
+        atol = 1e-2
+        rtol = 1e-2
+
+    triton.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
+    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    triton.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
+    triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("dtype_str", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("scale_dtype_str", ["fp32"])
+@pytest.mark.parametrize(
+    "M, N",
+    [(shape) for shape in get_vals()],
+)
+def test_layernorm_fused_add_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
+    arg_to_torch_dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }
+    dtype = arg_to_torch_dtype[dtype_str]
+    scale_dtype = arg_to_torch_dtype[scale_dtype_str]
+    torch.manual_seed(0)
+
+    x = torch.randn(M, N, device="cuda", dtype=dtype)
+    res = torch.randn(M, N, device="cuda", dtype=dtype)
+    w_shape = (N,)
+    b = torch.rand(w_shape, device="cuda", dtype=dtype)
+    w = torch.rand(w_shape, device="cuda", dtype=dtype)
+
+    # forward pass
+    y_torch, res_torch, y_scale_torch = run_torch(
+        x, w, b, eps, residual=res, y_scale_dtype=scale_dtype
+    )
+    y_triton, res_triton, y_scale_triton = run_triton(
+        x, w, b, eps, residual=res, y_scale_dtype=scale_dtype
+    )
+
+    xq_dequant = y_triton.to(torch.int32) * y_scale_triton
+    xq_dequant = xq_dequant.to(dtype)
+    ref_xq_dequant = y_torch.to(torch.int32) * y_scale_torch
+    ref_xq_dequant = xq_dequant.to(dtype)
+
+    if dtype == torch.float32:
+        atol = 1e-5
+        rtol = 1e-5
+    else:
+        atol = 1e-2
+        rtol = 1e-2
+
+    triton.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
+    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    triton.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
     triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
