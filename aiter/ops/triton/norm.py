@@ -346,6 +346,7 @@ def _quant_layernorm_kernel(
             x_scale = tl.load(x_scale_ptrs)
             y_block *= x_scale
 
+        # Computes the max value for each row
         blk_max = tl.max(tl.abs(y_block), axis=-1)
         row_max = max(row_max, blk_max)
 
@@ -366,6 +367,7 @@ def _quant_layernorm_kernel(
         x_scale = tl.load(x_scale_ptrs, mask=mask, other=0.0)
         y_block *= x_scale
 
+    # Computes the max value for each row
     blk_max = tl.max(tl.abs(y_block), axis=-1)
     row_max = max(row_max, blk_max)
 
@@ -428,8 +430,7 @@ def _quant_fused_add_layernorm_kernel(
     Note: this is Triton jited function and not meant to be called directly. Call layernorm2d_fwd_with_add function
     below
 
-    Performs an addition between two inputs and then applies Layer Normalization over
-    the addition result.
+    Performs an addition between two inputs, applies Layer Normalization over the result and then quantizes it.
 
     Key parameters:
     - X: The input tensor to be normalized with shape (M, N).
@@ -438,6 +439,8 @@ def _quant_fused_add_layernorm_kernel(
     - Res_out: The tensor in which the addition result will be stored with shape (M, N).
     - W: The learnable weights tensor with shape (N, ).
     - B: The learnable bias tensor with shape (N, ).
+    - X_scale: The tensor to be multiplied by the LayerNorm output if IS_SMOOTH is true, with shape (n_cols, ).
+    - Y_scale: The tensor where the scale for each row will be stored with shape (n_rows, ).
     """
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
@@ -513,6 +516,7 @@ def _quant_fused_add_layernorm_kernel(
             x_scale = tl.load(x_scale_ptrs)
             y_block *= x_scale
 
+        # Computes the max value for each row
         blk_max = tl.max(tl.abs(y_block), axis=-1)
         row_max = max(row_max, blk_max)
 
@@ -535,6 +539,7 @@ def _quant_fused_add_layernorm_kernel(
         x_scale = tl.load(x_scale_ptrs, mask=mask, other=0.0)
         y_block *= x_scale
 
+    # Computes the max value for each row
     blk_max = tl.max(tl.abs(y_block), axis=-1)
     row_max = max(row_max, blk_max)
 
