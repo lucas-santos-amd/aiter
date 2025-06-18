@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import pytest
 import torch
-import torch.nn.functional as F
 import triton
 from aiter.ops.triton.rmsnorm import (
     rms_norm,
@@ -80,8 +79,22 @@ def test_rmsnorm(M, N, in_dtype_str):
 
     x, weight = generate_rmsnorm_inputs(M, N, in_dtype)
 
+    dy = torch.randn_like(x)
+    x.requires_grad_(True)
+    weight.requires_grad_(True)
+
+    # forward pass
     y_torch, *_ = run_torch(x, weight, 1e-5)
     y_triton, *_ = run_triton(x, weight, 1e-5)
+
+    # backward pass (triton)
+    y_triton.backward(dy, retain_graph=True)
+    dx_triton, dg_triton = [_.grad.clone() for _ in [x, weight]]
+    x.grad, weight.grad = None, None
+
+    # backward pass (torch)
+    y_torch.backward(dy, retain_graph=True)
+    dx_torch, dg_torch = [_.grad.clone() for _ in [x, weight]]
 
     if out_dtype in (torch.float16, torch.bfloat16):
         atol, rtol = 1e-2, 1e-2
@@ -97,6 +110,8 @@ def test_rmsnorm(M, N, in_dtype_str):
     ), f"y_torch has dtype={y_torch.dtype}, expected {out_dtype}"
 
     triton.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
+    triton.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
+    triton.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
