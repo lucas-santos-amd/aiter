@@ -1002,6 +1002,43 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float = 1e-
     return y, rsigma
 
 
+def _rmsnorm_forward_with_add(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    residual_in: torch.Tensor,
+    residual_out: torch.Tensor,
+    weight: torch.Tensor,
+    rsigma: torch.Tensor,
+    epsilon: float,
+):
+
+    n_rows, n_cols = x.shape
+
+    blk_size = block_size(x)
+    USE_BLOCKED = use_blocked(x)
+    NUM_PRGMS = num_programs(x)
+
+    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    _fused_add_rmsnorm_kernel[grid](
+        x,
+        out,
+        residual_in,
+        residual_out,
+        weight,
+        rsigma,
+        x.stride(0),
+        out.stride(0),
+        n_rows,
+        n_cols,
+        epsilon,
+        blk_size,
+        USE_BLOCKED,
+        NUM_PRGMS,
+    )
+
+    return rsigma
+
+
 def _rmsnorm_backward(dz, x, gamma, rsigma):
     dz_ = dz.contiguous()
     x_ = x.contiguous()
@@ -1016,6 +1053,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     USE_BLOCKED = use_blocked(x_)
     NUM_PRGMS = num_programs(x_)
     need_reduction = N > 1
+
     dg_tmp = (
         torch.empty(
             dg_tmp_rows(x_), N, device="cuda", dtype=torch.float32, requires_grad=False
@@ -1082,6 +1120,34 @@ class RMSNorm(torch.autograd.Function):
         return dx, dg, None, None
 
 
+class RMSNorm2dFwdWithAdd(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, y, x, res_in, res_out, weight, epsilon, is_grad_enabled):
+
+        is_grad = is_grad_enabled and any(
+            tensor.requires_grad for tensor in [x, weight]
+        )
+
+        M = x.shape[0]
+        rsigma = torch.empty((M,), dtype=torch.float32, device=x.device)
+
+        _rmsnorm_forward_with_add(y, x, res_in, res_out, weight, rsigma, epsilon)
+
+        if is_grad:
+            ctx.save_for_backward(res_out, weight, rsigma)
+
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight, rsigma = ctx.saved_tensors
+
+        dx, dg = _rmsnorm_backward(grad_output, x, weight, rsigma)
+
+        return None, dx, None, None, dg, None, None
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float = 1e-6):
 
     return RMSNorm.apply(x, weight, epsilon, torch.is_grad_enabled())
@@ -1096,34 +1162,9 @@ def rmsnorm2d_fwd_with_add(
     epsilon: float,
 ):
 
-    n_rows, n_cols = input.shape
-
-    rsigma = torch.empty((n_rows,), dtype=torch.float32, device=input.device)
-
-    MAX_FUSED_SIZE = 65536 // input.element_size()
-    blk_size = min(MAX_FUSED_SIZE, triton.next_power_of_2(n_cols))
-    USE_BLOCKED = n_cols > blk_size
-    NUM_PRGMS = min(n_rows, get_num_sms())
-
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
-    _fused_add_rmsnorm_kernel[grid](
-        input,
-        out,
-        residual_in,
-        residual_out,
-        weight,
-        rsigma,
-        input.stride(0),
-        out.stride(0),
-        n_rows,
-        n_cols,
-        epsilon,
-        blk_size,
-        USE_BLOCKED,
-        NUM_PRGMS,
+    return RMSNorm2dFwdWithAdd.apply(
+        out, input, residual_in, residual_out, weight, epsilon, torch.is_grad_enabled()
     )
-
-    return out, residual_out
 
 
 def rmsnorm2d_fwd_with_smoothquant(
@@ -1132,7 +1173,7 @@ def rmsnorm2d_fwd_with_smoothquant(
     xscale: torch.Tensor,
     yscale: torch.Tensor,
     weight: torch.Tensor,
-    epsilon: float = 1e-6,
+    epsilon: float,
 ):
 
     n_rows, n_cols = input.shape
@@ -1188,7 +1229,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     input: torch.Tensor,
     yscale: torch.Tensor,
     weight: torch.Tensor,
-    epsilon: float = 1e-6,
+    epsilon: float,
     scale_ub: Optional[torch.Tensor] = None,
     clamp_out: bool = False,
     dump_rms_norm: bool = False,
