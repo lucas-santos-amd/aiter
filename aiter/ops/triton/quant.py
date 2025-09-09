@@ -253,8 +253,10 @@ def _mxfp4_quant_op(
     e = tl.maximum(e, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
 
     # Combine sign, exponent, and mantissa, while saturating
-    # rounding nearest with tie breaking up by adding +1 to one bit right of the LSB, then shift right
-    e2m1_tmp = tl.minimum((((e << 2) | (m >> 21)) + 1) >> 1, 0x7)
+    # round even
+    m_odd = (m >> 22) & 1
+    val_to_add = (1 << 21) - 1
+    e2m1_tmp = tl.minimum((((e << 23) | m) + val_to_add + m_odd) >> 22, 0x7)
     e2m1_value = ((s >> 28) | e2m1_tmp).to(tl.uint8)
     e2m1_value = tl.reshape(
         e2m1_value, [BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2]
