@@ -97,8 +97,10 @@ def torch_dynamic_mxfp4_quant(
     e = torch.where(e > E8_BIAS - E2_BIAS, e, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
 
     # Combine sign, exponent, and mantissa, while saturating
-    # rounding nearest with tie breaking up by adding +1 to one bit right of the LSB, then shift right
-    combined_val = (((e << 2) | (m >> 21)) + 1) >> 1
+    # round even
+    m_odd = (m >> 22) & 1
+    val_to_add = (1 << 21) - 1
+    combined_val = (((e << 23) | m) + val_to_add + m_odd) >> 22
     e2m1_tmp = torch.where(combined_val < 0x7, combined_val, 0x7)
     e2m1_value = (((s >> 28) & 0xF) | e2m1_tmp).to(torch.uint8)
 
