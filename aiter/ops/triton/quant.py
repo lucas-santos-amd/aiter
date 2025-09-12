@@ -257,12 +257,11 @@ def _mxfp4_quant_op(
     normal_mask = not (saturate_mask | denormal_mask)
 
     # Denormal numbers
-    denorm_exp: tl.constexpr = ((EXP_BIAS_FP32 - EXP_BIAS_FP4) +
-                                (MBITS_F32 - MBITS_FP4) + 1)
+    denorm_exp: tl.constexpr = (
+        (EXP_BIAS_FP32 - EXP_BIAS_FP4) + (MBITS_F32 - MBITS_FP4) + 1
+    )
     denorm_mask_int: tl.constexpr = denorm_exp << MBITS_F32
-    denorm_mask_float: tl.constexpr = tl.cast(denorm_mask_int,
-                                              tl.float32,
-                                              bitcast=True)
+    denorm_mask_float: tl.constexpr = tl.cast(denorm_mask_int, tl.float32, bitcast=True)
 
     denormal_x = qx_fp32 + denorm_mask_float
     denormal_x = denormal_x.to(tl.uint32, bitcast=True)

@@ -98,7 +98,7 @@ def torch_dynamic_mxfp4_quant(
     normal_mask = torch.logical_not(torch.logical_or(saturate_mask, denormal_mask))
 
     # Denormal numbers
-    denorm_exp = ((EXP_BIAS_FP32 - EXP_BIAS_FP4) + (MBITS_F32 - MBITS_FP4) + 1)
+    denorm_exp = (EXP_BIAS_FP32 - EXP_BIAS_FP4) + (MBITS_F32 - MBITS_FP4) + 1
     denorm_mask_int = denorm_exp << MBITS_F32
     denorm_mask_float = torch.tensor(denorm_mask_int, dtype=torch.int32).view(
         torch.float32
