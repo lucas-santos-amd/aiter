@@ -94,7 +94,9 @@ def torch_dynamic_mxfp4_quant(
 
     qx_fp32 = qx.view(torch.float32)
     saturate_mask = qx_fp32 >= max_normal
-    denormal_mask = torch.logical_and(torch.logical_not(saturate_mask), qx_fp32 < min_normal)
+    denormal_mask = torch.logical_and(
+        torch.logical_not(saturate_mask), qx_fp32 < min_normal
+    )
     normal_mask = torch.logical_not(torch.logical_or(saturate_mask, denormal_mask))
 
     # Denormal numbers
