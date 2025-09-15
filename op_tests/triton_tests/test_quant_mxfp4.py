@@ -94,7 +94,7 @@ def torch_dynamic_mxfp4_quant(
 
     qx_fp32 = qx.view(torch.float32)
     saturate_mask = qx_fp32 >= max_normal
-    denormal_mask = torch.logical_and(torch.logical_not(saturate_mask), x < min_normal)
+    denormal_mask = torch.logical_and(torch.logical_not(saturate_mask), qx_fp32 < min_normal)
     normal_mask = torch.logical_not(torch.logical_or(saturate_mask, denormal_mask))
 
     # Denormal numbers
@@ -123,7 +123,7 @@ def torch_dynamic_mxfp4_quant(
     normal_x = normal_x.to(torch.uint8)
 
     # Merge results
-    e2m1_value = torch.full_like(e2m1_value, 0x7, dtype=torch.uint8)
+    e2m1_value = torch.full_like(qx, 0x7, dtype=torch.uint8)
     e2m1_value = torch.where(denormal_mask, denormal_x, e2m1_value)
     e2m1_value = torch.where(normal_mask, normal_x, e2m1_value)
 
