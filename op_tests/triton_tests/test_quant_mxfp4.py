@@ -214,8 +214,8 @@ def test_dynamic_mxfp4_quant(M: int, N: int, dtype):
             1.4622,
             -2.3143,
             0.3412,
-            # -0.8931,
-            0.124,
+            -0.8931,
+            # 0.05,
         ],
         dtype=dtype,
         device="cuda",
@@ -228,10 +228,10 @@ def test_dynamic_mxfp4_quant(M: int, N: int, dtype):
         print(f"triton_out.shape={triton_out.shape} triton_out={triton_out}")
         print(f"triton_scale.shape={triton_scale.shape} triton_scale={triton_scale}")
 
-    # torch_out, torch_scale = torch_dynamic_mxfp4_quant(x)
+    torch_out, torch_scale = torch_dynamic_mxfp4_quant(x)
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape} torch_out={torch_out}")
         print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")
-    print(triton_out)
-    # torch.testing.assert_close(triton_scale, torch_scale)
-    # torch.testing.assert_close(triton_out, torch_out)
+    # print(triton_out)
+    torch.testing.assert_close(triton_scale, torch_scale)
+    torch.testing.assert_close(triton_out, torch_out)

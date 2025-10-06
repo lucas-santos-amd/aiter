@@ -252,7 +252,7 @@ def _mxfp4_quant_op(
     qx = qx ^ s
 
     qx_fp32 = qx.to(tl.float32, bitcast=True)
-    tl.device_print("qx_fp32", qx_fp32)
+    # tl.device_print("qx_fp32", qx_fp32)
     saturate_mask = qx_fp32 >= max_normal
     denormal_mask = (not saturate_mask) & (qx_fp32 < min_normal)
     normal_mask = not (saturate_mask | denormal_mask)
@@ -291,13 +291,8 @@ def _mxfp4_quant_op(
     sign_lp = sign_lp.to(tl.uint8)
     e2m1_value = e2m1_value | sign_lp
 
-    # print(f"{e2m1_value}")
-    # last_val = e2m1_value.handle.data[MXFP4_QUANT_BLOCK_SIZE-1]
-    last_val = e2m1_value
-    tl.device_print("last value = {}", last_val)
-
-    # print(e2m1_value)
-    # print("teste")
+    # last_val = e2m1_value
+    # tl.device_print("last value = {}", last_val)
 
     e2m1_value = tl.reshape(
         e2m1_value, [BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2]
