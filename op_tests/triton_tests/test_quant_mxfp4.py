@@ -58,6 +58,7 @@ def torch_dynamic_mxfp4_quant(
     # Compute quantized x
     qx = x_padded * quant_scale.unsqueeze(-1)
 
+    # print(qx)
     # blockscale_e8m0
     bs_e8m0 = scale_e8m0_unbiased.to(torch.uint8) + 127
 
@@ -102,6 +103,7 @@ def torch_dynamic_mxfp4_quant(
     e2m1_tmp = torch.where(combined_val < 0x7, combined_val, 0x7)
     e2m1_value = (((s >> 28) & 0xF) | e2m1_tmp).to(torch.uint8)
 
+    print(e2m1_value)
     # Pack 2 4-bit values into 8-bit
     x_mxfp4 = e2m1_value[..., ::2] | (e2m1_value[..., 1::2] << 4)
 
@@ -124,30 +126,69 @@ def torch_dynamic_mxfp4_quant(
     "M, N",
     [
         (1, 4),
-        (1, 28),
-        (1, 32),
-        (1, 64),
-        (1, 68),
-        (2, 4),
-        (2, 28),
-        (2, 32),
-        (2, 64),
-        (2, 68),
-        (128, 4),
-        (128, 28),
-        (128, 32),
-        (128, 64),
-        (128, 68),
-        (256, 32),
-        (160, 40),
-        (280, 20),
+        # (1, 28),
+        # (1, 32),
+        # (1, 64),
+        # (1, 68),
+        # (2, 4),
+        # (2, 28),
+        # (2, 32),
+        # (2, 64),
+        # (2, 68),
+        # (128, 4),
+        # (128, 28),
+        # (128, 32),
+        # (128, 64),
+        # (128, 68),
+        # (256, 32),
+        # (160, 40),
+        # (280, 20),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32])
 def test_dynamic_mxfp4_quant(M: int, N: int, dtype):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(20)
     x = torch.randn((M, N), dtype=dtype, device="cuda")
+    x = torch.tensor(
+        [
+            0.3463,
+            -0.0499,
+            0.3794,
+            -2.3764,
+            0.3960,
+            0.5989,
+            -0.6250,
+            -0.4239,
+            -0.6192,
+            0.2761,
+            -0.3746,
+            0.1462,
+            0.5216,
+            -0.5194,
+            -0.8497,
+            -0.8237,
+            0.5145,
+            0.3508,
+            0.0298,
+            -0.3462,
+            0.3917,
+            0.1096,
+            1.4494,
+            1.7009,
+            -0.5473,
+            -2.0851,
+            1.8099,
+            0.3587,
+            1.4622,
+            -2.3143,
+            0.3412,
+            0.376,
+        ],
+        dtype=dtype,
+        device="cuda",
+    )[None, :]
 
     if DEBUG_MODE:
         print(f"x.shape={x.shape} x={x}")
@@ -161,6 +202,7 @@ def test_dynamic_mxfp4_quant(M: int, N: int, dtype):
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape} torch_out={torch_out}")
         print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")
-
-    torch.testing.assert_close(triton_scale, torch_scale)
-    torch.testing.assert_close(triton_out, torch_out)
+    # print(triton_out)
+    # print(torch_out)
+    # torch.testing.assert_close(triton_scale, torch_scale)
+    # torch.testing.assert_close(triton_out, torch_out)

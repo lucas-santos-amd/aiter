@@ -111,7 +111,7 @@ def _mxfp4_quant_op(
 
     # Compute quantized x
     qx = x * quant_scale
-
+    tl.device_print("qx_fp32", qx)
     # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
     # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
     #   Zeros: S000 -> +/-0
@@ -145,6 +145,7 @@ def _mxfp4_quant_op(
     # rounding nearest with tie breaking up by adding +1 to one bit right of the LSB, then shift right
     e2m1_tmp = tl.minimum((((e << 2) | (m >> 21)) + 1) >> 1, 0x7)
     e2m1_value = ((s >> 28) | e2m1_tmp).to(tl.uint8)
+    tl.device_print("e2m1_value", e2m1_value)
     e2m1_value = tl.reshape(
         e2m1_value, [BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2]
     )
