@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import pytest
 import logging
+import os
+
+import pytest
+import torch
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -11,9 +13,11 @@ from aiter.ops.triton.attention.mha import (
     mha_set_use_int64_strides,
 )
 from aiter.ops.triton.attention.mha_v3 import (
+    _quantize_bshd,
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     generate_random_padding_mask,
@@ -27,6 +31,87 @@ arch = get_arch()
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 DEBUG_MODE = False
+
+# Set to a directory to save CPU tensors from ``test_mha_backward`` (per GPU / arch).
+# Layout: ``$AITER_MHA_BWD_SNAPSHOT_DIR/<arch>/<sanitized_pytest_nodeid>.pt``
+# Compare across machines with ``compare_mha_backward_snapshots.py``.
+AITER_MHA_BWD_SNAPSHOT_DIR_ENV = "AITER_MHA_BWD_SNAPSHOT_DIR"
+
+
+def _save_mha_backward_snapshot(
+    request,
+    triton_out: torch.Tensor,
+    torch_out: torch.Tensor,
+    **case_params,
+) -> None:
+    root = os.environ.get(AITER_MHA_BWD_SNAPSHOT_DIR_ENV)
+    if not root:
+        return
+    arch_name = str(arch)
+    nodeid = request.node.nodeid
+    safe = nodeid
+    for ch in '<>:"/\\|?*[]':
+        safe = safe.replace(ch, "_")
+    out_dir = os.path.join(root, arch_name)
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{safe}.pt")
+    device = torch.cuda.current_device() if torch.cuda.is_available() else None
+    gpu_name = (
+        torch.cuda.get_device_name(device) if device is not None else "cpu"
+    )
+    payload = {
+        "arch": arch_name,
+        "gpu_name": gpu_name,
+        "nodeid": nodeid,
+        "case_params": case_params,
+        "triton_out": triton_out.detach().float().cpu(),
+        "torch_out": torch_out.detach().float().cpu(),
+        "triton_dtype": str(triton_out.dtype),
+        "torch_dtype": str(torch_out.dtype),
+    }
+    torch.save(payload, path)
+
+
+def attention_ref_dequantized_fp8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    upcast: bool = True,
+    reorder_ops: bool = False,
+    **kwargs,
+):
+    """Attention reference that matches ``flash_attn_fp8_func`` QKV quantization.
+
+    Uses the same ``_quantize_bshd`` / per-head (or per-group) scales as the FP8
+    wrapper, dequantizes Q, K, V to FP32, then runs ``attention_ref`` (FP32
+    matmul + softmax + V). This models ``dequant(q_fp8) @ dequant(k_fp8)`` with
+    the kernel's descale factors; it does not reproduce ``tl.dot`` FP8 rounding.
+
+    Returns the same triple as ``attention_ref``: ``(output, attention, lse)``.
+    """
+    fp8_dtype = get_fp8_e4m3_dtype()
+    num_q_heads = q.shape[2]
+    num_kv_heads = k.shape[2]
+    group_size = (
+        num_q_heads // num_kv_heads if num_q_heads != num_kv_heads else None
+    )
+    q_fp8, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
+    k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
+    v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
+
+    if group_size is not None:
+        q_scale = torch.repeat_interleave(q_descale, group_size, dim=1)
+    else:
+        q_scale = q_descale
+
+    q_deq = q_fp8.to(torch.float32) * q_scale.unsqueeze(1).unsqueeze(-1)
+    k_deq = k_fp8.to(torch.float32) * k_descale.unsqueeze(1).unsqueeze(-1)
+    v_deq = v_fp8.to(torch.float32) * v_descale.unsqueeze(1).unsqueeze(-1)
+
+    return attention_ref(
+        q_deq, k_deq, v_deq, upcast=upcast, reorder_ops=reorder_ops, **kwargs
+    )
 
 
 def _attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
@@ -77,7 +162,20 @@ def _attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
     out, dq, dk, dv = _run_ref(upcast=True)
     out_pt, dq_pt, dk_pt, dv_pt = _run_ref(upcast=False, reorder_ops=True)
 
-    fwd_tol = _tol(out, out_pt, is_forward=True)
+    if is_fp8:
+        q0, k0, v0 = q.detach(), k.detach(), v.detach()
+        out_fp8_lin, _, _ = attention_ref_dequantized_fp8(
+            q0, k0, v0, upcast=True, reorder_ops=False, **kwargs
+        )
+        out_fp8_pt, _, _ = attention_ref_dequantized_fp8(
+            q0, k0, v0, upcast=True, reorder_ops=True, **kwargs
+        )
+        fwd_tol = _tol(out_fp8_lin, out_fp8_pt, is_forward=True)
+        out = out_fp8_lin
+    else:
+        fwd_tol = _tol(out, out_pt, is_forward=True)
+        out = out
+
     bwd_tols = [_tol(dq, dq_pt), _tol(dk, dk_pt), _tol(dv, dv_pt)]
 
     return out, (dq, dk, dv), fwd_tol, bwd_tols
@@ -519,6 +617,7 @@ def test_mha_varlen(
 @pytest.mark.parametrize("FUSED", [False, True])
 @pytest.mark.parametrize("FP8", [True, False])
 def test_mha_backward(
+    request,
     BATCH: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -587,6 +686,23 @@ def test_mha_backward(
         causal=CAUSAL,
     )
     torch_dq, torch_dk, torch_dv = torch_grads
+
+    _save_mha_backward_snapshot(
+        request,
+        triton_out,
+        torch_out,
+        BATCH=BATCH,
+        SEQLEN_Q=SEQLEN_Q,
+        SEQLEN_K=SEQLEN_K,
+        NUM_Q_HEADS=NUM_Q_HEADS,
+        NUM_K_HEADS=NUM_K_HEADS,
+        HEAD_SZ=HEAD_SZ,
+        CAUSAL=CAUSAL,
+        DROPOUT=DROPOUT,
+        FUSED=FUSED,
+        FP8=FP8,
+        dtype=str(dtype),
+    )
 
     # Check quality
     triton_vals = [triton_out, triton_dq, triton_dk, triton_dv]
