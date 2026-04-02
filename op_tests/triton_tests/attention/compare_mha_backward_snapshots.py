@@ -8,7 +8,7 @@ Snapshots are written when ``AITER_MHA_BWD_SNAPSHOT_DIR`` is set while running
 ``pytest`` (see ``test_mha.py``). Each run creates
 ``$AITER_MHA_BWD_SNAPSHOT_DIR/<arch>/*.pt``.
 
-Example (mask from gfx950 in dir_b — typical failing GPU vs reference):
+Example (mask from gfx950 in dir_b -- typical failing GPU vs reference):
 
   python op_tests/triton_tests/attention/compare_mha_backward_snapshots.py \\
       /tmp/mha_snaps/gfx942 /tmp/mha_snaps/gfx950 \\
@@ -120,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         f"  B: {args.dir_b.resolve()}\n"
         f"Mask: |triton - torch| > {args.mask_threshold} on side {src_label}\n"
     )
-    col_w = -60
+    col_w = 60
     header = (
         f"{'name':<{col_w}} {'n_mask':>8} "
         f"{'|tri-tor|_A':>12} {'|tri-tor|_B':>12} "
@@ -147,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if ta.shape != tb.shape:
             print(
-                f"{name[col_w:]:<{col_w}} triton SHAPE MISMATCH "
+                f"{name[-col_w:]:<{col_w}} triton SHAPE MISMATCH "
                 f"{tuple(ta.shape)} vs {tuple(tb.shape)}"
             )
             worst_triton = float("inf")
@@ -155,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if oa.shape != ob.shape:
             print(
-                f"{name[col_w:]:<{col_w}} torch SHAPE MISMATCH "
+                f"{name[-col_w:]:<{col_w}} torch SHAPE MISMATCH "
                 f"{tuple(oa.shape)} vs {tuple(ob.shape)}"
             )
             worst_torch = float("inf")
@@ -173,9 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         t_src = d_src["triton_out"]
         o_src = d_src["torch_out"]
         if t_src.shape != o_src.shape:
-            print(
-                f"{name[col_w:]:<{col_w}} mask-source triton/torch SHAPE MISMATCH"
-            )
+            print(f"{name[-col_w:]:<{col_w}} mask-source triton/torch SHAPE MISMATCH")
             continue
 
         mask = (t_src - o_src).abs() > args.mask_threshold
@@ -187,9 +185,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             dt_m = _masked_max_abs(ta, tb, mask)
             do_m = _masked_max_abs(oa, ob, mask)
-            if not math.isnan(dt_m) and (
-                worst_triton is None or dt_m > worst_triton
-            ):
+            if not math.isnan(dt_m) and (worst_triton is None or dt_m > worst_triton):
                 worst_triton, worst_triton_name = dt_m, name
             if not math.isnan(do_m) and (worst_torch is None or do_m > worst_torch):
                 worst_torch, worst_torch_name = do_m, name
@@ -200,7 +196,8 @@ def main(argv: list[str] | None = None) -> int:
 
         should_print = args.verbose or n_mask > 0
         if should_print:
-            short = name[col_w:] if len(name) <= col_w else name[: col_w - 3] + "..."
+            # short = name[-col_w:] if len(name) <= col_w else name[: col_w - 3] + "..."
+            short = name[-col_w:] + "..."
             dt_s = f"{dt_m:.6g}" if not math.isnan(dt_m) else "n/a"
             do_s = f"{do_m:.6g}" if not math.isnan(do_m) else "n/a"
             print(
