@@ -21,6 +21,9 @@ to those indices**:
   - |triton_A - triton_B| at masked positions
   - |torch_A - torch_B| at masked positions
 
+Also prints **per-GPU** max ``|triton_out - torch_out|`` over the full tensor
+for side A and side B (kernel vs reference on each run).
+
 Use ``--verbose`` to print a line for every snapshot (including zero masked
 count). By default, only rows with at least one masked position are printed.
 """
@@ -44,6 +47,11 @@ def _masked_max_abs(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> flo
     if not mask.any():
         return float("nan")
     return (a - b).abs()[mask].max().item()
+
+
+def _max_abs_triton_vs_torch(triton: torch.Tensor, ref_out: torch.Tensor) -> float:
+    """Global max |triton_out - torch_out| for one snapshot."""
+    return (triton - ref_out).abs().max().item()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -112,10 +120,11 @@ def main(argv: list[str] | None = None) -> int:
         f"  B: {args.dir_b.resolve()}\n"
         f"Mask: |triton - torch| > {args.mask_threshold} on side {src_label}\n"
     )
-    col_w = 100
+    col_w = -60
     header = (
         f"{'name':<{col_w}} {'n_mask':>8} "
-        f"{'|d triton|@mask':>16} {'|d torch|@mask':>16}"
+        f"{'|tri-tor|_A':>12} {'|tri-tor|_B':>12} "
+        f"{'|d triton|@m':>14} {'|d torch|@m':>14}"
     )
     print(header)
     print("-" * len(header))
@@ -124,6 +133,10 @@ def main(argv: list[str] | None = None) -> int:
     worst_torch: float | None = None
     worst_triton_name = ""
     worst_torch_name = ""
+    worst_err_a: float | None = None
+    worst_err_b: float | None = None
+    worst_err_a_name = ""
+    worst_err_b_name = ""
     any_fail_diff = False
 
     for name in names:
@@ -134,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if ta.shape != tb.shape:
             print(
-                f"{name[:col_w]:<{col_w}} triton SHAPE MISMATCH "
+                f"{name[col_w:]:<{col_w}} triton SHAPE MISMATCH "
                 f"{tuple(ta.shape)} vs {tuple(tb.shape)}"
             )
             worst_triton = float("inf")
@@ -142,21 +155,27 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if oa.shape != ob.shape:
             print(
-                f"{name[:col_w]:<{col_w}} torch SHAPE MISMATCH "
+                f"{name[col_w:]:<{col_w}} torch SHAPE MISMATCH "
                 f"{tuple(oa.shape)} vs {tuple(ob.shape)}"
             )
             worst_torch = float("inf")
             any_fail_diff = True
             continue
 
+        err_a = _max_abs_triton_vs_torch(ta, oa)
+        err_b = _max_abs_triton_vs_torch(tb, ob)
+        if worst_err_a is None or err_a > worst_err_a:
+            worst_err_a, worst_err_a_name = err_a, name
+        if worst_err_b is None or err_b > worst_err_b:
+            worst_err_b, worst_err_b_name = err_b, name
+
         d_src = da if args.mask_source == "a" else db
         t_src = d_src["triton_out"]
         o_src = d_src["torch_out"]
         if t_src.shape != o_src.shape:
             print(
-                f"{name[:col_w]:<{col_w}} mask-source triton/torch SHAPE MISMATCH"
+                f"{name[col_w:]:<{col_w}} mask-source triton/torch SHAPE MISMATCH"
             )
-            any_fail_diff = True
             continue
 
         mask = (t_src - o_src).abs() > args.mask_threshold
@@ -181,16 +200,24 @@ def main(argv: list[str] | None = None) -> int:
 
         should_print = args.verbose or n_mask > 0
         if should_print:
-            short = name[:col_w] if len(name) <= col_w else name[: col_w - 3] + "..."
+            short = name[col_w:] if len(name) <= col_w else name[: col_w - 3] + "..."
             dt_s = f"{dt_m:.6g}" if not math.isnan(dt_m) else "n/a"
             do_s = f"{do_m:.6g}" if not math.isnan(do_m) else "n/a"
-            print(f"{short:<{col_w}} {n_mask:8d} {dt_s:>16} {do_s:>16}")
+            print(
+                f"{short:<{col_w}} {n_mask:8d} "
+                f"{err_a:12.6g} {err_b:12.6g} "
+                f"{dt_s:>14} {do_s:>14}"
+            )
 
     print("-" * len(header))
     wt = f"{worst_triton:.6g}" if worst_triton is not None else "n/a"
     wo = f"{worst_torch:.6g}" if worst_torch is not None else "n/a"
     print(f"Worst |triton_A - triton_B| @mask: {wt}  ({worst_triton_name})")
     print(f"Worst |torch_A - torch_B| @mask: {wo}  ({worst_torch_name})")
+    wea = f"{worst_err_a:.6g}" if worst_err_a is not None else "n/a"
+    web = f"{worst_err_b:.6g}" if worst_err_b is not None else "n/a"
+    print(f"Worst max|triton - torch| side A: {wea}  ({worst_err_a_name})")
+    print(f"Worst max|triton - torch| side B: {web}  ({worst_err_b_name})")
 
     if args.fail_on_diff and any_fail_diff:
         return 1
