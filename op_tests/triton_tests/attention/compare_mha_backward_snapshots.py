@@ -34,6 +34,9 @@ from pathlib import Path
 
 import torch
 
+# Only print per-snapshot rows when max-abs diff exceeds this (either column).
+PRINT_DIFF_THRESHOLD = 0.3
+
 
 def _load(path: Path) -> dict:
     return torch.load(path, map_location="cpu", weights_only=False)
@@ -118,8 +121,9 @@ def main(argv: list[str] | None = None) -> int:
             worst_triton, worst_triton_name = dt, name
         if do > worst_torch:
             worst_torch, worst_torch_name = do, name
-        short = name[:56] if len(name) <= 56 else name[:53] + "..."
-        print(f"{short:<56} {dt:12.6g} {do:12.6g}")
+        if dt > PRINT_DIFF_THRESHOLD or do > PRINT_DIFF_THRESHOLD:
+            short = name[:56] if len(name) <= 56 else name[:53] + "..."
+            print(f"{short:<56} {dt:12.6g} {do:12.6g}")
 
     print("-" * len(header))
     print(f"Worst |d triton|: {worst_triton:.6g}  ({worst_triton_name})")
