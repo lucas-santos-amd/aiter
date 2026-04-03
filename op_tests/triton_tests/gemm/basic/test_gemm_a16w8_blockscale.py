@@ -19,7 +19,6 @@ block_shape = (128, 128)
 
 
 def run_torch(x, weight, w_scale, dtype=torch.bfloat16):
-    prequant = False
     block_shape_n, block_shape_k = block_shape
     m, k = x.shape
     n = weight.shape[0]
