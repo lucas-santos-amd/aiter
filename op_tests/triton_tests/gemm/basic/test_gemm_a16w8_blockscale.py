@@ -19,6 +19,7 @@ block_shape = (128, 128)
 
 
 def run_torch(x, weight, w_scale, dtype=torch.bfloat16):
+    prequant = False
     block_shape_n, block_shape_k = block_shape
     m, k = x.shape
     n = weight.shape[0]
@@ -119,8 +120,8 @@ def generate_gemm_a16w8_blockscale_inputs(
     ],
 )
 @pytest.mark.parametrize("shuffle", [True, False])
-@pytest.mark.parametrize("prequant", [False])
-def test_gemm(dtype, M, N, K, output, shuffle, prequant):
+def test_gemm(dtype, M, N, K, output, shuffle):
+    prequant = False
     block_shape_n, block_shape_k = block_shape
 
     if shuffle:
