@@ -266,28 +266,17 @@ def test_mha_with_dropout(
 
 
 # LLaMA 3 405B config
-@pytest.mark.parametrize("BATCH", [1])
-@pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K",
-    [(1, 1)],
-)
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 8)])
-@pytest.mark.parametrize("HEAD_SZ", [128])
-@pytest.mark.parametrize("CAUSAL", [True])
-@pytest.mark.parametrize("DROPOUT", [0.0])
 def test_mha_int64_strides(
-    BATCH: int,
-    SEQLEN_Q: int,
-    SEQLEN_K: int,
-    NUM_Q_HEADS: int,
-    NUM_K_HEADS: int,
-    HEAD_SZ: int,
-    CAUSAL: bool,
-    DROPOUT: float,
     dtype=torch.float16,
     device="cuda",
     test_backward=True,
 ):
+    BATCH = 1
+    SEQLEN_Q, SEQLEN_K = 1, 1
+    NUM_Q_HEADS, NUM_K_HEADS = 128, 8
+    HEAD_SZ = 128
+    CAUSAL = True
+    DROPOUT = 0.0
     """
     In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
     """
