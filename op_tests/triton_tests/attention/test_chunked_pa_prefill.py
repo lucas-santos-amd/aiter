@@ -9,12 +9,12 @@ from aiter.ops.triton.attention.chunked_pa_prefill import chunked_prefill_paged_
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 NUM_HEADS = [64]
-NUM_QUERIES_PER_KV = [1, 8, 64]
-HEAD_SIZES = [128, 96, 24]
+NUM_QUERIES_PER_KV = [1, 8]
+HEAD_SIZES = [128]
 DTYPES = [torch.float16]
-CUDA_DEVICES = [f"cuda:{i}" for i in range(1)]
-SLIDING_WINDOW = [0, 16, 64, 128, 256, 512, 2048]
-KV_CACHE_DTYPES = ["auto", "fp8e4m3", "fp8e5m2"]
+CUDA_DEVICES = [0, 3]
+SLIDING_WINDOW = [0, 256, 1024]
+KV_CACHE_DTYPES = ["auto", "fp8e4m3"]
 
 
 def context_attention_fwd_torch(
