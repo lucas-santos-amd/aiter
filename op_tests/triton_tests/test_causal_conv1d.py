@@ -140,11 +140,20 @@ def causal_conv1d_opcheck_fn(
     bias = bias.contiguous() if bias is not None else None
 
 
-def _causal_conv1d_update_impl(
+@pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("silu_activation", [True, False])
+@pytest.mark.parametrize("has_bias", [True, False])
+@pytest.mark.parametrize("seqlen", [1, 4, 8])
+@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("dim", [1024, 2048, 4096])
+@pytest.mark.parametrize("batch", [1, 7, 64, 127, 512])
+def test_causal_conv1d_update(
     batch, dim, width, seqlen, has_bias, silu_activation, itype
 ):
     device = "cuda"
-    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (1e-2, 6e-2)
+    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
+    if itype == torch.bfloat16:
+        rtol, atol = 1e-2, 6e-2
     # set seed
     seed_everything(0)
     x = torch.randn(batch, dim, seqlen, device=device, dtype=itype)
@@ -174,39 +183,22 @@ def _causal_conv1d_update_impl(
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("silu_activation", [True, False])
-@pytest.mark.parametrize("has_bias", [True, False])
-@pytest.mark.parametrize("seqlen", [1, 4])
-@pytest.mark.parametrize("batch", [1, 7])
-def test_causal_conv1d_update_float32(
-    batch, seqlen, has_bias, silu_activation
-):
-    width = 4
-    dim = 1024
-    _causal_conv1d_update_impl(
-        batch, dim, width, seqlen, has_bias, silu_activation, torch.float32
-    )
-
-
-@pytest.mark.parametrize("silu_activation", [True, False])
-@pytest.mark.parametrize("has_bias", [True, False])
+@pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("silu_activation", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize("seqlen", [1, 4, 8])
 @pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("dim", [1024, 4096])
-@pytest.mark.parametrize("batch", [1, 7, 64, 127])
-def test_causal_conv1d_update_bfloat16(
-    batch, dim, width, seqlen, has_bias, silu_activation
-):
-    _causal_conv1d_update_impl(
-        batch, dim, width, seqlen, has_bias, silu_activation, torch.bfloat16
-    )
-
-
-def _causal_conv1d_update_with_batch_gather_impl(
+@pytest.mark.parametrize("dim", [2048, 4096])
+# tests correctness in case subset of the sequences are padded
+@pytest.mark.parametrize("with_padding", [True, False])
+@pytest.mark.parametrize("batch_size", [1, 64, 128, 256, 512])
+def test_causal_conv1d_update_with_batch_gather(
     batch_size, with_padding, dim, width, seqlen, has_bias, silu_activation, itype
 ):
     device = "cuda"
-    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (1e-2, 6e-2)
+    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
+    if itype == torch.bfloat16:
+        rtol, atol = 1e-2, 6e-2
 
     # set seed
     seed_everything(0)
@@ -269,44 +261,22 @@ def _causal_conv1d_update_with_batch_gather_impl(
     assert torch.allclose(out[:batch_size], out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("silu_activation", [False, True])
-@pytest.mark.parametrize("has_bias", [False, True])
-@pytest.mark.parametrize("seqlen", [1, 4])
-# tests correctness in case subset of the sequences are padded
-@pytest.mark.parametrize("with_padding", [True, False])
-@pytest.mark.parametrize("batch_size", [1, 64])
-def test_causal_conv1d_update_with_batch_gather_float32(
-    batch_size, with_padding, seqlen, has_bias, silu_activation
-):
-    width = 2
-    dim = 2048
-    _causal_conv1d_update_with_batch_gather_impl(
-        batch_size, with_padding, dim, width, seqlen, has_bias, silu_activation, torch.float32
-    )
-
-
-@pytest.mark.parametrize("silu_activation", [False, True])
-@pytest.mark.parametrize("has_bias", [False, True])
-@pytest.mark.parametrize("seqlen", [1, 4, 8])
+@pytest.mark.parametrize("itype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("silu_activation", [True, False])
+@pytest.mark.parametrize("has_bias", [True, False])
 @pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("seqlen", [1, 64, 1024, 5120, 8192])
 @pytest.mark.parametrize("dim", [2048, 4096])
-# tests correctness in case subset of the sequences are padded
 @pytest.mark.parametrize("with_padding", [True, False])
-@pytest.mark.parametrize("batch_size", [1, 64])
-def test_causal_conv1d_update_with_batch_gather_bfloat16(
-    batch_size, with_padding, dim, width, seqlen, has_bias, silu_activation
-):
-    _causal_conv1d_update_with_batch_gather_impl(
-        batch_size, with_padding, dim, width, seqlen, has_bias, silu_activation, torch.bfloat16
-    )
-
-
-def _causal_conv1d_varlen_impl(
+@pytest.mark.parametrize("batch", [1, 64, 1024, 5120, 8192])
+def test_causal_conv1d_varlen(
     batch, with_padding, dim, seqlen, width, has_bias, silu_activation, itype
 ):
     device = "cuda"
     torch.cuda.empty_cache()
-    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (1e-2, 6e-2)
+    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
+    if itype == torch.bfloat16:
+        rtol, atol = 1e-2, 6e-2
     # set seed
     seed_everything(0)
     seqlens = []
@@ -404,33 +374,3 @@ def _causal_conv1d_varlen_impl(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
-
-
-@pytest.mark.parametrize("silu_activation", [True, False])
-@pytest.mark.parametrize("has_bias", [True, False])
-@pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("seqlen", [1, 64, 1024, 5120])
-@pytest.mark.parametrize("dim", [2048, 4096])
-@pytest.mark.parametrize("with_padding", [True, False])
-@pytest.mark.parametrize("batch", [1, 64, 1024, 5120])
-def test_causal_conv1d_varlen_float32(
-    batch, with_padding, dim, seqlen, width, has_bias, silu_activation
-):
-    _causal_conv1d_varlen_impl(
-        batch, with_padding, dim, seqlen, width, has_bias, silu_activation, torch.float32
-    )
-
-
-@pytest.mark.parametrize("silu_activation", [True, False])
-@pytest.mark.parametrize("has_bias", [True, False])
-@pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("seqlen", [1, 64, 1024, 5120])
-@pytest.mark.parametrize("dim", [2048, 4096])
-@pytest.mark.parametrize("with_padding", [True, False])
-@pytest.mark.parametrize("batch", [1, 64, 1024, 5120])
-def test_causal_conv1d_varlen_bfloat16(
-    batch, with_padding, dim, seqlen, width, has_bias, silu_activation
-):
-    _causal_conv1d_varlen_impl(
-        batch, with_padding, dim, seqlen, width, has_bias, silu_activation, torch.bfloat16
-    )
