@@ -1115,7 +1115,6 @@ def test_mha_backward_with_pe(
     torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
 
     # Backward assertions
-    # When dropout is active, some cases fail due to less than 1% mismatched elements.
     bwd_atol = 1e-1
     bwd_rtol = 1e-1
     torch.testing.assert_close(
