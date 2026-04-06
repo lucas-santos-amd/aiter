@@ -288,7 +288,6 @@ def test_triton_unified_attn(
     top_k: int,
     num_q_heads: int,
     lora_dim: int,
-    rope_dim: int,
     block_size: int,
 ) -> None:
     batch = 8

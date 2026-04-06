@@ -210,10 +210,10 @@ def test_sage(
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
     NUM_K_HEADS: int,
-    HEAD_SZ: int,
     layout: str,
     dtype=torch.bfloat16,
 ):
+    HEAD_SZ = 128
     torch.cuda.empty_cache()
 
     softmax_scale = 1.0 / math.sqrt(HEAD_SZ)

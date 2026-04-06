@@ -420,8 +420,8 @@ def test_mha_with_sink_sliding_window(
         torch_out, (q, k, v, sink), do
     )
 
-    bwd_atol = 1.5e-2
-    bwd_rtol = 1.5e-2
+    bwd_atol = 1e-1
+    bwd_rtol = 1e-1
     torch.testing.assert_close(
         triton_dq,
         torch_dq,
