@@ -60,7 +60,7 @@ def _attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
         baseline = (pt_val - ref_val).abs().max().item()
         if is_fp8:
             mult = 4
-            atol_floor = 1.0
+            atol_floor = 5e-1 if is_forward else 1.0
             rtol_floor = 1e-1
         elif has_dropout:
             # Dropout scaling (1/(1-p)) amplifies precision errors in the
