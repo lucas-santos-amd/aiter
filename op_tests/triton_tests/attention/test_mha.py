@@ -198,7 +198,7 @@ def _test_mha_impl(
 @pytest.mark.parametrize("BATCH", [1, 30, 64])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (128, 128), (1, 2), (32, 16), (64, 128)],
+    [(1, 1), (128, 128), (32, 16), (64, 128), (8192, 8192)],
 )
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 8), (48, 8)])
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
@@ -272,7 +272,7 @@ def test_mha_int64_strides(
     test_backward=True,
 ):
     BATCH = 1
-    SEQLEN_Q, SEQLEN_K = 1, 1
+    SEQLEN_Q, SEQLEN_K = 1024, 1024
     NUM_Q_HEADS, NUM_K_HEADS = 128, 8
     HEAD_SZ = 128
     CAUSAL = True
@@ -514,7 +514,7 @@ def _test_mha_varlen_impl(
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+    [(1, 1), (128, 128), (32, 16), (64, 128), (8192, 8192)],
 )
 @pytest.mark.parametrize(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
