@@ -182,9 +182,9 @@ def _attn_fwd_naive(
         qk = gl.where(mask, qk, float("-inf"))
 
         # -- online softmax --
+        # Fully-masked rows leave m_ij == -inf and produce NaNs here; those rows
+        # are zeroed out by index in the epilogue (see mha.py for the same scheme).
         m_ij = gl.maximum(m_i, gl.max(qk, 1))
-        # Guard fully-masked rows (m_ij == -inf) against -inf - (-inf) -> NaN.
-        m_ij = gl.where(m_ij == float("-inf"), 0.0, m_ij)
         p = gl.exp2(qk - m_ij[:, None])
         alpha = gl.exp2(m_i - m_ij)
         l_ij = gl.sum(p, 1)
@@ -208,6 +208,14 @@ def _attn_fwd_naive(
     offs_od = gl.arange(0, BLOCK_DMODEL, layout=gl.SliceLayout(0, mfmaLayout))
     o_base = o_ptr + off_z * stride_oz + off_q_head * stride_oh
     o_ptrs = o_base + offs_om[:, None] * stride_om + offs_od[None, :] * stride_on
+
+    # Rows above the bottom-right causal boundary (only possible when
+    # SEQLEN_Q > SEQLEN_K) attend to no keys, so their softmax row is all -inf and
+    # the normalization above yields NaN. Mirror mha.py / the reference by zeroing
+    # those rows out by index rather than guarding the division.
+    if IS_CAUSAL:
+        out = gl.where(offs_om[:, None] >= (SEQLEN_Q - SEQLEN_K), out, 0.0)
+
     o_mask = offs_om[:, None] < SEQLEN_Q
     gl.store(o_ptrs, out, mask=o_mask)
 
