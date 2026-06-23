@@ -74,7 +74,7 @@ def _attn_fwd_naive(
     RCP_LN2: gl.constexpr = 1.4426950408889634
 
     # --- program -> (batch, q_head, query block) -------------------------------
-    NUM_BLOCKS_M: gl.constexpr = gl.cdiv(SEQLEN_Q, BLOCK_M)
+    NUM_BLOCKS_M = gl.cdiv(SEQLEN_Q, BLOCK_M)
     pid = gl.program_id(axis=0)
     off_q_head = pid % NUM_Q_HEADS
     start_m = (pid // NUM_Q_HEADS) % NUM_BLOCKS_M
