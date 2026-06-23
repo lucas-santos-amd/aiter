@@ -5,6 +5,8 @@ import torch
 import pytest
 import logging
 from aiter.ops.triton.attention.mha_simplified import (
+    _GLUON_SUPPORTED_HEAD_DIMS,
+    _is_gluon_available,
     flash_attn_func,
     flash_attn_varlen_func,
 )
@@ -19,6 +21,18 @@ logger = logging.getLogger(__name__)
 DEBUG_MODE = False
 
 
+def _skip_if_gluon_unsupported(backend: str, head_sz: int):
+    if backend != "gluon":
+        return
+    if not _is_gluon_available():
+        pytest.skip("Gluon MHA backend is not available on this architecture")
+    if head_sz not in _GLUON_SUPPORTED_HEAD_DIMS:
+        pytest.skip(
+            f"gluon MHA supports headdim in {sorted(_GLUON_SUPPORTED_HEAD_DIMS)}, "
+            f"got {head_sz}"
+        )
+
+
 def _test_mha_impl(
     BATCH: int,
     SEQLEN_Q: int,
@@ -27,24 +41,27 @@ def _test_mha_impl(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
+    backend: str,
     dtype=torch.bfloat16,
 ):
+    _skip_if_gluon_unsupported(backend, HEAD_SZ)
+
     torch.manual_seed(20)
     torch.cuda.empty_cache()
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
 
-    triton_out = flash_attn_func(q, k, v, causal=CAUSAL)
+    kernel_out = flash_attn_func(q, k, v, causal=CAUSAL, backend=backend)
     if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+        print(f"kernel_out.shape={kernel_out.shape}, kernel_out={kernel_out}")
 
     torch_out = attention_ref(q, k, v, causal=CAUSAL)
     torch_out, attention_scores, _ = torch_out
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
 
-    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(kernel_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("BATCH", [1, 30, 50])
@@ -55,6 +72,7 @@ def _test_mha_impl(
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 8), (48, 8)])
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -63,6 +81,7 @@ def test_mha(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
+    backend: str,
     dtype=torch.bfloat16,
 ):
     _test_mha_impl(
@@ -73,6 +92,7 @@ def test_mha(
         NUM_K_HEADS,
         HEAD_SZ,
         CAUSAL=CAUSAL,
+        backend=backend,
         dtype=dtype,
     )
 
