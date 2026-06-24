@@ -203,6 +203,7 @@ def flash_attn_varlen_func(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     config: Optional[dict] = None,
+    backend: Optional[str] = None,
 ) -> torch.Tensor:
     """Forward-only varlen flash attention for the simplified gfx950 kernel.
 
@@ -216,14 +217,50 @@ def flash_attn_varlen_func(
         max_seqlen_k: maximum key sequence length in the batch.
         softmax_scale: scaling of QK^T before softmax. Defaults to 1 / sqrt(headdim).
         causal: whether to apply a (bottom-right aligned) causal mask.
+        config: [triton only] kernel tuning parameters.
+        backend: ``"triton"``, ``"gluon"``, or ``None`` (defaults to ``"triton"``).
     Return:
         out: (total_q, nheads, headdim).
     """
+    if backend is None:
+        backend = "triton"
+    backend = backend.lower()
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
     _LOGGER.info(
-        f"FLASH_ATTN_VARLEN:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+        f"FLASH_ATTN_VARLEN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
     )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+
+    if backend == "gluon":
+        assert (
+            _is_gluon_available()
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        head_size_og = q.size(2)
+        assert head_size_og in _GLUON_SUPPORTED_HEAD_DIMS, (
+            f"gluon backend supports headdim in {sorted(_GLUON_SUPPORTED_HEAD_DIMS)}, "
+            f"got {head_size_og}"
+        )
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_gluon import (
+            flash_attn_varlen_fwd,
+        )
+
+        return flash_attn_varlen_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            sm_scale=softmax_scale,
+        )
+
     head_size_og = q.size(2)
     if head_size_og % 8 != 0:
         q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])

@@ -105,8 +105,11 @@ def _test_mha_varlen_impl(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
+    backend: str,
     dtype=torch.bfloat16,
 ):
+    _skip_if_gluon_unsupported(backend, HEAD_SZ)
+
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -145,6 +148,7 @@ def _test_mha_varlen_impl(
         max_seqlen_q,
         max_seqlen_k,
         causal=CAUSAL,
+        backend=backend,
     )
     triton_out = output_pad_fn(triton_out)
     if DEBUG_MODE:
@@ -177,6 +181,7 @@ def _test_mha_varlen_impl(
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -185,6 +190,7 @@ def test_mha_varlen(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
+    backend: str,
     dtype=torch.bfloat16,
 ):
     _test_mha_varlen_impl(
@@ -195,5 +201,6 @@ def test_mha_varlen(
         NUM_K_HEADS,
         HEAD_SZ,
         CAUSAL=CAUSAL,
+        backend=backend,
         dtype=dtype,
     )
