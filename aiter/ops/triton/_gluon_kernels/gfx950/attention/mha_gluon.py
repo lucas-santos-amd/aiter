@@ -37,6 +37,17 @@
 # any boundary / causal mask work. ``PRELOAD_V`` issues the V load ahead of the
 # softmax so it can overlap the QK math.
 #
+# Other features ported from ``mha.py``:
+#   * Padded head dim: the real head dim (``BLOCK_DMODEL``) is decoupled from the
+#     padded power-of-2 tile (``BLOCK_DMODEL_POW2``) used for the layouts/MFMA, and
+#     the head-dim axis of the Q/K/V loads and the O store is masked. This lets
+#     non-power-of-2 head dims (whose padded size is in {32,64,128,256}) run.
+#   * XCD remap of the q-head index (``remap_xcd``) for cache locality.
+#   * ``HEAD_STRIDE_ALIGNED_8`` hints 8-element head-stride alignment so AxisInfo
+#     can widen the global loads.
+#   * A ``.cg`` cache modifier on the Q load when a Q block spans a full head.
+#   * ``overflow_size``-gated row masking on the O store.
+#
 # One program computes a single (batch, q_head, query-block) tile of the output
 # by looping over the key/value blocks and running an online softmax.
 #
@@ -52,6 +63,61 @@ import torch
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+from aiter.ops.triton.utils.device_info import get_num_xcds
+
+
+@gluon.jit
+def remap_xcd(pid, GRID_MN, NUM_XCDS: gl.constexpr = 8):
+    """Gluon copy of ``aiter...pid_preprocessing.remap_xcd``.
+
+    Re-groups the linear program id so consecutive ids land on the same XCD,
+    improving L2/cache locality. ``GRID_MN`` is intentionally a runtime value
+    (not constexpr) so ``tall_xcds`` is a tensor scalar with a ``.type``.
+    """
+    # Number of pids per XCD in the new arrangement.
+    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+    # When GRID_MN is not divisible by NUM_XCDS, some xcds get pids_per_xcd pids
+    # and the rest get pids_per_xcd - 1; tall_xcds counts the former.
+    tall_xcds = GRID_MN % NUM_XCDS
+    if tall_xcds == 0:
+        tall_xcds = gl.cast(NUM_XCDS, tall_xcds.type)
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    if xcd < tall_xcds:
+        pid = xcd * pids_per_xcd + local_pid
+    else:
+        pid = (
+            tall_xcds * pids_per_xcd
+            + (xcd - tall_xcds) * (pids_per_xcd - 1)
+            + local_pid
+        )
+    return pid
+
+
+@gluon.jit
+def _load_fn(ptrs, offset_first, offset_second, boundary_first, boundary_second):
+    """Gluon port of ``mha.py``'s ``_load_fn``.
+
+    Masks each axis only when the corresponding offset tensor is not ``None`` (a
+    compile-time decision), so fully-in-range loads stay mask-free. ``offset_first``
+    indexes axis 0 (``[:, None]``) and ``offset_second`` indexes axis 1
+    (``[None, :]``); both must carry the load tensor's slice layouts.
+    """
+    if offset_first is not None and offset_second is not None:
+        mask = (offset_first[:, None] < boundary_first) & (
+            offset_second[None, :] < boundary_second
+        )
+        tensor = gl.load(ptrs, mask=mask, other=0.0)
+    elif offset_first is not None:
+        mask = offset_first[:, None] < boundary_first
+        tensor = gl.load(ptrs, mask=mask, other=0.0)
+    elif offset_second is not None:
+        mask = offset_second[None, :] < boundary_second
+        tensor = gl.load(ptrs, mask=mask, other=0.0)
+    else:
+        tensor = gl.load(ptrs)
+    return tensor
 
 
 @gluon.jit
@@ -76,6 +142,8 @@ def _attn_fwd_inner_naive(
     V_LOAD_LAYOUT: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    BLOCK_DMODEL: gl.constexpr,
+    BLOCK_DMODEL_POW2: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
     MASK_STEPS: gl.constexpr,
     PRELOAD_V: gl.constexpr,
@@ -86,36 +154,50 @@ def _attn_fwd_inner_naive(
     at ``block_min``. The boundary / causal masks are compiled out entirely when
     ``MASK_STEPS`` / ``IS_CAUSAL`` are ``False`` (the full-block case), so the bulk
     of the work runs mask-free. The MFMA and K/V load layouts are passed in by the
-    outer kernel so both kernels share a single definition.
+    outer kernel so both kernels share a single definition. When ``BLOCK_DMODEL``
+    (the real head dim) is smaller than ``BLOCK_DMODEL_POW2`` (the padded tile),
+    the head-dim axis of the K/V loads is masked so the padding lanes read 0.
     """
+    PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
+
     # Dot-operand layouts are derived from the shared MFMA layout.
     dotK: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
     dotP: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=MFMA_LAYOUT, k_width=8)
     dotV: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
 
     # Load-space key offsets (line up with the pointer tensors); the MFMA-layout
-    # key offsets are used for the qk-space masks.
+    # key offsets are used for the qk-space masks. The d-axis offsets are only
+    # used for head-dim padding masks.
     offs_kn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, K_LOAD_LAYOUT))
     offs_vn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, V_LOAD_LAYOUT))
+    offs_kd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, K_LOAD_LAYOUT))
+    offs_vd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, V_LOAD_LAYOUT))
     offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, MFMA_LAYOUT))
 
     for start_n in range(block_min, block_max, BLOCK_N):
-        # -- load K (boundary-masked only on the masked blocks) --
+        # Per-axis offsets for the K/V load masks (None => that axis is unmasked,
+        # which lets _load_fn drop the comparison). The n-axis is masked only on
+        # boundary (masked) blocks; the head-dim axis only when the head is padded.
         if MASK_STEPS:
-            gk = gl.load(
-                k_ptrs, mask=(start_n + offs_kn)[None, :] < seqlen_k, other=0.0
-            )
+            k_offs_n = start_n + offs_kn
+            v_offs_n = start_n + offs_vn
         else:
-            gk = gl.load(k_ptrs)
+            k_offs_n = None
+            v_offs_n = None
+        if PADDED_HEAD:
+            k_offs_d = offs_kd
+            v_offs_d = offs_vd
+        else:
+            k_offs_d = None
+            v_offs_d = None
+
+        # -- load K ([BLOCK_DMODEL_POW2, BLOCK_N]: d on axis 0, n on axis 1) --
+        gk = _load_fn(k_ptrs, k_offs_d, k_offs_n, BLOCK_DMODEL, seqlen_k)
         k = gl.convert_layout(gk, layout=dotK)
 
+        # -- load V ([BLOCK_N, BLOCK_DMODEL_POW2]: n on axis 0, d on axis 1) --
         if PRELOAD_V:
-            if MASK_STEPS:
-                gv = gl.load(
-                    v_ptrs, mask=(start_n + offs_vn)[:, None] < seqlen_k, other=0.0
-                )
-            else:
-                gv = gl.load(v_ptrs)
+            gv = _load_fn(v_ptrs, v_offs_n, v_offs_d, seqlen_k, BLOCK_DMODEL)
 
         # -- QK^T --
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
@@ -151,12 +233,7 @@ def _attn_fwd_inner_naive(
 
         acc = acc * alpha[:, None]
         if not PRELOAD_V:
-            if MASK_STEPS:
-                gv = gl.load(
-                    v_ptrs, mask=(start_n + offs_vn)[:, None] < seqlen_k, other=0.0
-                )
-            else:
-                gv = gl.load(v_ptrs)
+            gv = _load_fn(v_ptrs, v_offs_n, v_offs_d, seqlen_k, BLOCK_DMODEL)
         v = gl.convert_layout(gv, layout=dotV)
         p = gl.convert_layout(p.to(gv.dtype), layout=dotP)
         acc = gl.amd.cdna4.mfma(p, v, acc)
@@ -205,9 +282,13 @@ def _attn_fwd_naive(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
+    BLOCK_DMODEL_POW2: gl.constexpr,
     PRELOAD_V: gl.constexpr,
+    NUM_XCD: gl.constexpr,
+    HEAD_STRIDE_ALIGNED_8: gl.constexpr = False,
 ):
     RCP_LN2: gl.constexpr = 1.4426950408889634
+    PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
 
     # --- program -> (batch, q_head, query block) -------------------------------
     # SEQLEN_Q is the max query length, so NUM_BLOCKS_M matches the launch grid in
@@ -215,6 +296,8 @@ def _attn_fwd_naive(
     NUM_BLOCKS_M = gl.cdiv(SEQLEN_Q, BLOCK_M)
     pid = gl.program_id(axis=0)
     off_q_head = pid % NUM_Q_HEADS
+    # Re-map the q-head index across XCDs for better cache locality.
+    off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
     start_m = (pid // NUM_Q_HEADS) % NUM_BLOCKS_M
     off_z = pid // (NUM_Q_HEADS * NUM_BLOCKS_M) % BATCH
 
@@ -250,55 +333,71 @@ def _attn_fwd_naive(
     dotQ: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfmaLayout, k_width=8)
 
     # Coalesced global-load layouts (converted to the dot-operand layouts after
-    # loading), in the same spirit as the GEMM kernel's gLoadLayoutA/B.
+    # loading), in the same spirit as the GEMM kernel's gLoadLayoutA/B. These are
+    # sized to the padded head dim (BLOCK_DMODEL_POW2); the real head dim is only
+    # used for the head-padding load/store masks.
     qLoadLayout: gl.constexpr = gl.BlockedLayout(
         [1, 8],
-        [512 // BLOCK_DMODEL, BLOCK_DMODEL // 8],
+        [512 // BLOCK_DMODEL_POW2, BLOCK_DMODEL_POW2 // 8],
         [4, 1],
         [1, 0],
     )
-    # K is read transposed as [BLOCK_DMODEL, BLOCK_N] (head dim contiguous).
+    # K is read transposed as [BLOCK_DMODEL_POW2, BLOCK_N] (head dim contiguous).
     kLoadLayout: gl.constexpr = gl.BlockedLayout(
         [8, 1],
-        [BLOCK_DMODEL // 8, 512 // BLOCK_DMODEL],
+        [BLOCK_DMODEL_POW2 // 8, 512 // BLOCK_DMODEL_POW2],
         [1, 4],
         [0, 1],
     )
     vLoadLayout: gl.constexpr = gl.BlockedLayout(
         [1, 8],
-        [512 // BLOCK_DMODEL, BLOCK_DMODEL // 8],
+        [512 // BLOCK_DMODEL_POW2, BLOCK_DMODEL_POW2 // 8],
         [4, 1],
         [1, 0],
     )
 
+    # --- head-axis byte offsets -------------------------------------------------
+    # When the caller guarantees Q/K/V head strides are multiples of 8 elements
+    # (HEAD_STRIDE_ALIGNED_8), the head-axis offset is 16-byte aligned. Hinting
+    # the multiple lets AxisInfo widen the global loads.
+    qh_off = off_q_head * stride_qh
+    kh_off = off_k_head * stride_kh
+    vh_off = off_k_head * stride_vh
+    if HEAD_STRIDE_ALIGNED_8:
+        qh_off = gl.multiple_of(qh_off, 8)
+        kh_off = gl.multiple_of(kh_off, 8)
+        vh_off = gl.multiple_of(vh_off, 8)
+
     # --- load Q (stays resident for the whole key loop) -------------------------
     offs_qm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, qLoadLayout))
-    offs_qd = gl.arange(0, BLOCK_DMODEL, layout=gl.SliceLayout(0, qLoadLayout))
-    q_base = (
-        q_ptr + off_z * stride_qz + off_q_head * stride_qh + cu_seqlens_q_start * stride_qm
-    )
+    offs_qd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, qLoadLayout))
+    q_base = q_ptr + off_z * stride_qz + qh_off + cu_seqlens_q_start * stride_qm
     q_ptrs = (
         q_base
         + (start_m * BLOCK_M + offs_qm)[:, None] * stride_qm
         + offs_qd[None, :] * stride_qk
     )
     q_mask = (start_m * BLOCK_M + offs_qm)[:, None] < seqlen_q
-    q = gl.load(q_ptrs, mask=q_mask, other=0.0)
+    if PADDED_HEAD:
+        q_mask = q_mask & (offs_qd[None, :] < BLOCK_DMODEL)
+    # Cache Q at .cg when a single Q block spans at least one full head, so the
+    # repeated head-major reads stay resident.
+    if BLOCK_M >= NUM_Q_HEADS:
+        q_cache_mod: gl.constexpr = ".cg"
+    else:
+        q_cache_mod: gl.constexpr = ""
+    q = gl.load(q_ptrs, mask=q_mask, other=0.0, cache_modifier=q_cache_mod)
     q = gl.convert_layout(q, layout=dotQ)
 
     # --- key/value pointer setup ------------------------------------------------
-    offs_kd = gl.arange(0, BLOCK_DMODEL, layout=gl.SliceLayout(1, kLoadLayout))
+    offs_kd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, kLoadLayout))
     offs_kn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kLoadLayout))
-    k_base = (
-        k_ptr + off_z * stride_kz + off_k_head * stride_kh + cu_seqlens_k_start * stride_kn
-    )
+    k_base = k_ptr + off_z * stride_kz + kh_off + cu_seqlens_k_start * stride_kn
     k_ptrs = k_base + offs_kd[:, None] * stride_kk + offs_kn[None, :] * stride_kn
 
     offs_vn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, vLoadLayout))
-    offs_vd = gl.arange(0, BLOCK_DMODEL, layout=gl.SliceLayout(0, vLoadLayout))
-    v_base = (
-        v_ptr + off_z * stride_vz + off_k_head * stride_vh + cu_seqlens_k_start * stride_vn
-    )
+    offs_vd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, vLoadLayout))
+    v_base = v_ptr + off_z * stride_vz + vh_off + cu_seqlens_k_start * stride_vn
     v_ptrs = v_base + offs_vn[:, None] * stride_vn + offs_vd[None, :] * stride_vk
 
     # --- online-softmax state ---------------------------------------------------
@@ -306,7 +405,7 @@ def _attn_fwd_naive(
     # which zeroes the seed, so no special-casing of the first block is needed.
     m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout))
     l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout))
-    acc = gl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=gl.float32, layout=mfmaLayout)
+    acc = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=mfmaLayout)
 
     qk_scale = sm_scale * RCP_LN2
 
@@ -329,7 +428,7 @@ def _attn_fwd_naive(
         # keys. Its output rows are all zero, so write them out and bail before
         # touching the matrix units (mirrors the early-out in mha.py).
         if n_blocks <= 0:
-            offs_od = gl.arange(0, BLOCK_DMODEL, layout=gl.SliceLayout(0, mfmaLayout))
+            offs_od = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, mfmaLayout))
             o_base = (
                 o_ptr
                 + off_z * stride_oz
@@ -338,9 +437,14 @@ def _attn_fwd_naive(
             )
             o_ptrs = o_base + offs_m[:, None] * stride_om + offs_od[None, :] * stride_on
             zeros = gl.zeros(
-                [BLOCK_M, BLOCK_DMODEL], dtype=o_ptr.dtype.element_ty, layout=mfmaLayout
+                [BLOCK_M, BLOCK_DMODEL_POW2],
+                dtype=o_ptr.dtype.element_ty,
+                layout=mfmaLayout,
             )
-            gl.store(o_ptrs, zeros, mask=offs_m[:, None] < seqlen_q)
+            o_mask = offs_m[:, None] < seqlen_q
+            if PADDED_HEAD:
+                o_mask = o_mask & (offs_od[None, :] < BLOCK_DMODEL)
+            gl.store(o_ptrs, zeros, mask=o_mask)
             return
 
     # A trailing partial key block (seqlen_k not a multiple of BLOCK_N) must be
@@ -389,6 +493,8 @@ def _attn_fwd_naive(
             V_LOAD_LAYOUT=vLoadLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
             IS_CAUSAL=False,
             MASK_STEPS=False,
             PRELOAD_V=PRELOAD_V,
@@ -421,6 +527,8 @@ def _attn_fwd_naive(
             V_LOAD_LAYOUT=vLoadLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=True,
             PRELOAD_V=PRELOAD_V,
@@ -428,24 +536,48 @@ def _attn_fwd_naive(
 
     # --- epilogue: normalize and write back -------------------------------------
     acc = acc / l_i[:, None]
-    out = acc.to(o_ptr.dtype.element_ty)
 
     offs_om = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout))
-    offs_od = gl.arange(0, BLOCK_DMODEL, layout=gl.SliceLayout(0, mfmaLayout))
+    offs_od = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, mfmaLayout))
+
+    # If seqlen_q > seqlen_k and the delta is not a multiple of BLOCK_M, this
+    # block straddles the bottom-right causal boundary: rows above it attend to no
+    # keys, so softmax over an all-(-inf) row yields NaN. Zero those rows by index
+    # (only when the boundary actually falls inside this block), mirroring mha.py.
+    end_m_idx = (start_m + 1) * BLOCK_M
+    start_m_idx = start_m * BLOCK_M
+    causal_start_idx = seqlen_q - seqlen_k
+    if IS_CAUSAL:
+        if (causal_start_idx > start_m_idx) and (causal_start_idx < end_m_idx):
+            out_mask_boundary = gl.full(
+                [BLOCK_DMODEL_POW2],
+                causal_start_idx,
+                dtype=gl.int32,
+                layout=gl.SliceLayout(0, mfmaLayout),
+            )
+            mask_m_offsets = start_m_idx + gl.arange(
+                0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout)
+            )
+            out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
+            acc = gl.where(out_ptrs_mask, acc, 0.0)
+
+    out = acc.to(o_ptr.dtype.element_ty)
+
     o_base = (
         o_ptr + off_z * stride_oz + off_q_head * stride_oh + cu_seqlens_q_start * stride_om
     )
     o_ptrs = o_base + offs_om[:, None] * stride_om + offs_od[None, :] * stride_on
 
-    # Rows above the bottom-right causal boundary (only possible when
-    # seqlen_q > seqlen_k) attend to no keys, so their softmax row is all -inf and
-    # the normalization above yields NaN. Mirror mha.py / the reference by zeroing
-    # those rows out by index rather than guarding the division.
-    if IS_CAUSAL:
-        out = gl.where(offs_om[:, None] >= (seqlen_q - seqlen_k), out, 0.0)
-
-    o_mask = offs_om[:, None] < seqlen_q
-    gl.store(o_ptrs, out, mask=o_mask)
+    # Build the store mask exactly as mha.py: start all-true, AND in the query-row
+    # bound only when this block overflows seqlen_q, and the head-dim bound only
+    # when the head is padded. The [BLOCK_M, 1] base broadcasts over the d-axis.
+    overflow_size = end_m_idx - seqlen_q
+    out_mask = gl.full([BLOCK_M, 1], True, dtype=gl.int1, layout=mfmaLayout)
+    if overflow_size > 0:
+        out_mask = out_mask & (offs_om[:, None] < seqlen_q)
+    if PADDED_HEAD:
+        out_mask = out_mask & (offs_od[None, :] < BLOCK_DMODEL)
+    gl.store(o_ptrs, out, mask=out_mask)
 
 
 def _validate_and_launch(
@@ -479,10 +611,22 @@ def _validate_and_launch(
     """
     assert q.shape[-1] == k.shape[-1] == v.shape[-1], "head_dim mismatch"
     assert num_q_heads % num_k_heads == 0, "num_q_heads must be divisible by num_k_heads"
-    # MFMA 16x16x32 needs the contraction dims (head_dim, BLOCK_N) to be
-    # multiples of 32, and the blocked load layouts need head_dim | 512.
-    assert head_dim in (32, 64, 128, 256), "naive kernel supports head_dim in {32,64,128,256}"
+    # The real head dim may be any value; it is padded up to the next power of 2
+    # for the layouts/MFMA. MFMA 16x16x32 needs the padded head-dim contraction to
+    # be a multiple of 32, and the blocked load layouts need it to divide 512.
+    BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(head_dim), 16)
+    assert BLOCK_DMODEL_POW2 in (32, 64, 128, 256), (
+        "naive kernel supports head_dim whose padded power-of-2 is in "
+        f"{{32,64,128,256}} (i.e. 17..256), got head_dim={head_dim}"
+    )
     assert BLOCK_N % 32 == 0, "BLOCK_N must be a multiple of 32"
+
+    # Soundness precondition for the widened head-axis loads: only hint 8-element
+    # alignment when every Q/K/V head-axis stride is a multiple of 8 elements.
+    # *_strides[1] are the head-axis strides in both bshd and thd layouts.
+    head_stride_aligned_8 = (
+        q_strides[1] % 8 == 0 and k_strides[1] % 8 == 0 and v_strides[1] % 8 == 0
+    )
 
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
@@ -508,7 +652,10 @@ def _validate_and_launch(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_DMODEL=head_dim,
+        BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
         PRELOAD_V=True,
+        NUM_XCD=get_num_xcds(),
+        HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
         num_warps=4,
     )
     return o

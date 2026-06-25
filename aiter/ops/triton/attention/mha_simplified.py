@@ -15,7 +15,16 @@ _LOGGER = AiterTritonLogger()
 
 _USE_INT64_STRIDES = True
 _GLUON_SUPPORTED_ARCHS = ("gfx950",)
-_GLUON_SUPPORTED_HEAD_DIMS = frozenset({32, 64, 128, 256})
+# The Gluon kernel pads the real head dim up to the next power of 2 (used for the
+# MFMA contraction / load layouts), so any head dim whose padded size is one of
+# these is supported -- i.e. real head dims in 17..256, not just the powers of 2.
+_GLUON_SUPPORTED_POW2_HEAD_DIMS = (32, 64, 128, 256)
+_GLUON_MAX_HEAD_DIM = max(_GLUON_SUPPORTED_POW2_HEAD_DIMS)
+_GLUON_SUPPORTED_HEAD_DIMS = frozenset(
+    d
+    for d in range(1, _GLUON_MAX_HEAD_DIM + 1)
+    if max(triton.next_power_of_2(d), 16) in _GLUON_SUPPORTED_POW2_HEAD_DIMS
+)
 _TRITON_GE_36 = Version(triton.__version__) >= Version("3.6.0")
 
 
@@ -165,8 +174,8 @@ def flash_attn_func(
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
         head_size_og = q.size(3)
         assert head_size_og in _GLUON_SUPPORTED_HEAD_DIMS, (
-            f"gluon backend supports headdim in {sorted(_GLUON_SUPPORTED_HEAD_DIMS)}, "
-            f"got {head_size_og}"
+            f"gluon backend supports headdim in 17..{_GLUON_MAX_HEAD_DIM} "
+            f"(padded to one of {_GLUON_SUPPORTED_POW2_HEAD_DIMS}), got {head_size_og}"
         )
         from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_gluon import (
             flash_attn_fwd,
@@ -242,8 +251,8 @@ def flash_attn_varlen_func(
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
         head_size_og = q.size(2)
         assert head_size_og in _GLUON_SUPPORTED_HEAD_DIMS, (
-            f"gluon backend supports headdim in {sorted(_GLUON_SUPPORTED_HEAD_DIMS)}, "
-            f"got {head_size_og}"
+            f"gluon backend supports headdim in 17..{_GLUON_MAX_HEAD_DIM} "
+            f"(padded to one of {_GLUON_SUPPORTED_POW2_HEAD_DIMS}), got {head_size_og}"
         )
         from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_gluon import (
             flash_attn_varlen_fwd,
