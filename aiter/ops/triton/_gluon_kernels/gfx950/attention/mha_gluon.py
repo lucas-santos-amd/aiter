@@ -25,10 +25,17 @@
 # Naive Gluon flash-attention forward kernel for gfx950.
 #
 # This mirrors the style of the naive Gluon GEMM kernel in ``matmul_kernel.py``:
-# everything is spelled out inline (explicit MFMA / DotOperand / Blocked
-# layouts, explicit ``gl.load`` / ``gl.convert_layout`` / ``gl.amd.cdna4.mfma``)
-# with no autotuning, no async pipelining and no shared-memory staging. The goal
-# is readability, not peak performance.
+# everything is spelled out with explicit MFMA / DotOperand / Blocked layouts and
+# explicit ``gl.load`` / ``gl.convert_layout`` / ``gl.amd.cdna4.mfma``, with no
+# autotuning, no async pipelining and no shared-memory staging.
+#
+# Like the Triton kernel in ``mha.py``, the key/value loop is factored into a
+# reusable inner routine (``_attn_fwd_inner_naive``) and the key blocks are
+# classified into two groups: fully-visible ("full") blocks that need no masking,
+# and boundary/causal ("masked") blocks. The outer kernel runs the inner routine
+# once for each group, so the bulk of the loop (the full blocks) executes free of
+# any boundary / causal mask work. ``PRELOAD_V`` issues the V load ahead of the
+# softmax so it can overlap the QK math.
 #
 # One program computes a single (batch, q_head, query-block) tile of the output
 # by looping over the key/value blocks and running an online softmax.
@@ -45,6 +52,122 @@ import torch
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+
+@gluon.jit
+def _attn_fwd_inner_naive(
+    acc,
+    l_i,
+    m_i,
+    q,
+    k_ptrs,
+    v_ptrs,
+    stride_kn,
+    stride_vn,
+    seqlen_q,
+    seqlen_k,
+    block_min,
+    block_max,
+    n_extra_tokens,
+    offs_m,
+    qk_scale,
+    MFMA_LAYOUT: gl.constexpr,
+    K_LOAD_LAYOUT: gl.constexpr,
+    V_LOAD_LAYOUT: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    IS_CAUSAL: gl.constexpr,
+    MASK_STEPS: gl.constexpr,
+    PRELOAD_V: gl.constexpr,
+):
+    """Online-softmax loop over the key/value blocks in ``[block_min, block_max)``.
+
+    ``q`` arrives already in the ``dotQ`` layout and ``k_ptrs`` / ``v_ptrs`` point
+    at ``block_min``. The boundary / causal masks are compiled out entirely when
+    ``MASK_STEPS`` / ``IS_CAUSAL`` are ``False`` (the full-block case), so the bulk
+    of the work runs mask-free. The MFMA and K/V load layouts are passed in by the
+    outer kernel so both kernels share a single definition.
+    """
+    # Dot-operand layouts are derived from the shared MFMA layout.
+    dotK: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
+    dotP: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=MFMA_LAYOUT, k_width=8)
+    dotV: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
+
+    # Load-space key offsets (line up with the pointer tensors); the MFMA-layout
+    # key offsets are used for the qk-space masks.
+    offs_kn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, K_LOAD_LAYOUT))
+    offs_vn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, V_LOAD_LAYOUT))
+    offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, MFMA_LAYOUT))
+
+    for start_n in range(block_min, block_max, BLOCK_N):
+        # -- load K (boundary-masked only on the masked blocks) --
+        if MASK_STEPS:
+            gk = gl.load(
+                k_ptrs, mask=(start_n + offs_kn)[None, :] < seqlen_k, other=0.0
+            )
+        else:
+            gk = gl.load(k_ptrs)
+        k = gl.convert_layout(gk, layout=dotK)
+
+        if PRELOAD_V:
+            if MASK_STEPS:
+                gv = gl.load(
+                    v_ptrs, mask=(start_n + offs_vn)[:, None] < seqlen_k, other=0.0
+                )
+            else:
+                gv = gl.load(v_ptrs)
+
+        # -- QK^T --
+        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
+        qk = gl.amd.cdna4.mfma(q, k, qk)
+        qk = qk * qk_scale
+
+        # qk-space mask (MFMA layout): boundary + (optionally) causal. Skipped
+        # entirely for full blocks.
+        if MASK_STEPS or IS_CAUSAL:
+            mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=MFMA_LAYOUT)
+            if MASK_STEPS:
+                # Only the last visible block can be partial, and only when
+                # seqlen_k is not a multiple of BLOCK_N. mask_partial is computed
+                # unconditionally and selected via bound_cond so the loop body
+                # stays branch-free (mirrors mha.py).
+                bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
+                size_n = start_n + offs_n
+                mask_partial = size_n[None, :] < seqlen_k
+                mask = gl.where(bound_cond, mask_partial, mask)
+            if IS_CAUSAL:
+                causal_boundary = start_n + offs_n + (seqlen_q - seqlen_k)
+                causal_mask = offs_m[:, None] >= causal_boundary[None, :]
+                mask = mask & causal_mask
+            qk = gl.where(mask, qk, float("-inf"))
+
+        # -- online softmax --
+        # Fully-masked rows leave m_ij == -inf and produce NaNs here; those rows
+        # are zeroed out by index in the epilogue (see mha.py for the same scheme).
+        m_ij = gl.maximum(m_i, gl.max(qk, 1))
+        p = gl.exp2(qk - m_ij[:, None])
+        alpha = gl.exp2(m_i - m_ij)
+        l_ij = gl.sum(p, 1)
+
+        acc = acc * alpha[:, None]
+        if not PRELOAD_V:
+            if MASK_STEPS:
+                gv = gl.load(
+                    v_ptrs, mask=(start_n + offs_vn)[:, None] < seqlen_k, other=0.0
+                )
+            else:
+                gv = gl.load(v_ptrs)
+        v = gl.convert_layout(gv, layout=dotV)
+        p = gl.convert_layout(p.to(gv.dtype), layout=dotP)
+        acc = gl.amd.cdna4.mfma(p, v, acc)
+
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+
+        k_ptrs += BLOCK_N * stride_kn
+        v_ptrs += BLOCK_N * stride_vn
+
+    return acc, l_i, m_i
 
 
 @gluon.jit
@@ -82,6 +205,7 @@ def _attn_fwd_naive(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
+    PRELOAD_V: gl.constexpr,
 ):
     RCP_LN2: gl.constexpr = 1.4426950408889634
 
@@ -119,13 +243,11 @@ def _attn_fwd_naive(
     # A single MFMA layout is reused for both matmuls (QK^T and P@V). For bf16/fp16
     # both dots share the same 16x16x32 instruction shape, so the result
     # distribution is identical and softmax state can live in its slice layouts.
+    # The dot/load layouts for K/V are recomputed inside _attn_fwd_inner_naive.
     mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 2]
     )
     dotQ: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfmaLayout, k_width=8)
-    dotK: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfmaLayout, k_width=8)
-    dotP: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfmaLayout, k_width=8)
-    dotV: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfmaLayout, k_width=8)
 
     # Coalesced global-load layouts (converted to the dot-operand layouts after
     # loading), in the same spirit as the GEMM kernel's gLoadLayoutA/B.
@@ -188,11 +310,13 @@ def _attn_fwd_naive(
 
     qk_scale = sm_scale * RCP_LN2
 
-    # Query / key positions used for masking, in the MFMA result layout.
+    # Query positions used for the causal mask, in the MFMA result layout.
     offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout))
-    offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
 
-    # Number of key blocks; for causal we stop at the (bottom-right aligned) diagonal.
+    # --- classify key blocks: full (mask-free) vs masked (boundary/causal) ------
+    # Mirrors mha.py: full blocks are fully inside seqlen_k and (for causal) fully
+    # below the diagonal, so they run without any masking. Only the trailing
+    # boundary block and the causal-diagonal blocks need masking.
     n_blocks = gl.cdiv(seqlen_k, BLOCK_N)
     if IS_CAUSAL:
         n_blocks_causal = gl.cdiv(
@@ -200,43 +324,107 @@ def _attn_fwd_naive(
         )
         n_blocks = min(n_blocks, n_blocks_causal)
 
-    for start_n in range(0, n_blocks * BLOCK_N, BLOCK_N):
-        # qk-space mask (MFMA layout): boundary + (optionally) causal.
-        key_pos = start_n + offs_n
-        mask = key_pos[None, :] < seqlen_k
-        if IS_CAUSAL:
-            mask = mask & (key_pos[None, :] <= (offs_m[:, None] + (seqlen_k - seqlen_q)))
+        # If there are no visible blocks left, this query block lies entirely
+        # above the (bottom-right aligned) causal diagonal and attends to no
+        # keys. Its output rows are all zero, so write them out and bail before
+        # touching the matrix units (mirrors the early-out in mha.py).
+        if n_blocks <= 0:
+            offs_od = gl.arange(0, BLOCK_DMODEL, layout=gl.SliceLayout(0, mfmaLayout))
+            o_base = (
+                o_ptr
+                + off_z * stride_oz
+                + off_q_head * stride_oh
+                + cu_seqlens_q_start * stride_om
+            )
+            o_ptrs = o_base + offs_m[:, None] * stride_om + offs_od[None, :] * stride_on
+            zeros = gl.zeros(
+                [BLOCK_M, BLOCK_DMODEL], dtype=o_ptr.dtype.element_ty, layout=mfmaLayout
+            )
+            gl.store(o_ptrs, zeros, mask=offs_m[:, None] < seqlen_q)
+            return
 
-        # Load-space boundary masks must live in the load layouts (not the MFMA
-        # layout) so they line up with the pointer tensors.
-        gk = gl.load(k_ptrs, mask=(start_n + offs_kn)[None, :] < seqlen_k, other=0.0)
-        gv = gl.load(v_ptrs, mask=(start_n + offs_vn)[:, None] < seqlen_k, other=0.0)
-        k = gl.convert_layout(gk, layout=dotK)
+    # A trailing partial key block (seqlen_k not a multiple of BLOCK_N) must be
+    # masked on its boundary.
+    n_extra_tokens = 0
+    if seqlen_k < BLOCK_N:
+        n_extra_tokens = BLOCK_N - seqlen_k
+    elif seqlen_k % BLOCK_N:
+        n_extra_tokens = seqlen_k % BLOCK_N
+    padded_block_k = n_extra_tokens != 0
+    is_modulo_mn = (not padded_block_k) and (seqlen_q % BLOCK_M == 0)
 
-        # -- QK^T --
-        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-        qk = gl.amd.cdna4.mfma(q, k, qk)
-        qk = qk * qk_scale
-        qk = gl.where(mask, qk, float("-inf"))
+    if IS_CAUSAL:
+        # At least BLOCK_M // BLOCK_N diagonal blocks, plus one more when the
+        # seqlens are not aligned.
+        masked_blocks = BLOCK_M // BLOCK_N + (not is_modulo_mn)
+    else:
+        masked_blocks = padded_block_k
 
-        # -- online softmax --
-        # Fully-masked rows leave m_ij == -inf and produce NaNs here; those rows
-        # are zeroed out by index in the epilogue (see mha.py for the same scheme).
-        m_ij = gl.maximum(m_i, gl.max(qk, 1))
-        p = gl.exp2(qk - m_ij[:, None])
-        alpha = gl.exp2(m_i - m_ij)
-        l_ij = gl.sum(p, 1)
+    masked_blocks = min(masked_blocks, n_blocks)
+    n_full_blocks = n_blocks - masked_blocks
+    block_min = 0
+    block_max = n_blocks * BLOCK_N
 
-        acc = acc * alpha[:, None]
-        v = gl.convert_layout(gv, layout=dotV)
-        p = gl.convert_layout(p.to(v_ptr.dtype.element_ty), layout=dotP)
-        acc = gl.amd.cdna4.mfma(p, v, acc)
+    # Full blocks: no boundary mask, no causal mask.
+    if n_full_blocks > 0:
+        block_max = n_full_blocks * BLOCK_N
+        acc, l_i, m_i = _attn_fwd_inner_naive(
+            acc,
+            l_i,
+            m_i,
+            q,
+            k_ptrs,
+            v_ptrs,
+            stride_kn,
+            stride_vn,
+            seqlen_q,
+            seqlen_k,
+            block_min,
+            block_max,
+            0,
+            offs_m,
+            qk_scale,
+            MFMA_LAYOUT=mfmaLayout,
+            K_LOAD_LAYOUT=kLoadLayout,
+            V_LOAD_LAYOUT=vLoadLayout,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            IS_CAUSAL=False,
+            MASK_STEPS=False,
+            PRELOAD_V=PRELOAD_V,
+        )
+        block_min = block_max
+        block_max = n_blocks * BLOCK_N
 
-        l_i = l_i * alpha + l_ij
-        m_i = m_ij
-
-        k_ptrs += BLOCK_N * stride_kn
-        v_ptrs += BLOCK_N * stride_vn
+    # Remaining blocks carry the boundary / causal masking.
+    if masked_blocks > 0:
+        k_ptrs += n_full_blocks * BLOCK_N * stride_kn
+        v_ptrs += n_full_blocks * BLOCK_N * stride_vn
+        acc, l_i, m_i = _attn_fwd_inner_naive(
+            acc,
+            l_i,
+            m_i,
+            q,
+            k_ptrs,
+            v_ptrs,
+            stride_kn,
+            stride_vn,
+            seqlen_q,
+            seqlen_k,
+            block_min,
+            block_max,
+            n_extra_tokens,
+            offs_m,
+            qk_scale,
+            MFMA_LAYOUT=mfmaLayout,
+            K_LOAD_LAYOUT=kLoadLayout,
+            V_LOAD_LAYOUT=vLoadLayout,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            IS_CAUSAL=IS_CAUSAL,
+            MASK_STEPS=True,
+            PRELOAD_V=PRELOAD_V,
+        )
 
     # --- epilogue: normalize and write back -------------------------------------
     acc = acc / l_i[:, None]
@@ -320,6 +508,7 @@ def _validate_and_launch(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_DMODEL=head_dim,
+        PRELOAD_V=True,
         num_warps=4,
     )
     return o
