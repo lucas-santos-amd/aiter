@@ -22,7 +22,7 @@
 # THE SOFTWARE.
 ##############################################################################
 
-# Naive Gluon flash-attention forward kernel for gfx950.
+# Gluon flash-attention forward kernel for gfx950.
 #
 
 # One program computes a single (batch, q_head, query-block) tile of the output
@@ -73,30 +73,41 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: gl.constexpr = 8):
 
 
 @gluon.jit
-def _load_fn(base, offsets, offset_first, offset_second, boundary_first, boundary_second):
-    """Gluon port of ``mha.py``'s ``_load_fn``, using an AMD buffer load.
+def _async_load_fn(
+    smem, base, offsets, offset_first, offset_second, boundary_first, boundary_second
+):
+    """Async global->LDS copy with the same masking logic as ``mha.py``'s ``_load_fn``.
 
-    ``base`` is a scalar base pointer and ``offsets`` is the constant int32 offset
-    tile (carrying the load layout).
+    Issues an AMD ``buffer_load_to_shared`` from scalar base ``base`` + constant
+    int32 ``offsets`` into the shared-memory tile ``smem``. Each axis is masked
+    only when its offset tensor is not ``None`` (a compile-time decision), so
+    fully-in-range copies stay mask-free; masked lanes are filled with 0 (needed
+    so head-dim padding lanes contribute 0 to the MFMA contraction). The caller
+    owns the matching ``commit_group`` / ``wait_group`` before reading ``smem``.
     """
     if offset_first is not None and offset_second is not None:
         mask = (offset_first[:, None] < boundary_first) & (
             offset_second[None, :] < boundary_second
         )
-        tensor = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets, mask=mask, other=0.0)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem, base, offsets, mask=mask, other=0.0
+        )
     elif offset_first is not None:
         mask = offset_first[:, None] < boundary_first
-        tensor = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets, mask=mask, other=0.0)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem, base, offsets, mask=mask, other=0.0
+        )
     elif offset_second is not None:
         mask = offset_second[None, :] < boundary_second
-        tensor = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets, mask=mask, other=0.0)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem, base, offsets, mask=mask, other=0.0
+        )
     else:
-        tensor = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets)
-    return tensor
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(smem, base, offsets)
 
 
 @gluon.jit
-def _attn_fwd_inner_naive(
+def _attn_fwd_inner(
     acc,
     l_i,
     m_i,
@@ -105,6 +116,8 @@ def _attn_fwd_inner_naive(
     k_offsets,
     v_base,
     v_offsets,
+    smemK,
+    smemV,
     stride_kn,
     stride_vn,
     seqlen_q,
@@ -130,7 +143,9 @@ def _attn_fwd_inner_naive(
     ``q`` arrives already in the ``dotQ`` layout. ``k_base`` / ``v_base`` are scalar
     base pointers positioned at ``block_min`` (advanced by one key block per
     iteration) and ``k_offsets`` / ``v_offsets`` are the constant int32 offset tiles
-    consumed by the buffer loads. The boundary / causal masks are compiled out
+    consumed by the buffer loads. ``smemK`` / ``smemV`` are the shared-memory tiles
+    each key block is async-copied into before being read straight into the MFMA
+    dot-operand layout. The boundary / causal masks are compiled out
     entirely when
     ``MASK_STEPS`` / ``IS_CAUSAL`` are ``False`` (the full-block case), so the bulk
     of the work runs mask-free. The MFMA and K/V load layouts are passed in by the
@@ -156,8 +171,8 @@ def _attn_fwd_inner_naive(
 
     for start_n in range(block_min, block_max, BLOCK_N):
         # Per-axis offsets for the K/V load masks (None => that axis is unmasked,
-        # which lets _load_fn drop the comparison). The n-axis is masked only on
-        # boundary (masked) blocks; the head-dim axis only when the head is padded.
+        # which lets _async_load_fn drop the comparison). The n-axis is masked only
+        # on boundary (masked) blocks; the head-dim axis only when the head is padded.
         if MASK_STEPS:
             k_offs_n = start_n + offs_kn
             v_offs_n = start_n + offs_vn
@@ -171,15 +186,20 @@ def _attn_fwd_inner_naive(
             k_offs_d = None
             v_offs_d = None
 
-        # -- load K ([BLOCK_DMODEL_POW2, BLOCK_N]: d on axis 0, n on axis 1) --
-        gk = _load_fn(k_base, k_offsets, k_offs_d, k_offs_n, BLOCK_DMODEL, seqlen_k)
-        k = gl.convert_layout(gk, layout=dotK)
+        # -- async-copy K and V from global memory into LDS --
+        # K is staged as [BLOCK_DMODEL_POW2, BLOCK_N] (d on axis 0, n on axis 1);
+        # V as [BLOCK_N, BLOCK_DMODEL_POW2] (n on axis 0, d on axis 1). Both tiles
+        # are issued up front, then a single commit + wait(0) blocks until they
+        # land in LDS. Without pipelining the ``PRELOAD_V`` knob no longer affects
+        # ordering: async staging already overlaps both copies with the math.
+        _async_load_fn(smemK, k_base, k_offsets, k_offs_d, k_offs_n, BLOCK_DMODEL, seqlen_k)
+        _async_load_fn(smemV, v_base, v_offsets, v_offs_n, v_offs_d, seqlen_k, BLOCK_DMODEL)
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(0)
 
-        # -- load V ([BLOCK_N, BLOCK_DMODEL_POW2]: n on axis 0, d on axis 1) --
-        if PRELOAD_V:
-            gv = _load_fn(v_base, v_offsets, v_offs_n, v_offs_d, seqlen_k, BLOCK_DMODEL)
-
-        # -- QK^T --
+        # -- QK^T (K read straight from LDS into the dotK operand layout) --
+        k = smemK.load(dotK)
+        v = smemV.load(dotV)
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
         qk = gl.amd.cdna4.mfma(q, k, qk)
         qk = qk * qk_scale
@@ -212,10 +232,8 @@ def _attn_fwd_inner_naive(
         l_ij = gl.sum(p, 1)
 
         acc = acc * alpha[:, None]
-        if not PRELOAD_V:
-            gv = _load_fn(v_base, v_offsets, v_offs_n, v_offs_d, seqlen_k, BLOCK_DMODEL)
-        v = gl.convert_layout(gv, layout=dotV)
-        p = gl.convert_layout(p.to(gv.dtype), layout=dotP)
+
+        p = gl.convert_layout(p.to(v.dtype), layout=dotP)
         acc = gl.amd.cdna4.mfma(p, v, acc)
 
         l_i = l_i * alpha + l_ij
@@ -229,7 +247,7 @@ def _attn_fwd_inner_naive(
 
 
 @gluon.jit
-def _attn_fwd_naive(
+def _attn_fwd(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -307,7 +325,7 @@ def _attn_fwd_naive(
     # A single MFMA layout is reused for both matmuls (QK^T and P@V). For bf16/fp16
     # both dots share the same 16x16x32 instruction shape, so the result
     # distribution is identical and softmax state can live in its slice layouts.
-    # The dot/load layouts for K/V are recomputed inside _attn_fwd_inner_naive.
+    # The dot/load layouts for K/V are recomputed inside _attn_fwd.
     mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 2]
     )
@@ -336,6 +354,10 @@ def _attn_fwd_naive(
         [4, 1],
         [1, 0],
     )
+
+    # Shared-memory layouts for the async global->LDS staging of K and V
+    kSharedLayout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0, 1])
+    vSharedLayout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
 
     # --- head-axis byte offsets -------------------------------------------------
     # When the caller guarantees Q/K/V head strides are multiples of 8 elements
@@ -380,7 +402,7 @@ def _attn_fwd_naive(
     # --- key/value pointer setup ------------------------------------------------
     # Same base/offset split as Q: the scalar base lands at key block 0 of this
     # (batch, head) and is advanced one key block per loop iteration inside
-    # _attn_fwd_inner_naive, while the int32 offset tiles stay constant.
+    # _attn_fwd, while the int32 offset tiles stay constant.
     offs_kd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, kLoadLayout))
     offs_kn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kLoadLayout))
     k_base = k_ptr + off_z * stride_kz + kh_off + cu_seqlens_k_start * stride_kn
@@ -390,6 +412,18 @@ def _attn_fwd_naive(
     offs_vd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, vLoadLayout))
     v_base = v_ptr + off_z * stride_vz + vh_off + cu_seqlens_k_start * stride_vn
     v_offsets = (offs_vn[:, None] * stride_vn + offs_vd[None, :] * stride_vk).to(gl.int32)
+
+    # --- shared-memory tiles for the async K/V staging --------------------------
+    # Allocated once and reused (single-buffered) across both inner-loop passes;
+    # each key block is async-copied here, then read straight into the MFMA
+    # dot-operand layout. K is [BLOCK_DMODEL_POW2, BLOCK_N], V is
+    # [BLOCK_N, BLOCK_DMODEL_POW2].
+    smemK = gl.allocate_shared_memory(
+        k_ptr.dtype.element_ty, [BLOCK_DMODEL_POW2, BLOCK_N], kSharedLayout
+    )
+    smemV = gl.allocate_shared_memory(
+        v_ptr.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL_POW2], vSharedLayout
+    )
 
     # --- online-softmax state ---------------------------------------------------
     # l_i is seeded to 1.0: on the first iteration alpha == exp2(-inf - m) == 0,
@@ -467,7 +501,7 @@ def _attn_fwd_naive(
     # Full blocks: no boundary mask, no causal mask.
     if n_full_blocks > 0:
         block_max = n_full_blocks * BLOCK_N
-        acc, l_i, m_i = _attn_fwd_inner_naive(
+        acc, l_i, m_i = _attn_fwd_inner(
             acc,
             l_i,
             m_i,
@@ -476,6 +510,8 @@ def _attn_fwd_naive(
             k_offsets,
             v_base,
             v_offsets,
+            smemK,
+            smemV,
             stride_kn,
             stride_vn,
             seqlen_q,
@@ -503,7 +539,7 @@ def _attn_fwd_naive(
     if masked_blocks > 0:
         k_base += n_full_blocks * BLOCK_N * stride_kn
         v_base += n_full_blocks * BLOCK_N * stride_vn
-        acc, l_i, m_i = _attn_fwd_inner_naive(
+        acc, l_i, m_i = _attn_fwd_inner(
             acc,
             l_i,
             m_i,
@@ -512,6 +548,8 @@ def _attn_fwd_naive(
             k_offsets,
             v_base,
             v_offsets,
+            smemK,
+            smemV,
             stride_kn,
             stride_vn,
             seqlen_q,
@@ -620,7 +658,7 @@ def _validate_and_launch(
     # be a multiple of 32, and the blocked load layouts need it to divide 512.
     BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(head_dim), 16)
     assert BLOCK_DMODEL_POW2 in (32, 64, 128, 256), (
-        "naive kernel supports head_dim whose padded power-of-2 is in "
+        "kernel supports head_dim whose padded power-of-2 is in "
         f"{{32,64,128,256}} (i.e. 17..256), got head_dim={head_dim}"
     )
     assert BLOCK_N % 32 == 0, "BLOCK_N must be a multiple of 32"
@@ -634,7 +672,7 @@ def _validate_and_launch(
 
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
-    _attn_fwd_naive[grid](
+    _attn_fwd[grid](
         q,
         k,
         v,
@@ -675,7 +713,7 @@ def flash_attn_fwd(
     BLOCK_M=128,
     BLOCK_N=64,
 ):
-    """Naive Gluon flash-attention forward (fixed-length / padded batch).
+    """Gluon flash-attention forward (fixed-length / padded batch).
 
     Arguments:
         q: (batch, seqlen_q, num_q_heads, head_dim)
@@ -739,7 +777,7 @@ def flash_attn_varlen_fwd(
     BLOCK_M=128,
     BLOCK_N=64,
 ):
-    """Naive Gluon flash-attention forward for ragged (varlen) batches.
+    """Gluon flash-attention forward for ragged (varlen) batches.
 
     Q/K/V are packed token sequences without a batch dimension; the per-sequence
     boundaries are given by the cumulative-length tensors.
