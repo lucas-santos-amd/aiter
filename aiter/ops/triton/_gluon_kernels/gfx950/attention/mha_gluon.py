@@ -383,9 +383,18 @@ def _attn_fwd(
         [1, 0],
     )
 
-    # Shared-memory layouts for the async global->LDS staging of K and V
-    kSharedLayout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0, 1])
-    vSharedLayout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    # Shared-memory layouts for the async global->LDS staging of K and V. Both
+    # tiles are contiguous along the head-dim axis (BLOCK_DMODEL_POW2), so pad
+    # once per contiguous row (interval == the head dim) by 8 elements to break
+    # LDS bank conflicts. with_identity_for cannot express an interval larger than
+    # the contiguous run (e.g. 128 over a 64-wide head): that produces an identity
+    # layout the async copy can't lower, failing LLVM translation.
+    kSharedLayout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_DMODEL_POW2, 8]], [BLOCK_DMODEL_POW2, BLOCK_N], [0, 1]
+    )
+    vSharedLayout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_DMODEL_POW2, 8]], [BLOCK_N, BLOCK_DMODEL_POW2], [1, 0]
+    )
 
     # --- head-axis byte offsets -------------------------------------------------
     # When the caller guarantees Q/K/V head strides are multiples of 8 elements
