@@ -383,17 +383,20 @@ def _attn_fwd(
         [1, 0],
     )
 
-    # Shared-memory layouts for the async global->LDS staging of K and V. Both
-    # tiles are contiguous along the head-dim axis (BLOCK_DMODEL_POW2), so pad
-    # once per contiguous row (interval == the head dim) by 8 elements to break
-    # LDS bank conflicts. with_identity_for cannot express an interval larger than
-    # the contiguous run (e.g. 128 over a 64-wide head): that produces an identity
-    # layout the async copy can't lower, failing LLVM translation.
-    kSharedLayout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_DMODEL_POW2, 8]], [BLOCK_DMODEL_POW2, BLOCK_N], [0, 1]
+    # Shared-memory layouts for the async global->LDS staging of K and V.
+    SWIZZLE_VEC: gl.constexpr = 8
+    ELEM_BYTES: gl.constexpr = k_ptr.dtype.element_ty.primitive_bitwidth // 8
+    BANK_LINE_BYTES: gl.constexpr = 64 * 4  # gfx950: 64 banks * 4 B
+    BANK_LINE_ELEMS: gl.constexpr = BANK_LINE_BYTES // ELEM_BYTES
+    ROW_BYTES: gl.constexpr = BLOCK_DMODEL_POW2 * ELEM_BYTES
+
+    SWIZZLE_PER_PHASE: gl.constexpr = max(1, BANK_LINE_BYTES // ROW_BYTES)
+    SWIZZLE_MAX_PHASE: gl.constexpr = min(BLOCK_DMODEL_POW2 // SWIZZLE_VEC, BANK_LINE_ELEMS // SWIZZLE_VEC)
+    kSharedLayout: gl.constexpr = gl.SwizzledSharedLayout(
+        SWIZZLE_VEC, SWIZZLE_PER_PHASE, SWIZZLE_MAX_PHASE, order=[0, 1]
     )
-    vSharedLayout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_DMODEL_POW2, 8]], [BLOCK_N, BLOCK_DMODEL_POW2], [1, 0]
+    vSharedLayout: gl.constexpr = gl.SwizzledSharedLayout(
+        SWIZZLE_VEC, SWIZZLE_PER_PHASE, SWIZZLE_MAX_PHASE, order=[1, 0]
     )
 
     # --- head-axis byte offsets -------------------------------------------------
