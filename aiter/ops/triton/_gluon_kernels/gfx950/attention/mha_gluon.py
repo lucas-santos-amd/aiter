@@ -80,40 +80,44 @@ def _async_load_fn(smem, base, offsets):
     into the shared-memory tile ``smem``; the caller owns the matching
     ``commit_group`` / ``wait_group`` before reading ``smem``.
 
-    Only used for fully in-range tiles. The *masked* async-to-LDS path
-    (``buffer_load_to_shared`` with a per-lane mask + ``other``) was empirically
-    shown to produce wrong results for partial tiles on this stack -- NaNs on the
-    boundary/partial-key-block tests, not fixed by an explicit cross-warp barrier
-    -- so any tile that needs per-lane masking (boundary key columns or head-dim
-    padding) goes through the register ``_load_fn`` instead.
+    Only used for fully in-range tiles. The scalar-base ``buffer_load_to_shared``
+    masked path was unreliable for partial tiles here, so tiles that need per-lane
+    masking (boundary key columns or head-dim padding) go through the pointer-
+    tensor ``global_load_to_shared`` path in ``_async_load_masked_fn`` instead.
     """
     gl.amd.cdna4.async_copy.buffer_load_to_shared(smem, base, offsets)
 
 
 @gluon.jit
-def _load_fn(base, offsets, offset_first, offset_second, boundary_first, boundary_second):
-    """Masked register buffer-load (AMD ``buffer_load``) for tiles needing masking.
+def _async_load_masked_fn(
+    smem, base, offsets, offset_first, offset_second, boundary_first, boundary_second
+):
+    """Masked async global->LDS copy (AMD ``global_load_to_shared``).
 
-    Unlike the async-to-LDS copy, ``buffer_load`` honors ``other=0.0`` on masked
-    lanes, so out-of-range key columns / head-dim padding lanes read 0 (required
-    so they contribute 0 to the QK / P@V matmuls instead of stale garbage). Each
-    axis is masked only when its offset tensor is not ``None`` (a compile-time
-    decision), so fully-in-range loads stay mask-free.
+    Builds the 64-bit pointer tensor ``base + offsets`` and async-copies it into
+    the shared tile ``smem`` with a per-axis mask, filling masked lanes with
+    ``other=0.0`` so out-of-range key columns / head-dim padding read 0 (required
+    so they contribute 0 to the QK / P@V matmuls). Used for boundary and
+    padded-head tiles so K/V always stage through LDS. Unlike the scalar-base
+    ``buffer_load_to_shared`` fast path, ``global_load_to_shared`` takes a full
+    pointer tensor, which is what supports masked async-to-LDS here. Each axis is
+    masked only when its offset tensor is not ``None`` (a compile-time decision).
+    The caller owns the matching ``commit_group`` / ``wait_group``.
     """
+    ptrs = base + offsets
     if offset_first is not None and offset_second is not None:
         mask = (offset_first[:, None] < boundary_first) & (
             offset_second[None, :] < boundary_second
         )
-        tensor = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets, mask=mask, other=0.0)
+        gl.amd.cdna4.async_copy.global_load_to_shared(smem, ptrs, mask=mask, other=0.0)
     elif offset_first is not None:
         mask = offset_first[:, None] < boundary_first
-        tensor = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets, mask=mask, other=0.0)
+        gl.amd.cdna4.async_copy.global_load_to_shared(smem, ptrs, mask=mask, other=0.0)
     elif offset_second is not None:
         mask = offset_second[None, :] < boundary_second
-        tensor = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets, mask=mask, other=0.0)
+        gl.amd.cdna4.async_copy.global_load_to_shared(smem, ptrs, mask=mask, other=0.0)
     else:
-        tensor = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets)
-    return tensor
+        gl.amd.cdna4.async_copy.global_load_to_shared(smem, ptrs)
 
 
 @gluon.jit
@@ -164,13 +168,12 @@ def _attn_fwd_inner(
     the head-dim axis of the K/V loads is masked so the padding lanes read 0.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
-    # Use the async global->LDS copy only for fully in-range tiles. The masked
-    # buffer-load-to-LDS path produces incorrect (flaky, occupancy-dependent)
-    # results for partial tiles on gfx950: it NaNs on the boundary/partial-key
-    # tests and an explicit cross-warp barrier after the wait did not help. So any
-    # tile that needs per-lane masking (boundary key columns or head-dim padding)
-    # goes through the masked register load instead.
-    USE_ASYNC: gl.constexpr = (not MASK_STEPS) and (not PADDED_HEAD)
+    # K and V always stage through LDS. Fully in-range tiles take the fast
+    # ``buffer_load_to_shared`` path (USE_BUFFER_LOAD); tiles that need
+    # per-lane masking (boundary key columns or head-dim padding) use the
+    # pointer-tensor ``global_load_to_shared`` path, which supports a mask with
+    # other=0 so masked lanes stage as 0.
+    USE_BUFFER_LOAD: gl.constexpr = (not MASK_STEPS) and (not PADDED_HEAD)
 
     # Dot-operand layouts are derived from the shared MFMA layout.
     dotK: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
@@ -188,8 +191,9 @@ def _attn_fwd_inner(
 
     for start_n in range(block_min, block_max, BLOCK_N):
         # Per-axis offsets for the K/V load masks (None => that axis is unmasked,
-        # which lets _async_load_fn drop the comparison). The n-axis is masked only
-        # on boundary (masked) blocks; the head-dim axis only when the head is padded.
+        # which lets _async_load_masked_fn drop the comparison). The n-axis is masked
+        # only on boundary (masked) blocks; the head-dim axis only when the head is
+        # padded. Unused by the USE_BUFFER_LOAD (fully in-range) buffer-copy path.
         if MASK_STEPS:
             k_offs_n = start_n + offs_kn
             v_offs_n = start_n + offs_vn
@@ -204,28 +208,28 @@ def _attn_fwd_inner(
             v_offs_d = None
 
         # -- load K and V --
-        # Fully in-range tiles (full blocks of a non-padded head) are async-copied
-        # global->LDS, then read straight into the MFMA dot-operand layout. K is
-        # staged as [BLOCK_DMODEL_POW2, BLOCK_N] (d on axis 0, n on axis 1); V as
-        # [BLOCK_N, BLOCK_DMODEL_POW2] (n on axis 0, d on axis 1). Both copies are
-        # issued up front, then a single commit + wait(0) blocks until they land.
-        # Tiles that need per-lane masking (boundary key columns or head-dim
-        # padding) instead use the masked register buffer-load: the masked
-        # async-to-LDS path was shown to give wrong results for partial tiles here
-        # (see _async_load_fn). (With this split, PRELOAD_V no longer affects
+        # K and V are always async-copied global->LDS, then read straight into the
+        # MFMA dot-operand layout. K is staged as [BLOCK_DMODEL_POW2, BLOCK_N] (d on
+        # axis 0, n on axis 1); V as [BLOCK_N, BLOCK_DMODEL_POW2] (n on axis 0, d on
+        # axis 1). Fully in-range tiles use the fast scalar-base buffer copy; tiles
+        # that need per-lane masking use the pointer-tensor global copy with
+        # other=0. Both copies are issued up front, then a single commit + wait(0)
+        # blocks until they land. (With this split, PRELOAD_V no longer affects
         # ordering.)
-        if USE_ASYNC:
+        if USE_BUFFER_LOAD:
             _async_load_fn(smemK, k_base, k_offsets)
             _async_load_fn(smemV, v_base, v_offsets)
-            gl.amd.cdna4.async_copy.commit_group()
-            gl.amd.cdna4.async_copy.wait_group(0)
-            k = smemK.load(dotK)
-            v = smemV.load(dotV)
         else:
-            gk = _load_fn(k_base, k_offsets, k_offs_d, k_offs_n, BLOCK_DMODEL, seqlen_k)
-            k = gl.convert_layout(gk, layout=dotK)
-            gv = _load_fn(v_base, v_offsets, v_offs_n, v_offs_d, seqlen_k, BLOCK_DMODEL)
-            v = gl.convert_layout(gv, layout=dotV)
+            _async_load_masked_fn(
+                smemK, k_base, k_offsets, k_offs_d, k_offs_n, BLOCK_DMODEL, seqlen_k
+            )
+            _async_load_masked_fn(
+                smemV, v_base, v_offsets, v_offs_n, v_offs_d, seqlen_k, BLOCK_DMODEL
+            )
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(0)
+        k = smemK.load(dotK)
+        v = smemV.load(dotV)
 
         # -- QK^T --
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
