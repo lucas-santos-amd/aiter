@@ -5,7 +5,6 @@ import torch
 import pytest
 import logging
 from aiter.ops.triton.attention.mha_simplified import (
-    _GLUON_SUPPORTED_HEAD_DIMS,
     _is_gluon_available,
     flash_attn_func,
     flash_attn_varlen_func,
@@ -26,11 +25,6 @@ def _skip_if_gluon_unsupported(backend: str, head_sz: int):
         return
     if not _is_gluon_available():
         pytest.skip("Gluon MHA backend is not available on this architecture")
-    if head_sz not in _GLUON_SUPPORTED_HEAD_DIMS:
-        pytest.skip(
-            f"gluon MHA supports headdim in {sorted(_GLUON_SUPPORTED_HEAD_DIMS)}, "
-            f"got {head_sz}"
-        )
 
 
 def _test_mha_impl(

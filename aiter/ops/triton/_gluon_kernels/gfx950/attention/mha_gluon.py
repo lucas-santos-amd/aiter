@@ -700,11 +700,7 @@ def _validate_and_launch(
     # The real head dim may be any value; it is padded up to the next power of 2
     # for the layouts/MFMA. MFMA 16x16x32 needs the padded head-dim contraction to
     # be a multiple of 32, and the blocked load layouts need it to divide 512.
-    BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(head_dim), 16)
-    assert BLOCK_DMODEL_POW2 in (32, 64, 128, 256), (
-        "kernel supports head_dim whose padded power-of-2 is in "
-        f"{{32,64,128,256}} (i.e. 17..256), got head_dim={head_dim}"
-    )
+    BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(head_dim), 32)
     assert BLOCK_N % 32 == 0, "BLOCK_N must be a multiple of 32"
 
     # Soundness precondition for the widened head-axis loads: only hint 8-element
