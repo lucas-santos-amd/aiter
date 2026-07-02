@@ -313,21 +313,21 @@ def _attn_fwd_inner(
     MASK_STEPS: gl.constexpr,
     PRELOAD_V: gl.constexpr,
 ):
-    """Global-prefetch online-softmax loop over ``[block_min, block_max)``.
+    """Local-prefetch online-softmax loop over ``[block_min, block_max)``.
 
     ``q`` arrives already in the ``dotQ`` layout. ``k_base`` / ``v_base`` are scalar
-    base pointers positioned at ``block_min`` (advanced by one key block per copy)
-    and ``k_offsets`` / ``v_offsets`` are the constant int32 offset tiles consumed
-    by the buffer loads. ``smemK`` / ``smemV`` are *double-buffered* shared-memory
-    tiles (leading dim = 2); each key block is async-copied into one buffer while
-    the previous buffer is being read into the MFMA and consumed.
+    base pointers positioned at ``block_min`` (advanced by one key block per copy
+    issued) and ``k_offsets`` / ``v_offsets`` are the constant int32 offset tiles
+    consumed by the buffer loads. ``smemK`` / ``smemV`` are *double-buffered*
+    shared-memory tiles (leading dim = 2).
 
-    So every block's global->LDS transfer overlaps the previous block's matmuls
-    and softmax, hiding the K/V load latency. The boundary / causal masks are
-    compiled out entirely when ``MASK_STEPS`` / ``IS_CAUSAL`` are ``False`` (the
-    full-block case). The full-block and masked-block phases each run their own
-    prologue/epilogue (the full phase drains with ``wait_group(0)`` before it
-    returns), so a single ``buffer=2`` allocation is safely reused across both.
+    The boundary / causal masks are compiled out entirely when MASK_STEPS /
+    IS_CAUSAL are False (the full-block case). n_iter >= 1 (the caller
+    only enters with at least one block); the pipeline degrades gracefully to a
+    single load + compute at n_iter == 1. Both phases share the buffer=2
+    allocation: each drains its copies (the last wait_group(0) retires the
+    final copy before the loop ends) before returning, so no async copy leaks
+    across the full/masked handoff.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
     # Fully in-range tiles take the fast scalar-base ``buffer_load_to_shared``
@@ -345,7 +345,8 @@ def _attn_fwd_inner(
 
     n_iter = (block_max - block_min) // BLOCK_N
 
-    # prologue
+    # prologue: stage block 0 (and block 1 if present) into LDS, then read
+    # block 0 into the dot-operand registers so the loop can compute immediately.
     _issue_kv_copy(
         smemK.index(0),
         smemV.index(0),
@@ -368,20 +369,15 @@ def _attn_fwd_inner(
     k_base += BLOCK_N * stride_kn
     v_base += BLOCK_N * stride_vn
 
-    # prefetch block i+1 while computing block i --
-    for i in range(0, n_iter - 1):
-        l_idx = i % 2
-        g_idx = 1 - l_idx
-        copy_start_n = block_min + (i + 1) * BLOCK_N
-
+    if n_iter > 1:
         _issue_kv_copy(
-            smemK.index(g_idx),
-            smemV.index(g_idx),
+            smemK.index(1),
+            smemV.index(1),
             k_base,
             v_base,
             k_offsets,
             v_offsets,
-            copy_start_n,
+            block_min + BLOCK_N,
             seqlen_k,
             K_LOAD_LAYOUT,
             V_LOAD_LAYOUT,
@@ -393,11 +389,22 @@ def _attn_fwd_inner(
             PADDED_HEAD,
         )
         gl.amd.cdna4.async_copy.commit_group()
-        # Wait until only the copy just issued is still in flight
+        k_base += BLOCK_N * stride_kn
+        v_base += BLOCK_N * stride_vn
         gl.amd.cdna4.async_copy.wait_group(1)
+    else:
+        gl.amd.cdna4.async_copy.wait_group(0)
+    
+    k = smemK.index(0).load(dotK)
+    v = smemV.index(0).load(dotV)
 
-        k = smemK.index(l_idx).load(dotK)
-        v = smemV.index(l_idx).load(dotV)
+    # steady state: compute block i from registers while the async copy of block
+    # i+2 is in flight and block i+1 is read into the next registers.
+    for i in range(0, n_iter - 1):
+        # buffer i%2 holds block i (already consumed into k/v), so it is free to
+        # receive block i+2; buffer (i+1)%2 holds block i+1.
+        g_idx = i % 2
+        l_idx = 1 - g_idx
 
         start_n = block_min + i * BLOCK_N
         acc, l_i, m_i = _attn_compute_block(
@@ -423,15 +430,43 @@ def _attn_fwd_inner(
             MASK_STEPS=MASK_STEPS,
         )
 
-        k_base += BLOCK_N * stride_kn
-        v_base += BLOCK_N * stride_vn
+        # Block i+1's copy (from the prologue / a previous iteration) must have
+        # landed before the ds_read below; the matmuls above already retired the
+        # ds_read of buffer g_idx, so refilling it with block i+2 is race-free.
+        gl.amd.cdna4.async_copy.wait_group(0)
 
-    # epilogue
-    gl.amd.cdna4.async_copy.wait_group(0)
-    l_idx = (n_iter - 1) % 2
-    k = smemK.index(l_idx).load(dotK)
-    v = smemV.index(l_idx).load(dotV)
+        # Prefetch block i+2, except on the last iteration where it would run
+        # past block_max (i + 2 == n_iter). The base pointers advance only when a
+        # copy is issued so they stay aligned with the staged block.
+        if i != n_iter - 2:
+            _issue_kv_copy(
+                smemK.index(g_idx),
+                smemV.index(g_idx),
+                k_base,
+                v_base,
+                k_offsets,
+                v_offsets,
+                block_min + (i + 2) * BLOCK_N,
+                seqlen_k,
+                K_LOAD_LAYOUT,
+                V_LOAD_LAYOUT,
+                BLOCK_N,
+                BLOCK_DMODEL,
+                BLOCK_DMODEL_POW2,
+                USE_BUFFER_LOAD,
+                MASK_STEPS,
+                PADDED_HEAD,
+            )
+            gl.amd.cdna4.async_copy.commit_group()
+            k_base += BLOCK_N * stride_kn
+            v_base += BLOCK_N * stride_vn
 
+        # Local (LDS -> register) prefetch of block i+1 for the next iteration
+        # (or the epilogue); this ds_read overlaps the block i+2 async copy.
+        k = smemK.index(l_idx).load(dotK)
+        v = smemV.index(l_idx).load(dotV)
+
+    # epilogue: compute the final block from the preloaded registers.
     start_n = block_min + (n_iter - 1) * BLOCK_N
     acc, l_i, m_i = _attn_compute_block(
         acc,
