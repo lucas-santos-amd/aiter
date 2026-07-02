@@ -144,6 +144,144 @@ def _async_load_masked_fn(
 
 
 @gluon.jit
+def _issue_kv_copy(
+    smemK_buf,
+    smemV_buf,
+    k_base,
+    v_base,
+    k_offsets,
+    v_offsets,
+    copy_start_n,
+    seqlen_k,
+    K_LOAD_LAYOUT: gl.constexpr,
+    V_LOAD_LAYOUT: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_DMODEL: gl.constexpr,
+    BLOCK_DMODEL_POW2: gl.constexpr,
+    USE_BUFFER_LOAD: gl.constexpr,
+    MASK_STEPS: gl.constexpr,
+    PADDED_HEAD: gl.constexpr,
+):
+    """Issue the async global->LDS copies of one K and one V key block.
+
+    Mirrors the load logic that used to live inline in ``_attn_fwd_inner`` but
+    targets explicit shared-memory buffer slots (``smemK_buf`` / ``smemV_buf``,
+    already selected via ``smem.index(...)``) so the caller can double-buffer and
+    prefetch the next block while the current one is being consumed. K is staged
+    as ``[BLOCK_DMODEL_POW2, BLOCK_N]`` (d on axis 0, n on axis 1); V as
+    ``[BLOCK_N, BLOCK_DMODEL_POW2]``. Fully in-range tiles take the fast
+    scalar-base ``buffer_load_to_shared`` path; boundary / padded-head tiles use
+    the pointer-tensor ``global_load_to_shared`` path with ``other=0`` so masked
+    lanes stage as 0. ``copy_start_n`` is the key-block start of the tile being
+    copied (used only for the boundary n-axis mask). The caller owns the matching
+    ``commit_group`` / ``wait_group``.
+    """
+    if USE_BUFFER_LOAD:
+        _async_load_fn(smemK_buf, k_base, k_offsets)
+        _async_load_fn(smemV_buf, v_base, v_offsets)
+    else:
+        # Load-space offsets line up with the pointer tensors. The n-axis is
+        # masked only on boundary (masked) blocks; the head-dim axis only when
+        # the head is padded (None => that axis is unmasked).
+        offs_kn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, K_LOAD_LAYOUT))
+        offs_vn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, V_LOAD_LAYOUT))
+        offs_kd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, K_LOAD_LAYOUT))
+        offs_vd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, V_LOAD_LAYOUT))
+        if MASK_STEPS:
+            k_offs_n = copy_start_n + offs_kn
+            v_offs_n = copy_start_n + offs_vn
+        else:
+            k_offs_n = None
+            v_offs_n = None
+        if PADDED_HEAD:
+            k_offs_d = offs_kd
+            v_offs_d = offs_vd
+        else:
+            k_offs_d = None
+            v_offs_d = None
+        _async_load_masked_fn(
+            smemK_buf, k_base, k_offsets, k_offs_d, k_offs_n, BLOCK_DMODEL, seqlen_k
+        )
+        _async_load_masked_fn(
+            smemV_buf, v_base, v_offsets, v_offs_n, v_offs_d, seqlen_k, BLOCK_DMODEL
+        )
+
+
+@gluon.jit
+def _attn_compute_block(
+    acc,
+    l_i,
+    m_i,
+    q,
+    k,
+    v,
+    start_n,
+    seqlen_q,
+    seqlen_k,
+    block_max,
+    n_extra_tokens,
+    offs_m,
+    offs_n,
+    qk_scale,
+    MFMA_LAYOUT: gl.constexpr,
+    dotP: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    IS_CAUSAL: gl.constexpr,
+    MASK_STEPS: gl.constexpr,
+):
+    """Single online-softmax step for one already-staged key block.
+
+    ``k`` / ``v`` have already been read out of LDS into their MFMA dot-operand
+    layouts. Runs QK^T, the (optional) boundary / causal mask, the online-softmax
+    rescale, and the P@V accumulation, returning the updated ``(acc, l_i, m_i)``.
+    The masks are compiled out entirely when ``MASK_STEPS`` / ``IS_CAUSAL`` are
+    ``False`` (the full-block case), so the bulk of the work runs mask-free.
+    """
+    # -- QK^T --
+    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
+    qk = gl.amd.cdna4.mfma(q, k, qk)
+    qk = qk * qk_scale
+
+    # qk-space mask (MFMA layout): boundary + (optionally) causal. Skipped
+    # entirely for full blocks.
+    if MASK_STEPS or IS_CAUSAL:
+        mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=MFMA_LAYOUT)
+        if MASK_STEPS:
+            # Only the last visible block can be partial, and only when seqlen_k
+            # is not a multiple of BLOCK_N. mask_partial is computed
+            # unconditionally and selected via bound_cond so the body stays
+            # branch-free (mirrors mha.py).
+            bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
+            size_n = start_n + offs_n
+            mask_partial = size_n[None, :] < seqlen_k
+            mask = gl.where(bound_cond, mask_partial, mask)
+        if IS_CAUSAL:
+            causal_boundary = start_n + offs_n + (seqlen_q - seqlen_k)
+            causal_mask = offs_m[:, None] >= causal_boundary[None, :]
+            mask = mask & causal_mask
+        qk = gl.where(mask, qk, float("-inf"))
+
+    # -- online softmax --
+    # Fully-masked rows leave m_ij == -inf and produce NaNs here; those rows are
+    # zeroed out by index in the epilogue (see mha.py for the same scheme).
+    m_ij = gl.maximum(m_i, gl.max(qk, 1))
+    p = gl.exp2(qk - m_ij[:, None])
+    alpha = gl.exp2(m_i - m_ij)
+    l_ij = gl.sum(p, 1)
+
+    acc = acc * alpha[:, None]
+
+    p = gl.convert_layout(p.to(v.dtype), layout=dotP)
+    acc = gl.amd.cdna4.mfma(p, v, acc)
+
+    l_i = l_i * alpha + l_ij
+    m_i = m_ij
+
+    return acc, l_i, m_i
+
+
+@gluon.jit
 def _attn_fwd_inner(
     acc,
     l_i,
@@ -175,27 +313,26 @@ def _attn_fwd_inner(
     MASK_STEPS: gl.constexpr,
     PRELOAD_V: gl.constexpr,
 ):
-    """Online-softmax loop over the key/value blocks in ``[block_min, block_max)``.
+    """Global-prefetch online-softmax loop over ``[block_min, block_max)``.
 
     ``q`` arrives already in the ``dotQ`` layout. ``k_base`` / ``v_base`` are scalar
-    base pointers positioned at ``block_min`` (advanced by one key block per
-    iteration) and ``k_offsets`` / ``v_offsets`` are the constant int32 offset tiles
-    consumed by the buffer loads. ``smemK`` / ``smemV`` are the shared-memory tiles
-    each key block is async-copied into before being read straight into the MFMA
-    dot-operand layout. The boundary / causal masks are compiled out
-    entirely when
-    ``MASK_STEPS`` / ``IS_CAUSAL`` are ``False`` (the full-block case), so the bulk
-    of the work runs mask-free. The MFMA and K/V load layouts are passed in by the
-    outer kernel so both kernels share a single definition. When ``BLOCK_DMODEL``
-    (the real head dim) is smaller than ``BLOCK_DMODEL_POW2`` (the padded tile),
-    the head-dim axis of the K/V loads is masked so the padding lanes read 0.
+    base pointers positioned at ``block_min`` (advanced by one key block per copy)
+    and ``k_offsets`` / ``v_offsets`` are the constant int32 offset tiles consumed
+    by the buffer loads. ``smemK`` / ``smemV`` are *double-buffered* shared-memory
+    tiles (leading dim = 2); each key block is async-copied into one buffer while
+    the previous buffer is being read into the MFMA and consumed.
+
+    So every block's global->LDS transfer overlaps the previous block's matmuls
+    and softmax, hiding the K/V load latency. The boundary / causal masks are
+    compiled out entirely when ``MASK_STEPS`` / ``IS_CAUSAL`` are ``False`` (the
+    full-block case). The full-block and masked-block phases each run their own
+    prologue/epilogue (the full phase drains with ``wait_group(0)`` before it
+    returns), so a single ``buffer=2`` allocation is safely reused across both.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
-    # K and V always stage through LDS. Fully in-range tiles take the fast
-    # ``buffer_load_to_shared`` path (USE_BUFFER_LOAD); tiles that need
-    # per-lane masking (boundary key columns or head-dim padding) use the
-    # pointer-tensor ``global_load_to_shared`` path, which supports a mask with
-    # other=0 so masked lanes stage as 0.
+    # Fully in-range tiles take the fast scalar-base ``buffer_load_to_shared``
+    # path; tiles that need per-lane masking (boundary key columns or head-dim
+    # padding) use the pointer-tensor ``global_load_to_shared`` path with other=0.
     USE_BUFFER_LOAD: gl.constexpr = (not MASK_STEPS) and (not PADDED_HEAD)
 
     # Dot-operand layouts are derived from the shared MFMA layout.
@@ -203,100 +340,121 @@ def _attn_fwd_inner(
     dotP: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=MFMA_LAYOUT, k_width=8)
     dotV: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
 
-    # Load-space key offsets (line up with the pointer tensors); the MFMA-layout
-    # key offsets are used for the qk-space masks. The d-axis offsets are only
-    # used for head-dim padding masks.
-    offs_kn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, K_LOAD_LAYOUT))
-    offs_vn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, V_LOAD_LAYOUT))
-    offs_kd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, K_LOAD_LAYOUT))
-    offs_vd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, V_LOAD_LAYOUT))
+    # qk-space key offsets (MFMA layout) for the boundary / causal masks.
     offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, MFMA_LAYOUT))
 
-    for start_n in range(block_min, block_max, BLOCK_N):
-        # Per-axis offsets for the K/V load masks (None => that axis is unmasked,
-        # which lets _async_load_masked_fn drop the comparison). The n-axis is masked
-        # only on boundary (masked) blocks; the head-dim axis only when the head is
-        # padded. Unused by the USE_BUFFER_LOAD (fully in-range) buffer-copy path.
-        if MASK_STEPS:
-            k_offs_n = start_n + offs_kn
-            v_offs_n = start_n + offs_vn
-        else:
-            k_offs_n = None
-            v_offs_n = None
-        if PADDED_HEAD:
-            k_offs_d = offs_kd
-            v_offs_d = offs_vd
-        else:
-            k_offs_d = None
-            v_offs_d = None
+    n_iter = (block_max - block_min) // BLOCK_N
 
-        # -- load K and V --
-        # K and V are always async-copied global->LDS, then read straight into the
-        # MFMA dot-operand layout. K is staged as [BLOCK_DMODEL_POW2, BLOCK_N] (d on
-        # axis 0, n on axis 1); V as [BLOCK_N, BLOCK_DMODEL_POW2] (n on axis 0, d on
-        # axis 1). Fully in-range tiles use the fast scalar-base buffer copy; tiles
-        # that need per-lane masking use the pointer-tensor global copy with
-        # other=0. Both copies are issued up front, then a single commit + wait(0)
-        # blocks until they land. (With this split, PRELOAD_V no longer affects
-        # ordering.)
-        if USE_BUFFER_LOAD:
-            _async_load_fn(smemK, k_base, k_offsets)
-            _async_load_fn(smemV, v_base, v_offsets)
-        else:
-            _async_load_masked_fn(
-                smemK, k_base, k_offsets, k_offs_d, k_offs_n, BLOCK_DMODEL, seqlen_k
-            )
-            _async_load_masked_fn(
-                smemV, v_base, v_offsets, v_offs_n, v_offs_d, seqlen_k, BLOCK_DMODEL
-            )
+    # prologue
+    _issue_kv_copy(
+        smemK.index(0),
+        smemV.index(0),
+        k_base,
+        v_base,
+        k_offsets,
+        v_offsets,
+        block_min,
+        seqlen_k,
+        K_LOAD_LAYOUT,
+        V_LOAD_LAYOUT,
+        BLOCK_N,
+        BLOCK_DMODEL,
+        BLOCK_DMODEL_POW2,
+        USE_BUFFER_LOAD,
+        MASK_STEPS,
+        PADDED_HEAD,
+    )
+    gl.amd.cdna4.async_copy.commit_group()
+    k_base += BLOCK_N * stride_kn
+    v_base += BLOCK_N * stride_vn
+
+    # prefetch block i+1 while computing block i --
+    for i in range(0, n_iter - 1):
+        l_idx = i % 2
+        g_idx = 1 - l_idx
+        copy_start_n = block_min + (i + 1) * BLOCK_N
+
+        _issue_kv_copy(
+            smemK.index(g_idx),
+            smemV.index(g_idx),
+            k_base,
+            v_base,
+            k_offsets,
+            v_offsets,
+            copy_start_n,
+            seqlen_k,
+            K_LOAD_LAYOUT,
+            V_LOAD_LAYOUT,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            USE_BUFFER_LOAD,
+            MASK_STEPS,
+            PADDED_HEAD,
+        )
         gl.amd.cdna4.async_copy.commit_group()
-        gl.amd.cdna4.async_copy.wait_group(0)
-        k = smemK.load(dotK)
-        v = smemV.load(dotV)
+        # Wait until only the copy just issued is still in flight
+        gl.amd.cdna4.async_copy.wait_group(1)
 
-        # -- QK^T --
-        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
-        qk = gl.amd.cdna4.mfma(q, k, qk)
-        qk = qk * qk_scale
+        k = smemK.index(l_idx).load(dotK)
+        v = smemV.index(l_idx).load(dotV)
 
-        # qk-space mask (MFMA layout): boundary + (optionally) causal. Skipped
-        # entirely for full blocks.
-        if MASK_STEPS or IS_CAUSAL:
-            mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=MFMA_LAYOUT)
-            if MASK_STEPS:
-                # Only the last visible block can be partial, and only when
-                # seqlen_k is not a multiple of BLOCK_N. mask_partial is computed
-                # unconditionally and selected via bound_cond so the loop body
-                # stays branch-free (mirrors mha.py).
-                bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
-                size_n = start_n + offs_n
-                mask_partial = size_n[None, :] < seqlen_k
-                mask = gl.where(bound_cond, mask_partial, mask)
-            if IS_CAUSAL:
-                causal_boundary = start_n + offs_n + (seqlen_q - seqlen_k)
-                causal_mask = offs_m[:, None] >= causal_boundary[None, :]
-                mask = mask & causal_mask
-            qk = gl.where(mask, qk, float("-inf"))
+        start_n = block_min + i * BLOCK_N
+        acc, l_i, m_i = _attn_compute_block(
+            acc,
+            l_i,
+            m_i,
+            q,
+            k,
+            v,
+            start_n,
+            seqlen_q,
+            seqlen_k,
+            block_max,
+            n_extra_tokens,
+            offs_m,
+            offs_n,
+            qk_scale,
+            MFMA_LAYOUT=MFMA_LAYOUT,
+            dotP=dotP,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            IS_CAUSAL=IS_CAUSAL,
+            MASK_STEPS=MASK_STEPS,
+        )
 
-        # -- online softmax --
-        # Fully-masked rows leave m_ij == -inf and produce NaNs here; those rows
-        # are zeroed out by index in the epilogue (see mha.py for the same scheme).
-        m_ij = gl.maximum(m_i, gl.max(qk, 1))
-        p = gl.exp2(qk - m_ij[:, None])
-        alpha = gl.exp2(m_i - m_ij)
-        l_ij = gl.sum(p, 1)
-
-        acc = acc * alpha[:, None]
-
-        p = gl.convert_layout(p.to(v.dtype), layout=dotP)
-        acc = gl.amd.cdna4.mfma(p, v, acc)
-
-        l_i = l_i * alpha + l_ij
-        m_i = m_ij
-
-        # Advance the scalar base pointers; the offset tiles stay constant.
         k_base += BLOCK_N * stride_kn
         v_base += BLOCK_N * stride_vn
+
+    # epilogue
+    gl.amd.cdna4.async_copy.wait_group(0)
+    l_idx = (n_iter - 1) % 2
+    k = smemK.index(l_idx).load(dotK)
+    v = smemV.index(l_idx).load(dotV)
+
+    start_n = block_min + (n_iter - 1) * BLOCK_N
+    acc, l_i, m_i = _attn_compute_block(
+        acc,
+        l_i,
+        m_i,
+        q,
+        k,
+        v,
+        start_n,
+        seqlen_q,
+        seqlen_k,
+        block_max,
+        n_extra_tokens,
+        offs_m,
+        offs_n,
+        qk_scale,
+        MFMA_LAYOUT=MFMA_LAYOUT,
+        dotP=dotP,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        IS_CAUSAL=IS_CAUSAL,
+        MASK_STEPS=MASK_STEPS,
+    )
 
     return acc, l_i, m_i
 
@@ -472,15 +630,16 @@ def _attn_fwd(
     v_offsets = (offs_vn[:, None] * stride_vn + offs_vd[None, :] * stride_vk).to(gl.int32)
 
     # --- shared-memory tiles for the async K/V staging --------------------------
-    # Allocated once and reused (single-buffered) across both inner-loop passes;
-    # each key block is async-copied here, then read straight into the MFMA
-    # dot-operand layout. K is [BLOCK_DMODEL_POW2, BLOCK_N], V is
-    # [BLOCK_N, BLOCK_DMODEL_POW2].
+    # Double-buffered (leading dim = NUM_KV_BUFFERS) so _attn_fwd_inner can
+    # prefetch the next key block into one buffer while the previous buffer is
+    # read into the MFMA (global prefetch). Allocated once and reused across both
+    # inner-loop passes (each pass drains its copies before returning).
+    NUM_KV_BUFFERS: gl.constexpr = 2
     smemK = gl.allocate_shared_memory(
-        k_ptr.dtype.element_ty, [BLOCK_DMODEL_POW2, BLOCK_N], kSharedLayout
+        k_ptr.dtype.element_ty, [NUM_KV_BUFFERS, BLOCK_DMODEL_POW2, BLOCK_N], kSharedLayout
     )
     smemV = gl.allocate_shared_memory(
-        v_ptr.dtype.element_ty, [BLOCK_N, BLOCK_DMODEL_POW2], vSharedLayout
+        v_ptr.dtype.element_ty, [NUM_KV_BUFFERS, BLOCK_N, BLOCK_DMODEL_POW2], vSharedLayout
     )
 
     # --- online-softmax state ---------------------------------------------------
