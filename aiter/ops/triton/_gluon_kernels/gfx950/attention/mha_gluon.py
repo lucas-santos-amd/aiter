@@ -72,6 +72,29 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: gl.constexpr = 8):
     return pid
 
 
+@gluon.constexpr_function
+def _make_kv_shared_layouts(head_dim_pow2, elem_bytes, k_width=8, non_k_dim=16, banks=64):
+    """Swizzled LDS layouts for the async K/V staging tiles (gfx950).
+
+    Returns (kSharedLayout, vSharedLayout):
+    K is stored [head, N] (order [0, 1]), V is [N, head] (order
+    [1, 0]); both are contiguous along the head dim.
+    """
+    bank_line_bytes = banks * 4
+    bank_line_elems = bank_line_bytes // elem_bytes
+    read_vec_bytes = min(k_width * elem_bytes, 16)
+    num_threads_same_cycle = bank_line_bytes // read_vec_bytes
+    per_phase = (bank_line_elems + head_dim_pow2 - 1) // head_dim_pow2
+    swizzle_vec = k_width * max(1, per_phase // 2)
+    max_phase = min(
+        min(non_k_dim, num_threads_same_cycle) // per_phase,
+        bank_line_elems // swizzle_vec,
+    )
+    k_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[0, 1])
+    v_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[1, 0])
+    return k_shared, v_shared
+
+
 @gluon.jit
 def _async_load_fn(smem, base, offsets):
     """Unmasked async global->LDS copy (AMD ``buffer_load_to_shared``).
@@ -387,30 +410,12 @@ def _attn_fwd(
         [1, 0],
     )
 
-    # Swizzled shared layouts for the async global->LDS staging of K and V,
-    kWidth: gl.constexpr = 8  # MFMA k_width == ds_read vector (elements)
-    ELEM_BYTES: gl.constexpr = k_ptr.dtype.element_ty.primitive_bitwidth // 8
-    BANK_LINE_BYTES: gl.constexpr = 64 * 4  # gfx950: 64 banks * 4 B
-    BANK_LINE_ELEMS: gl.constexpr = BANK_LINE_BYTES // ELEM_BYTES  # 128 for bf16
-    NON_K_DIM: gl.constexpr = 16  # MFMA instr_shape[0]
-    READ_VEC_BYTES: gl.constexpr = min(kWidth * ELEM_BYTES, 16)
-    NUM_THREADS_SAME_CYCLE: gl.constexpr = BANK_LINE_BYTES // READ_VEC_BYTES
-
-    # perPhase: tensor rows that pack into one LDS bank line (ceil).
-    SWIZZLE_PER_PHASE: gl.constexpr = (
-        (BANK_LINE_ELEMS + BLOCK_DMODEL_POW2 - 1) // BLOCK_DMODEL_POW2
+    # Swizzled shared layouts for the async global->LDS staging of K and V
+    _KV_SHARED: gl.constexpr = _make_kv_shared_layouts(
+        BLOCK_DMODEL_POW2, k_ptr.dtype.element_ty.primitive_bitwidth // 8
     )
-    SWIZZLE_VEC: gl.constexpr = kWidth * max(1, SWIZZLE_PER_PHASE // 2)
-    SWIZZLE_MAX_PHASE: gl.constexpr = min(
-        min(NON_K_DIM, NUM_THREADS_SAME_CYCLE) // SWIZZLE_PER_PHASE,
-        BANK_LINE_ELEMS // SWIZZLE_VEC,
-    )
-    kSharedLayout: gl.constexpr = gl.SwizzledSharedLayout(
-        SWIZZLE_VEC, SWIZZLE_PER_PHASE, SWIZZLE_MAX_PHASE, order=[0, 1]
-    )
-    vSharedLayout: gl.constexpr = gl.SwizzledSharedLayout(
-        SWIZZLE_VEC, SWIZZLE_PER_PHASE, SWIZZLE_MAX_PHASE, order=[1, 0]
-    )
+    kSharedLayout: gl.constexpr = _KV_SHARED[0]
+    vSharedLayout: gl.constexpr = _KV_SHARED[1]
 
     # --- head-axis byte offsets -------------------------------------------------
     # When the caller guarantees Q/K/V head strides are multiples of 8 elements
