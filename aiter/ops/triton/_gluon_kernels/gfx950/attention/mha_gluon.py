@@ -387,15 +387,24 @@ def _attn_fwd(
         [1, 0],
     )
 
-    # Shared-memory layouts for the async global->LDS staging of K and V.
-    SWIZZLE_VEC: gl.constexpr = 8
+    # Swizzled shared layouts for the async global->LDS staging of K and V,
+    kWidth: gl.constexpr = 8  # MFMA k_width == ds_read vector (elements)
     ELEM_BYTES: gl.constexpr = k_ptr.dtype.element_ty.primitive_bitwidth // 8
     BANK_LINE_BYTES: gl.constexpr = 64 * 4  # gfx950: 64 banks * 4 B
-    BANK_LINE_ELEMS: gl.constexpr = BANK_LINE_BYTES // ELEM_BYTES
-    ROW_BYTES: gl.constexpr = BLOCK_DMODEL_POW2 * ELEM_BYTES
+    BANK_LINE_ELEMS: gl.constexpr = BANK_LINE_BYTES // ELEM_BYTES  # 128 for bf16
+    NON_K_DIM: gl.constexpr = 16  # MFMA instr_shape[0]
+    READ_VEC_BYTES: gl.constexpr = min(kWidth * ELEM_BYTES, 16)
+    NUM_THREADS_SAME_CYCLE: gl.constexpr = BANK_LINE_BYTES // READ_VEC_BYTES
 
-    SWIZZLE_PER_PHASE: gl.constexpr = max(1, BANK_LINE_BYTES // ROW_BYTES)
-    SWIZZLE_MAX_PHASE: gl.constexpr = min(BLOCK_DMODEL_POW2 // SWIZZLE_VEC, BANK_LINE_ELEMS // SWIZZLE_VEC)
+    # perPhase: tensor rows that pack into one LDS bank line (ceil).
+    SWIZZLE_PER_PHASE: gl.constexpr = (
+        (BANK_LINE_ELEMS + BLOCK_DMODEL_POW2 - 1) // BLOCK_DMODEL_POW2
+    )
+    SWIZZLE_VEC: gl.constexpr = kWidth * max(1, SWIZZLE_PER_PHASE // 2)
+    SWIZZLE_MAX_PHASE: gl.constexpr = min(
+        min(NON_K_DIM, NUM_THREADS_SAME_CYCLE) // SWIZZLE_PER_PHASE,
+        BANK_LINE_ELEMS // SWIZZLE_VEC,
+    )
     kSharedLayout: gl.constexpr = gl.SwizzledSharedLayout(
         SWIZZLE_VEC, SWIZZLE_PER_PHASE, SWIZZLE_MAX_PHASE, order=[0, 1]
     )
