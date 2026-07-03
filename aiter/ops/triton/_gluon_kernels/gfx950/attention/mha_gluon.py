@@ -194,6 +194,29 @@ def _issue_kv_copy(
 
 
 @gluon.jit
+def _attn_qk_nomask(
+    q,
+    k,
+    qk_scale,
+    MFMA_LAYOUT: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    """QK^T + scale for one already-staged key block (no masking).
+
+    ``k`` has already been read out of LDS into its MFMA dot-operand layout.
+    Returns the ``qk`` scores in ``MFMA_LAYOUT`` (float32). This is the first half
+    of one online-softmax step, split out so the caller can pipeline the QK^T of
+    block ``i+1`` ahead of the softmax / P@V of block ``i`` -- the independent QK
+    MFMA then fills the issue gaps left by the softmax VALU chain, mimicking what
+    mha.py's auto-pipeliner does across loop iterations.
+    """
+    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
+    qk = gl.amd.cdna4.mfma(q, k, qk)
+    return qk * qk_scale
+
+
+@gluon.jit
 def _attn_qk(
     q,
     k,
@@ -213,17 +236,11 @@ def _attn_qk(
 ):
     """QK^T (+ scale + boundary/causal mask) for one already-staged key block.
 
-    ``k`` has already been read out of LDS into its MFMA dot-operand layout.
-    Returns the masked ``qk`` scores in ``MFMA_LAYOUT`` (float32). This is the
-    first half of one online-softmax step, split out so the caller can pipeline
-    the QK^T of block ``i+1`` ahead of the softmax / P@V of block ``i`` -- the
-    independent QK MFMA then fills the issue gaps left by the softmax VALU chain,
-    mimicking what mha.py's auto-pipeliner does across loop iterations. The masks
-    are compiled out entirely when ``MASK_STEPS`` / ``IS_CAUSAL`` are ``False``.
+    Wraps ``_attn_qk_nomask`` with the qk-space boundary / causal masks used by the
+    masked tail. The masks are compiled out entirely when ``MASK_STEPS`` /
+    ``IS_CAUSAL`` are ``False``.
     """
-    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
-    qk = gl.amd.cdna4.mfma(q, k, qk)
-    qk = qk * qk_scale
+    qk = _attn_qk_nomask(q, k, qk_scale, MFMA_LAYOUT, BLOCK_M, BLOCK_N)
 
     # qk-space mask (MFMA layout): boundary + (optionally) causal. Skipped
     # entirely for full blocks.
@@ -287,12 +304,9 @@ def _attn_fwd_inner(
     smemV,
     stride_kn,
     stride_vn,
-    seqlen_q,
     seqlen_k,
     block_min,
     block_max,
-    n_extra_tokens,
-    offs_m,
     qk_scale,
     MFMA_LAYOUT: gl.constexpr,
     K_LOAD_LAYOUT: gl.constexpr,
@@ -301,9 +315,6 @@ def _attn_fwd_inner(
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
-    IS_CAUSAL: gl.constexpr,
-    MASK_STEPS: gl.constexpr,
-    PRELOAD_V: gl.constexpr,
     NUM_KV_BUFFERS: gl.constexpr,
 ):
     """QK-ahead software-pipelined online-softmax loop over ``[block_min, block_max)``.
@@ -340,25 +351,22 @@ def _attn_fwd_inner(
     a one-iteration WAR margin before ``copy(i+3)`` reuses it requires
     ``NUM_KV_BUFFERS >= 4``.
 
-    The boundary / causal masks are compiled out entirely when MASK_STEPS /
-    IS_CAUSAL are False (the full-block case). n_iter >= 1 (the caller only enters
-    with at least one block); the pipeline degrades gracefully at n_iter in
-    {1, 2, 3}. Each pass drains its own copies before returning, so no async copy
-    leaks across the full/masked handoff.
+    This runs only the full-block pass, so there is no boundary / causal masking
+    (the masked tail uses the simpler non-pipelined _attn_fwd_inner_masked). n_iter
+    >= 1 (the caller only enters with at least one block); the pipeline degrades
+    gracefully at n_iter in {1, 2, 3}. All copies are drained before returning, so
+    nothing leaks into the masked pass.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
-    # Fully in-range tiles take the fast scalar-base ``buffer_load_to_shared``
-    # path; tiles that need per-lane masking (boundary key columns or head-dim
-    # padding) use the pointer-tensor ``global_load_to_shared`` path with other=0.
-    USE_BUFFER_LOAD: gl.constexpr = (not MASK_STEPS) and (not PADDED_HEAD)
+    # Full (unmasked) blocks: fully in-range tiles take the fast scalar-base
+    # ``buffer_load_to_shared`` path; only head-dim padding forces the pointer-tensor
+    # ``global_load_to_shared`` path with other=0.
+    USE_BUFFER_LOAD: gl.constexpr = not PADDED_HEAD
 
     # Dot-operand layouts are derived from the shared MFMA layout.
     dotK: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
     dotP: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=MFMA_LAYOUT, k_width=8)
     dotV: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
-
-    # qk-space key offsets (MFMA layout) for the boundary / causal masks.
-    offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, MFMA_LAYOUT))
 
     n_iter = (block_max - block_min) // BLOCK_N
 
@@ -382,7 +390,7 @@ def _attn_fwd_inner(
         BLOCK_DMODEL,
         BLOCK_DMODEL_POW2,
         USE_BUFFER_LOAD,
-        MASK_STEPS,
+        False,
         PADDED_HEAD,
     )
     gl.amd.cdna4.async_copy.commit_group()
@@ -405,7 +413,7 @@ def _attn_fwd_inner(
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
             USE_BUFFER_LOAD,
-            MASK_STEPS,
+            False,
             PADDED_HEAD,
         )
         gl.amd.cdna4.async_copy.commit_group()
@@ -428,7 +436,7 @@ def _attn_fwd_inner(
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
             USE_BUFFER_LOAD,
-            MASK_STEPS,
+            False,
             PADDED_HEAD,
         )
         gl.amd.cdna4.async_copy.commit_group()
@@ -441,22 +449,13 @@ def _attn_fwd_inner(
         gl.amd.cdna4.async_copy.wait_group(0)
 
     k = smemK.index(0).load(dotK)
-    qk_cur = _attn_qk(
+    qk_cur = _attn_qk_nomask(
         q,
         k,
-        block_min,
-        seqlen_q,
-        seqlen_k,
-        block_max,
-        n_extra_tokens,
-        offs_m,
-        offs_n,
         qk_scale,
         MFMA_LAYOUT=MFMA_LAYOUT,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        IS_CAUSAL=IS_CAUSAL,
-        MASK_STEPS=MASK_STEPS,
     )
 
     # k_nxt holds block 1's keys for the first QK^T inside the loop. When there is
@@ -499,7 +498,7 @@ def _attn_fwd_inner(
                     BLOCK_DMODEL,
                     BLOCK_DMODEL_POW2,
                     USE_BUFFER_LOAD,
-                    MASK_STEPS,
+                    False,
                     PADDED_HEAD,
                 )
                 gl.amd.cdna4.async_copy.commit_group()
@@ -524,22 +523,13 @@ def _attn_fwd_inner(
 
             # (d) QK^T of block i+1 from the already-resident k_nxt, issued ahead of
             # the softmax + P@V of block i.
-            qk_nxt = _attn_qk(
+            qk_nxt = _attn_qk_nomask(
                 q,
                 k_nxt,
-                block_min + (i + 1) * BLOCK_N,
-                seqlen_q,
-                seqlen_k,
-                block_max,
-                n_extra_tokens,
-                offs_m,
-                offs_n,
                 qk_scale,
                 MFMA_LAYOUT=MFMA_LAYOUT,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
-                IS_CAUSAL=IS_CAUSAL,
-                MASK_STEPS=MASK_STEPS,
             )
 
             # (e) softmax + P@V for block i; its softmax VALU overlaps the QK MFMA
@@ -551,6 +541,110 @@ def _attn_fwd_inner(
         else:
             # Final block: pipeline drained, just the softmax + P@V remains.
             acc, l_i, m_i = _attn_softmax_pv(acc, l_i, m_i, qk_cur, v_cur, dotP)
+
+    return acc, l_i, m_i
+
+
+@gluon.jit
+def _attn_fwd_inner_masked(
+    acc,
+    l_i,
+    m_i,
+    q,
+    k_base,
+    k_offsets,
+    v_base,
+    v_offsets,
+    smemK,
+    smemV,
+    stride_kn,
+    stride_vn,
+    seqlen_q,
+    seqlen_k,
+    block_min,
+    block_max,
+    n_extra_tokens,
+    offs_m,
+    qk_scale,
+    MFMA_LAYOUT: gl.constexpr,
+    K_LOAD_LAYOUT: gl.constexpr,
+    V_LOAD_LAYOUT: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_DMODEL: gl.constexpr,
+    BLOCK_DMODEL_POW2: gl.constexpr,
+    IS_CAUSAL: gl.constexpr,
+    MASK_STEPS: gl.constexpr,
+):
+    """Non-pipelined online-softmax loop over the boundary / causal masked blocks.
+
+    Deliberately serial: one block at a time, stage K/V into a single LDS buffer,
+    wait, read into registers, then QK^T (+ mask) and softmax + P@V. The masked tail
+    is only a block or two, so the pipeline's extra buffering / register pressure is
+    not worth it here -- this keeps the masked path simple and drains every copy it
+    issues, so nothing leaks across the full -> masked handoff.
+    """
+    PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
+    USE_BUFFER_LOAD: gl.constexpr = (not MASK_STEPS) and (not PADDED_HEAD)
+
+    dotK: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
+    dotP: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=MFMA_LAYOUT, k_width=8)
+    dotV: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
+
+    offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, MFMA_LAYOUT))
+
+    n_iter = (block_max - block_min) // BLOCK_N
+
+    for i in range(0, n_iter):
+        start_n = block_min + i * BLOCK_N
+
+        # Stage this block into buffer 0 and wait for it before reading. The QK / P@V
+        # matmuls below retire the ds_reads before the next iteration's copy reuses
+        # buffer 0, so the single buffer is race-free.
+        _issue_kv_copy(
+            smemK.index(0),
+            smemV.index(0),
+            k_base,
+            v_base,
+            k_offsets,
+            v_offsets,
+            start_n,
+            seqlen_k,
+            K_LOAD_LAYOUT,
+            V_LOAD_LAYOUT,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            USE_BUFFER_LOAD,
+            MASK_STEPS,
+            PADDED_HEAD,
+        )
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(0)
+        k_base += BLOCK_N * stride_kn
+        v_base += BLOCK_N * stride_vn
+
+        k = smemK.index(0).load(dotK)
+        v = smemV.index(0).load(dotV)
+
+        qk = _attn_qk(
+            q,
+            k,
+            start_n,
+            seqlen_q,
+            seqlen_k,
+            block_max,
+            n_extra_tokens,
+            offs_m,
+            offs_n,
+            qk_scale,
+            MFMA_LAYOUT=MFMA_LAYOUT,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            IS_CAUSAL=IS_CAUSAL,
+            MASK_STEPS=MASK_STEPS,
+        )
+        acc, l_i, m_i = _attn_softmax_pv(acc, l_i, m_i, qk, v, dotP)
 
     return acc, l_i, m_i
 
@@ -819,12 +913,9 @@ def _attn_fwd(
             smemV,
             stride_kn,
             stride_vn,
-            seqlen_q,
             seqlen_k,
             block_min,
             block_max,
-            0,
-            offs_m,
             qk_scale,
             MFMA_LAYOUT=mfmaLayout,
             K_LOAD_LAYOUT=kLoadLayout,
@@ -833,19 +924,17 @@ def _attn_fwd(
             BLOCK_N=BLOCK_N,
             BLOCK_DMODEL=BLOCK_DMODEL,
             BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
-            IS_CAUSAL=False,
-            MASK_STEPS=False,
-            PRELOAD_V=PRELOAD_V,
             NUM_KV_BUFFERS=NUM_KV_BUFFERS,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
 
-    # Remaining blocks carry the boundary / causal masking.
+    # Remaining blocks carry the boundary / causal masking. These run on the simple
+    # non-pipelined path (the masked tail is only a block or two).
     if masked_blocks > 0:
         k_base += n_full_blocks * BLOCK_N * stride_kn
         v_base += n_full_blocks * BLOCK_N * stride_vn
-        acc, l_i, m_i = _attn_fwd_inner(
+        acc, l_i, m_i = _attn_fwd_inner_masked(
             acc,
             l_i,
             m_i,
@@ -874,8 +963,6 @@ def _attn_fwd(
             BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=True,
-            PRELOAD_V=PRELOAD_V,
-            NUM_KV_BUFFERS=NUM_KV_BUFFERS,
         )
 
     # epilogue: normalize and write
