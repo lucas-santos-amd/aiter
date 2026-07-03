@@ -947,6 +947,7 @@ def _validate_and_launch(
         NUM_XCD=get_num_xcds(),
         HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
         num_warps=4,
+        waves_per_eu=2,
     )
     return o
 
