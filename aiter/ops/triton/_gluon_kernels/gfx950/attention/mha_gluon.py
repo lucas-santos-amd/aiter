@@ -22,20 +22,6 @@
 # THE SOFTWARE.
 ##############################################################################
 
-# Gluon flash-attention forward kernel for gfx950.
-#
-
-# One program computes a single (batch, q_head, query-block) tile of the output
-# by looping over the key/value blocks and running an online softmax.
-#
-# Varlen (ragged batch) inputs are supported via ``cu_seqlens_q`` / ``cu_seqlens_k``
-# (cumulative sequence-length offsets, batch+1 entries each) and the ``VARLEN``
-# flag, mirroring the Triton kernel in ``mha.py``. In varlen mode Q/K/V are packed
-# as ``[total_tokens, num_heads, head_dim]`` (no batch dimension), the batch stride
-# is 0, and each program looks up its sequence start/length from the cu_seqlens
-# tensors. ``SEQLEN_Q`` / ``SEQLEN_K`` then carry the *max* sequence lengths (used
-# only to size the launch grid).
-
 import torch
 import triton
 from triton.experimental import gluon
@@ -328,25 +314,37 @@ def _attn_fwd_inner(
     consumed by the buffer loads. ``smemK`` / ``smemV`` are ``NUM_KV_BUFFERS``-way
     shared-memory tiles (block ``j`` lives in buffer ``j % NUM_KV_BUFFERS``).
 
-    Three overlapping pipelines run concurrently, mirroring what mha.py's
-    auto-pipeliner buys for free:
+    A 4-stage software pipeline runs four blocks' worth of work concurrently,
+    mirroring what mha.py's auto-pipeliner buys for free. Iteration ``i`` issues::
 
-    * **global prefetch** -- the async copy of block ``i+2`` (issued at the top of
-      iteration ``i``) is in flight while block ``i`` is being consumed;
-    * **local prefetch** -- block ``i+1`` is read LDS->register just before it is
-      used;
-    * **compute pipeline** -- the QK^T MFMA of block ``i+1`` is issued *before* the
-      softmax + P@V of block ``i`` (``qk``/``v`` for the current block are carried
-      across iterations). The independent QK MFMA overlaps the softmax VALU chain,
-      hiding the softmax latency the two dependent matmuls would otherwise expose.
+        copy(i+3)  ->  readK(i+2)  ->  QK(i+1)  ->  readV(i) + softmax+P@V(i)
+        (HBM->LDS)     (LDS->reg)      (MFMA)       (LDS->reg)   (VALU + MFMA)
 
-    Keeping blocks ``i`` (being consumed), ``i+1`` (read into registers) and
-    ``i+2`` (async copy in flight) simultaneously resident requires
-    ``NUM_KV_BUFFERS >= 3``. The boundary / causal masks are compiled out entirely
-    when MASK_STEPS / IS_CAUSAL are False (the full-block case). n_iter >= 1 (the
-    caller only enters with at least one block); the pipeline degrades gracefully
-    at n_iter == 1/2. Each pass drains its own copies before returning, so no
-    async copy leaks across the full/masked handoff.
+    * **global prefetch** -- the async copy of block ``i+3`` is in flight while the
+      earlier blocks are consumed (its K read lands one iteration later);
+    * **local K prefetch** -- block ``i+2``'s *keys* are read LDS->register a full
+      iteration before their QK^T, so the ds_read latency is hidden behind the
+      current iteration's compute (this is the extra stage over the 3-stage
+      version). K is carried across one iteration (``k_nxt`` = block ``i+1``);
+    * **compute pipeline** -- the QK^T MFMA of block ``i+1`` runs from that resident
+      ``k_nxt`` and is issued *before* the softmax + P@V of block ``i``, so the
+      independent MFMA overlaps the softmax VALU chain.
+
+    ``V`` is *not* carried: block ``i``'s values are read LDS->register at the top of
+    iteration ``i`` and consumed by the P@V at its end, so the ds_read overlaps the
+    QK MFMA + softmax VALU without needing a second value tile in registers. Only
+    ``qk_cur`` (block ``i``) and ``k_nxt`` (block ``i+1``) cross the loop back-edge.
+
+    Blocks ``i`` (V read + consumed), ``i+1`` (QK from registers), ``i+2`` (K read)
+    and ``i+3`` (async copy) are all live in LDS each iteration; giving every buffer
+    a one-iteration WAR margin before ``copy(i+3)`` reuses it requires
+    ``NUM_KV_BUFFERS >= 4``.
+
+    The boundary / causal masks are compiled out entirely when MASK_STEPS /
+    IS_CAUSAL are False (the full-block case). n_iter >= 1 (the caller only enters
+    with at least one block); the pipeline degrades gracefully at n_iter in
+    {1, 2, 3}. Each pass drains its own copies before returning, so no async copy
+    leaks across the full/masked handoff.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
     # Fully in-range tiles take the fast scalar-base ``buffer_load_to_shared``
@@ -364,8 +362,11 @@ def _attn_fwd_inner(
 
     n_iter = (block_max - block_min) // BLOCK_N
 
-    # prologue: stage block 0 (and block 1 if present) into LDS, read block 0 into
-    # registers and compute its QK^T so the loop starts one QK ahead.
+    # ---- prologue: prime the 4-stage pipeline --------------------------------
+    # Stage the first three blocks (whichever exist) into LDS, then read the *keys*
+    # of blocks 0 and 1 into registers and compute QK^T(block 0). Entering the loop
+    # we hold qk_cur = QK(0) and k_nxt = K(1), and block 2's copy is in flight (its
+    # keys are read at iteration 0). Values are read inside the loop, not here.
     _issue_kv_copy(
         smemK.index(0),
         smemV.index(0),
@@ -410,13 +411,36 @@ def _attn_fwd_inner(
         gl.amd.cdna4.async_copy.commit_group()
         k_base += BLOCK_N * stride_kn
         v_base += BLOCK_N * stride_vn
-        # block 0 ready, block 1 copy stays in flight (overlaps the QK^T below).
+
+    if n_iter > 2:
+        _issue_kv_copy(
+            smemK.index(2),
+            smemV.index(2),
+            k_base,
+            v_base,
+            k_offsets,
+            v_offsets,
+            block_min + 2 * BLOCK_N,
+            seqlen_k,
+            K_LOAD_LAYOUT,
+            V_LOAD_LAYOUT,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            USE_BUFFER_LOAD,
+            MASK_STEPS,
+            PADDED_HEAD,
+        )
+        gl.amd.cdna4.async_copy.commit_group()
+        k_base += BLOCK_N * stride_kn
+        v_base += BLOCK_N * stride_vn
+        # blocks 0,1 ready; block 2's copy stays in flight (read at iteration 0).
         gl.amd.cdna4.async_copy.wait_group(1)
     else:
+        # <=2 blocks: no block-2 copy, so drain everything we issued.
         gl.amd.cdna4.async_copy.wait_group(0)
 
     k = smemK.index(0).load(dotK)
-    v_cur = smemV.index(0).load(dotV)
     qk_cur = _attn_qk(
         q,
         k,
@@ -435,17 +459,31 @@ def _attn_fwd_inner(
         MASK_STEPS=MASK_STEPS,
     )
 
-    # steady state: iteration i consumes block i (softmax + P@V from the carried
-    # qk_cur / v_cur) while (a) the async copy of block i+2 is in flight, (b) block
-    # i+1 is read LDS->register, and (c) its QK^T MFMA is issued ahead of the
-    # softmax so the two overlap.
+    # k_nxt holds block 1's keys for the first QK^T inside the loop. When there is
+    # only one block it is never used, but must still be defined for the JIT, so
+    # alias block 0's keys rather than reading an unwritten buffer.
+    if n_iter > 1:
+        k_nxt = smemK.index(1).load(dotK)
+    else:
+        k_nxt = k
+
+    # steady state: iteration i runs copy(i+3) / readK(i+2) / QK(i+1) /
+    # readV(i) + softmax+P@V(i) for four blocks at once. QK(i+1) uses the carried
+    # k_nxt (keys read a full iteration ago, LDS latency already hidden) and is
+    # issued ahead of softmax(i) so the MFMA overlaps the softmax VALU. Block i's
+    # values are read here (still resident in LDS) rather than carried.
     for i in range(0, n_iter):
+        # V(i) for this block's P@V: block i is still resident (its buffer is not
+        # reused by copy(i+4) until the next iteration). Read early so the ds_read
+        # overlaps the QK MFMA + softmax VALU below before P@V consumes it.
+        v_cur = smemV.index(i % NUM_KV_BUFFERS).load(dotV)
+
         if i + 1 < n_iter:
-            # (a) Prefetch block i+2 into its buffer, which last held block i-1
-            # (already fully consumed), so the async write is race-free. Issued
-            # first so the DMA overlaps the wait / compute below.
-            if i + 2 < n_iter:
-                g_idx = (i + 2) % NUM_KV_BUFFERS
+            # (a) global prefetch: async-copy block i+3 into its buffer. That buffer
+            # last held block i-1 (consumed at iteration i-1), giving a one-iteration
+            # WAR margin before this overwrite.
+            if i + 3 < n_iter:
+                g_idx = (i + 3) % NUM_KV_BUFFERS
                 _issue_kv_copy(
                     smemK.index(g_idx),
                     smemV.index(g_idx),
@@ -453,7 +491,7 @@ def _attn_fwd_inner(
                     v_base,
                     k_offsets,
                     v_offsets,
-                    block_min + (i + 2) * BLOCK_N,
+                    block_min + (i + 3) * BLOCK_N,
                     seqlen_k,
                     K_LOAD_LAYOUT,
                     V_LOAD_LAYOUT,
@@ -467,22 +505,28 @@ def _attn_fwd_inner(
                 gl.amd.cdna4.async_copy.commit_group()
                 k_base += BLOCK_N * stride_kn
                 v_base += BLOCK_N * stride_vn
-                # block i+1 copy + block i+2 copy in flight -> retire the oldest
-                # (block i+1) so its ds_read below is safe.
+
+            # (b) wait so block i+2's copy has landed before we read its keys. With
+            # the copy just issued, {block i+2, block i+3} are in flight -> retire
+            # the older (i+2) via wait_group(1); otherwise drain the last copy.
+            if i + 3 < n_iter:
                 gl.amd.cdna4.async_copy.wait_group(1)
-            else:
-                # Tail: no more copies to issue, only block i+1's copy is left.
+            elif i + 2 < n_iter:
                 gl.amd.cdna4.async_copy.wait_group(0)
 
-            # (b) local prefetch of block i+1 into registers.
-            l_idx = (i + 1) % NUM_KV_BUFFERS
-            k = smemK.index(l_idx).load(dotK)
-            v_next = smemV.index(l_idx).load(dotV)
+            # (c) local K prefetch: read block i+2's keys LDS->register, a full
+            # iteration ahead of its QK^T (next iteration) so the ds_read is hidden.
+            if i + 2 < n_iter:
+                k_rd = smemK.index((i + 2) % NUM_KV_BUFFERS).load(dotK)
+            else:
+                # No block i+2: keep k_rd defined (unused past this iteration).
+                k_rd = k_nxt
 
-            # (c) QK^T of block i+1, issued ahead of the softmax + P@V of block i.
-            qk_next = _attn_qk(
+            # (d) QK^T of block i+1 from the already-resident k_nxt, issued ahead of
+            # the softmax + P@V of block i.
+            qk_nxt = _attn_qk(
                 q,
-                k,
+                k_nxt,
                 block_min + (i + 1) * BLOCK_N,
                 seqlen_q,
                 seqlen_k,
@@ -498,15 +542,14 @@ def _attn_fwd_inner(
                 MASK_STEPS=MASK_STEPS,
             )
 
-            # softmax + P@V for block i; its softmax VALU overlaps the block i+1
-            # QK MFMA issued just above. Carry block i+1's scores/values as the new
-            # "current" state. The carry lives in this branch (not a second
-            # ``if i + 1 < n_iter``) so qk_next / v_next stay in scope for the JIT.
+            # (e) softmax + P@V for block i; its softmax VALU overlaps the QK MFMA
+            # just issued. Carry qk / keys forward one block (kept in this branch so
+            # k_rd / qk_nxt stay in scope for the JIT).
             acc, l_i, m_i = _attn_softmax_pv(acc, l_i, m_i, qk_cur, v_cur, dotP)
-            qk_cur = qk_next
-            v_cur = v_next
+            qk_cur = qk_nxt
+            k_nxt = k_rd
         else:
-            # Final block: nothing left to prefetch, just drain the softmax + P@V.
+            # Final block: pipeline drained, just the softmax + P@V remains.
             acc, l_i, m_i = _attn_softmax_pv(acc, l_i, m_i, qk_cur, v_cur, dotP)
 
     return acc, l_i, m_i
@@ -683,14 +726,16 @@ def _attn_fwd(
     v_offsets = (offs_vn[:, None] * stride_vn + offs_vd[None, :] * stride_vk).to(gl.int32)
 
     # --- shared-memory tiles for the async K/V staging --------------------------
-    # Triple-buffered (leading dim = NUM_KV_BUFFERS) so _attn_fwd_inner can keep
-    # block i (being consumed), block i+1 (read LDS->register) and block i+2 (async
-    # copy in flight) simultaneously resident. This is what lets the QK^T of block
-    # i+1 be issued ahead of the softmax + P@V of block i (compute pipeline) on top
-    # of the global/local prefetch. Allocated once and reused across both inner-loop
-    # passes (each pass drains its copies before returning). CDNA4 has 160KB of LDS,
-    # so three K/V buffers fit comfortably.
-    NUM_KV_BUFFERS: gl.constexpr = 3
+    # Quad-buffered (leading dim = NUM_KV_BUFFERS) for _attn_fwd_inner's 4-stage
+    # pipeline, which touches four blocks each iteration: block i (values read +
+    # consumed), block i+1 (QK^T from carried keys), block i+2 (keys read
+    # LDS->register) and block i+3 (async copy in flight). All four map to distinct
+    # buffers, so copy(i+3) never lands on block i's buffer while its values are
+    # still being read; four buffers also give a one-iteration WAR margin before a
+    # buffer is reused. Allocated once and reused across both inner-loop passes
+    # (each pass drains its copies before returning). CDNA4 has 160KB of LDS, so
+    # four K/V buffers fit.
+    NUM_KV_BUFFERS: gl.constexpr = 4
     smemK = gl.allocate_shared_memory(
         k_ptr.dtype.element_ty, [NUM_KV_BUFFERS, BLOCK_DMODEL_POW2, BLOCK_N], kSharedLayout
     )
@@ -698,9 +743,7 @@ def _attn_fwd(
         v_ptr.dtype.element_ty, [NUM_KV_BUFFERS, BLOCK_N, BLOCK_DMODEL_POW2], vSharedLayout
     )
 
-    # --- online-softmax state ---------------------------------------------------
-    # l_i is seeded to 1.0: on the first iteration alpha == exp2(-inf - m) == 0,
-    # which zeroes the seed, so no special-casing of the first block is needed.
+    # online-softmax state
     m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout))
     l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout))
     acc = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=mfmaLayout)
@@ -710,10 +753,7 @@ def _attn_fwd(
     # Query positions used for the causal mask, in the MFMA result layout.
     offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout))
 
-    # --- classify key blocks: full (mask-free) vs masked (boundary/causal) ------
-    # Mirrors mha.py: full blocks are fully inside seqlen_k and (for causal) fully
-    # below the diagonal, so they run without any masking. Only the trailing
-    # boundary block and the causal-diagonal blocks need masking.
+    # classify key blocks: full (mask-free) vs masked (boundary/causal)
     n_blocks = gl.cdiv(seqlen_k, BLOCK_N)
     if IS_CAUSAL:
         n_blocks_causal = gl.cdiv(
@@ -721,10 +761,6 @@ def _attn_fwd(
         )
         n_blocks = min(n_blocks, n_blocks_causal)
 
-        # If there are no visible blocks left, this query block lies entirely
-        # above the (bottom-right aligned) causal diagonal and attends to no
-        # keys. Its output rows are all zero, so write them out and bail before
-        # touching the matrix units (mirrors the early-out in mha.py).
         if n_blocks <= 0:
             offs_od = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, mfmaLayout))
             offs_rm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout))
@@ -749,8 +785,6 @@ def _attn_fwd(
             gl.amd.cdna4.buffer_store(zeros, ptr=o_base, offsets=o_offsets, mask=o_mask)
             return
 
-    # A trailing partial key block (seqlen_k not a multiple of BLOCK_N) must be
-    # masked on its boundary.
     n_extra_tokens = 0
     if seqlen_k < BLOCK_N:
         n_extra_tokens = BLOCK_N - seqlen_k
@@ -760,8 +794,6 @@ def _attn_fwd(
     is_modulo_mn = (not padded_block_k) and (seqlen_q % BLOCK_M == 0)
 
     if IS_CAUSAL:
-        # At least BLOCK_M // BLOCK_N diagonal blocks, plus one more when the
-        # seqlens are not aligned.
         masked_blocks = BLOCK_M // BLOCK_N + (not is_modulo_mn)
     else:
         masked_blocks = padded_block_k
@@ -846,17 +878,13 @@ def _attn_fwd(
             NUM_KV_BUFFERS=NUM_KV_BUFFERS,
         )
 
-    # --- epilogue: normalize and write back -------------------------------------
+    # epilogue: normalize and write
     acc = acc / l_i[:, None]
 
     offs_rm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout))
     offs_om = start_m * BLOCK_M + offs_rm
     offs_od = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, mfmaLayout))
 
-    # If seqlen_q > seqlen_k and the delta is not a multiple of BLOCK_M, this
-    # block straddles the bottom-right causal boundary: rows above it attend to no
-    # keys, so softmax over an all-(-inf) row yields NaN. Zero those rows by index
-    # (only when the boundary actually falls inside this block), mirroring mha.py.
     end_m_idx = (start_m + 1) * BLOCK_M
     start_m_idx = start_m * BLOCK_M
     causal_start_idx = seqlen_q - seqlen_k
@@ -885,9 +913,6 @@ def _attn_fwd(
     )
     o_offsets = (offs_rm[:, None] * stride_om + offs_od[None, :] * stride_on).to(gl.int32)
 
-    # Build the store mask exactly as mha.py: start all-true, AND in the query-row
-    # bound only when this block overflows seqlen_q, and the head-dim bound only
-    # when the head is padded. The [BLOCK_M, 1] base broadcasts over the d-axis.
     overflow_size = end_m_idx - seqlen_q
     out_mask = gl.full([BLOCK_M, 1], True, dtype=gl.int1, layout=mfmaLayout)
     if overflow_size > 0:
@@ -934,9 +959,6 @@ def _validate_and_launch(
     BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(head_dim), 32)
     assert BLOCK_N % 32 == 0, "BLOCK_N must be a multiple of 32"
 
-    # Soundness precondition for the widened head-axis loads: only hint 8-element
-    # alignment when every Q/K/V head-axis stride is a multiple of 8 elements.
-    # *_strides[1] are the head-axis strides in both bshd and thd layouts.
     head_stride_aligned_8 = (
         q_strides[1] % 8 == 0 and k_strides[1] % 8 == 0 and v_strides[1] % 8 == 0
     )
