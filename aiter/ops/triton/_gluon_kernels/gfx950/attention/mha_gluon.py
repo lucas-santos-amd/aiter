@@ -208,13 +208,9 @@ def _issue_kv_copy(
 
 
 @gluon.jit
-def _attn_compute_block(
-    acc,
-    l_i,
-    m_i,
+def _attn_qk(
     q,
     k,
-    v,
     start_n,
     seqlen_q,
     seqlen_k,
@@ -224,21 +220,21 @@ def _attn_compute_block(
     offs_n,
     qk_scale,
     MFMA_LAYOUT: gl.constexpr,
-    dotP: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
     MASK_STEPS: gl.constexpr,
 ):
-    """Single online-softmax step for one already-staged key block.
+    """QK^T (+ scale + boundary/causal mask) for one already-staged key block.
 
-    ``k`` / ``v`` have already been read out of LDS into their MFMA dot-operand
-    layouts. Runs QK^T, the (optional) boundary / causal mask, the online-softmax
-    rescale, and the P@V accumulation, returning the updated ``(acc, l_i, m_i)``.
-    The masks are compiled out entirely when ``MASK_STEPS`` / ``IS_CAUSAL`` are
-    ``False`` (the full-block case), so the bulk of the work runs mask-free.
+    ``k`` has already been read out of LDS into its MFMA dot-operand layout.
+    Returns the masked ``qk`` scores in ``MFMA_LAYOUT`` (float32). This is the
+    first half of one online-softmax step, split out so the caller can pipeline
+    the QK^T of block ``i+1`` ahead of the softmax / P@V of block ``i`` -- the
+    independent QK MFMA then fills the issue gaps left by the softmax VALU chain,
+    mimicking what mha.py's auto-pipeliner does across loop iterations. The masks
+    are compiled out entirely when ``MASK_STEPS`` / ``IS_CAUSAL`` are ``False``.
     """
-    # -- QK^T --
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
     qk = gl.amd.cdna4.mfma(q, k, qk)
     qk = qk * qk_scale
@@ -262,7 +258,17 @@ def _attn_compute_block(
             mask = mask & causal_mask
         qk = gl.where(mask, qk, float("-inf"))
 
-    # -- online softmax --
+    return qk
+
+
+@gluon.jit
+def _attn_softmax_pv(acc, l_i, m_i, qk, v, dotP: gl.constexpr):
+    """Online-softmax rescale + P@V accumulation for one key block.
+
+    ``qk`` holds the (already masked) QK^T scores for this block and ``v`` its
+    value tile in the MFMA dot-operand layout. Returns the updated
+    ``(acc, l_i, m_i)``. Second half of one online-softmax step (see ``_attn_qk``).
+    """
     # Fully-masked rows leave m_ij == -inf and produce NaNs here; those rows are
     # zeroed out by index in the epilogue (see mha.py for the same scheme).
     m_ij = gl.maximum(m_i, gl.max(qk, 1))
@@ -312,22 +318,35 @@ def _attn_fwd_inner(
     IS_CAUSAL: gl.constexpr,
     MASK_STEPS: gl.constexpr,
     PRELOAD_V: gl.constexpr,
+    NUM_KV_BUFFERS: gl.constexpr,
 ):
-    """Local-prefetch online-softmax loop over ``[block_min, block_max)``.
+    """QK-ahead software-pipelined online-softmax loop over ``[block_min, block_max)``.
 
     ``q`` arrives already in the ``dotQ`` layout. ``k_base`` / ``v_base`` are scalar
     base pointers positioned at ``block_min`` (advanced by one key block per copy
     issued) and ``k_offsets`` / ``v_offsets`` are the constant int32 offset tiles
-    consumed by the buffer loads. ``smemK`` / ``smemV`` are *double-buffered*
-    shared-memory tiles (leading dim = 2).
+    consumed by the buffer loads. ``smemK`` / ``smemV`` are ``NUM_KV_BUFFERS``-way
+    shared-memory tiles (block ``j`` lives in buffer ``j % NUM_KV_BUFFERS``).
 
-    The boundary / causal masks are compiled out entirely when MASK_STEPS /
-    IS_CAUSAL are False (the full-block case). n_iter >= 1 (the caller
-    only enters with at least one block); the pipeline degrades gracefully to a
-    single load + compute at n_iter == 1. Both phases share the buffer=2
-    allocation: each drains its copies (the last wait_group(0) retires the
-    final copy before the loop ends) before returning, so no async copy leaks
-    across the full/masked handoff.
+    Three overlapping pipelines run concurrently, mirroring what mha.py's
+    auto-pipeliner buys for free:
+
+    * **global prefetch** -- the async copy of block ``i+2`` (issued at the top of
+      iteration ``i``) is in flight while block ``i`` is being consumed;
+    * **local prefetch** -- block ``i+1`` is read LDS->register just before it is
+      used;
+    * **compute pipeline** -- the QK^T MFMA of block ``i+1`` is issued *before* the
+      softmax + P@V of block ``i`` (``qk``/``v`` for the current block are carried
+      across iterations). The independent QK MFMA overlaps the softmax VALU chain,
+      hiding the softmax latency the two dependent matmuls would otherwise expose.
+
+    Keeping blocks ``i`` (being consumed), ``i+1`` (read into registers) and
+    ``i+2`` (async copy in flight) simultaneously resident requires
+    ``NUM_KV_BUFFERS >= 3``. The boundary / causal masks are compiled out entirely
+    when MASK_STEPS / IS_CAUSAL are False (the full-block case). n_iter >= 1 (the
+    caller only enters with at least one block); the pipeline degrades gracefully
+    at n_iter == 1/2. Each pass drains its own copies before returning, so no
+    async copy leaks across the full/masked handoff.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
     # Fully in-range tiles take the fast scalar-base ``buffer_load_to_shared``
@@ -345,8 +364,8 @@ def _attn_fwd_inner(
 
     n_iter = (block_max - block_min) // BLOCK_N
 
-    # prologue: stage block 0 (and block 1 if present) into LDS, then read
-    # block 0 into the dot-operand registers so the loop can compute immediately.
+    # prologue: stage block 0 (and block 1 if present) into LDS, read block 0 into
+    # registers and compute its QK^T so the loop starts one QK ahead.
     _issue_kv_copy(
         smemK.index(0),
         smemV.index(0),
@@ -391,91 +410,17 @@ def _attn_fwd_inner(
         gl.amd.cdna4.async_copy.commit_group()
         k_base += BLOCK_N * stride_kn
         v_base += BLOCK_N * stride_vn
+        # block 0 ready, block 1 copy stays in flight (overlaps the QK^T below).
         gl.amd.cdna4.async_copy.wait_group(1)
     else:
         gl.amd.cdna4.async_copy.wait_group(0)
-    
+
     k = smemK.index(0).load(dotK)
-    v = smemV.index(0).load(dotV)
-
-    # steady state: compute block i from registers while the async copy of block
-    # i+2 is in flight and block i+1 is read into the next registers.
-    for i in range(0, n_iter - 1):
-        # buffer i%2 holds block i (already consumed into k/v), so it is free to
-        # receive block i+2; buffer (i+1)%2 holds block i+1.
-        g_idx = i % 2
-        l_idx = 1 - g_idx
-
-        start_n = block_min + i * BLOCK_N
-        acc, l_i, m_i = _attn_compute_block(
-            acc,
-            l_i,
-            m_i,
-            q,
-            k,
-            v,
-            start_n,
-            seqlen_q,
-            seqlen_k,
-            block_max,
-            n_extra_tokens,
-            offs_m,
-            offs_n,
-            qk_scale,
-            MFMA_LAYOUT=MFMA_LAYOUT,
-            dotP=dotP,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            IS_CAUSAL=IS_CAUSAL,
-            MASK_STEPS=MASK_STEPS,
-        )
-
-        # Block i+1's copy (from the prologue / a previous iteration) must have
-        # landed before the ds_read below; the matmuls above already retired the
-        # ds_read of buffer g_idx, so refilling it with block i+2 is race-free.
-        gl.amd.cdna4.async_copy.wait_group(0)
-
-        # Prefetch block i+2, except on the last iteration where it would run
-        # past block_max (i + 2 == n_iter). The base pointers advance only when a
-        # copy is issued so they stay aligned with the staged block.
-        if i != n_iter - 2:
-            _issue_kv_copy(
-                smemK.index(g_idx),
-                smemV.index(g_idx),
-                k_base,
-                v_base,
-                k_offsets,
-                v_offsets,
-                block_min + (i + 2) * BLOCK_N,
-                seqlen_k,
-                K_LOAD_LAYOUT,
-                V_LOAD_LAYOUT,
-                BLOCK_N,
-                BLOCK_DMODEL,
-                BLOCK_DMODEL_POW2,
-                USE_BUFFER_LOAD,
-                MASK_STEPS,
-                PADDED_HEAD,
-            )
-            gl.amd.cdna4.async_copy.commit_group()
-            k_base += BLOCK_N * stride_kn
-            v_base += BLOCK_N * stride_vn
-
-        # Local (LDS -> register) prefetch of block i+1 for the next iteration
-        # (or the epilogue); this ds_read overlaps the block i+2 async copy.
-        k = smemK.index(l_idx).load(dotK)
-        v = smemV.index(l_idx).load(dotV)
-
-    # epilogue: compute the final block from the preloaded registers.
-    start_n = block_min + (n_iter - 1) * BLOCK_N
-    acc, l_i, m_i = _attn_compute_block(
-        acc,
-        l_i,
-        m_i,
+    v_cur = smemV.index(0).load(dotV)
+    qk_cur = _attn_qk(
         q,
         k,
-        v,
-        start_n,
+        block_min,
         seqlen_q,
         seqlen_k,
         block_max,
@@ -484,12 +429,85 @@ def _attn_fwd_inner(
         offs_n,
         qk_scale,
         MFMA_LAYOUT=MFMA_LAYOUT,
-        dotP=dotP,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         IS_CAUSAL=IS_CAUSAL,
         MASK_STEPS=MASK_STEPS,
     )
+
+    # steady state: iteration i consumes block i (softmax + P@V from the carried
+    # qk_cur / v_cur) while (a) the async copy of block i+2 is in flight, (b) block
+    # i+1 is read LDS->register, and (c) its QK^T MFMA is issued ahead of the
+    # softmax so the two overlap.
+    for i in range(0, n_iter):
+        if i + 1 < n_iter:
+            # (a) Prefetch block i+2 into its buffer, which last held block i-1
+            # (already fully consumed), so the async write is race-free. Issued
+            # first so the DMA overlaps the wait / compute below.
+            if i + 2 < n_iter:
+                g_idx = (i + 2) % NUM_KV_BUFFERS
+                _issue_kv_copy(
+                    smemK.index(g_idx),
+                    smemV.index(g_idx),
+                    k_base,
+                    v_base,
+                    k_offsets,
+                    v_offsets,
+                    block_min + (i + 2) * BLOCK_N,
+                    seqlen_k,
+                    K_LOAD_LAYOUT,
+                    V_LOAD_LAYOUT,
+                    BLOCK_N,
+                    BLOCK_DMODEL,
+                    BLOCK_DMODEL_POW2,
+                    USE_BUFFER_LOAD,
+                    MASK_STEPS,
+                    PADDED_HEAD,
+                )
+                gl.amd.cdna4.async_copy.commit_group()
+                k_base += BLOCK_N * stride_kn
+                v_base += BLOCK_N * stride_vn
+                # block i+1 copy + block i+2 copy in flight -> retire the oldest
+                # (block i+1) so its ds_read below is safe.
+                gl.amd.cdna4.async_copy.wait_group(1)
+            else:
+                # Tail: no more copies to issue, only block i+1's copy is left.
+                gl.amd.cdna4.async_copy.wait_group(0)
+
+            # (b) local prefetch of block i+1 into registers.
+            l_idx = (i + 1) % NUM_KV_BUFFERS
+            k = smemK.index(l_idx).load(dotK)
+            v_next = smemV.index(l_idx).load(dotV)
+
+            # (c) QK^T of block i+1, issued ahead of the softmax + P@V of block i.
+            qk_next = _attn_qk(
+                q,
+                k,
+                block_min + (i + 1) * BLOCK_N,
+                seqlen_q,
+                seqlen_k,
+                block_max,
+                n_extra_tokens,
+                offs_m,
+                offs_n,
+                qk_scale,
+                MFMA_LAYOUT=MFMA_LAYOUT,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                IS_CAUSAL=IS_CAUSAL,
+                MASK_STEPS=MASK_STEPS,
+            )
+
+            # softmax + P@V for block i; its softmax VALU overlaps the block i+1
+            # QK MFMA issued just above. Carry block i+1's scores/values as the new
+            # "current" state. The carry lives in this branch (not a second
+            # ``if i + 1 < n_iter``) so qk_next / v_next stay in scope for the JIT.
+            acc, l_i, m_i = _attn_softmax_pv(acc, l_i, m_i, qk_cur, v_cur, dotP)
+            qk_cur = qk_next
+            v_cur = v_next
+        else:
+            # Final block: nothing left to prefetch, just drain the softmax + P@V.
+            acc, l_i, m_i = _attn_softmax_pv(acc, l_i, m_i, qk_cur, v_cur, dotP)
 
     return acc, l_i, m_i
 
@@ -665,11 +683,14 @@ def _attn_fwd(
     v_offsets = (offs_vn[:, None] * stride_vn + offs_vd[None, :] * stride_vk).to(gl.int32)
 
     # --- shared-memory tiles for the async K/V staging --------------------------
-    # Double-buffered (leading dim = NUM_KV_BUFFERS) so _attn_fwd_inner can
-    # prefetch the next key block into one buffer while the previous buffer is
-    # read into the MFMA (global prefetch). Allocated once and reused across both
-    # inner-loop passes (each pass drains its copies before returning).
-    NUM_KV_BUFFERS: gl.constexpr = 2
+    # Triple-buffered (leading dim = NUM_KV_BUFFERS) so _attn_fwd_inner can keep
+    # block i (being consumed), block i+1 (read LDS->register) and block i+2 (async
+    # copy in flight) simultaneously resident. This is what lets the QK^T of block
+    # i+1 be issued ahead of the softmax + P@V of block i (compute pipeline) on top
+    # of the global/local prefetch. Allocated once and reused across both inner-loop
+    # passes (each pass drains its copies before returning). CDNA4 has 160KB of LDS,
+    # so three K/V buffers fit comfortably.
+    NUM_KV_BUFFERS: gl.constexpr = 3
     smemK = gl.allocate_shared_memory(
         k_ptr.dtype.element_ty, [NUM_KV_BUFFERS, BLOCK_DMODEL_POW2, BLOCK_N], kSharedLayout
     )
@@ -783,6 +804,7 @@ def _attn_fwd(
             IS_CAUSAL=False,
             MASK_STEPS=False,
             PRELOAD_V=PRELOAD_V,
+            NUM_KV_BUFFERS=NUM_KV_BUFFERS,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -821,6 +843,7 @@ def _attn_fwd(
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=True,
             PRELOAD_V=PRELOAD_V,
+            NUM_KV_BUFFERS=NUM_KV_BUFFERS,
         )
 
     # --- epilogue: normalize and write back -------------------------------------
