@@ -28,34 +28,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils.device_info import get_num_xcds
-
-
-@gluon.jit
-def remap_xcd(pid, GRID_MN, NUM_XCDS: gl.constexpr = 8):
-    """Gluon copy of ``aiter...pid_preprocessing.remap_xcd``.
-
-    Re-groups the linear program id so consecutive ids land on the same XCD,
-    improving L2/cache locality. ``GRID_MN`` is intentionally a runtime value
-    (not constexpr) so ``tall_xcds`` is a tensor scalar with a ``.type``.
-    """
-    # Number of pids per XCD in the new arrangement.
-    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
-    # When GRID_MN is not divisible by NUM_XCDS, some xcds get pids_per_xcd pids
-    # and the rest get pids_per_xcd - 1; tall_xcds counts the former.
-    tall_xcds = GRID_MN % NUM_XCDS
-    if tall_xcds == 0:
-        tall_xcds = gl.cast(NUM_XCDS, tall_xcds.type)
-    xcd = pid % NUM_XCDS
-    local_pid = pid // NUM_XCDS
-    if xcd < tall_xcds:
-        pid = xcd * pids_per_xcd + local_pid
-    else:
-        pid = (
-            tall_xcds * pids_per_xcd
-            + (xcd - tall_xcds) * (pids_per_xcd - 1)
-            + local_pid
-        )
-    return pid
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 
 
 @gluon.constexpr_function
@@ -281,6 +254,7 @@ def _attn_softmax_pv(acc, l_i, m_i, qk, v, dotP: gl.constexpr):
 
     acc = acc * alpha[:, None]
 
+    # TODO: Layout conversion is not trivial
     p = gl.convert_layout(p.to(v.dtype), layout=dotP)
     acc = gl.amd.cdna4.mfma(p, v, acc)
 
