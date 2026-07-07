@@ -33,12 +33,7 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 
 @gluon.constexpr_function
 def _make_kv_shared_layouts(head_dim_pow2, elem_bytes, k_width=8, non_k_dim=16, banks=64):
-    """Swizzled LDS layouts for the async K/V staging tiles (gfx950).
-
-    Returns (kSharedLayout, vSharedLayout):
-    K is stored [head, N] (order [0, 1]), V is [N, head] (order
-    [1, 0]); both are contiguous along the head dim.
-    """
+    """Swizzled LDS layouts for the async K/V staging tiles."""
     bank_line_bytes = banks * 4
     bank_line_elems = bank_line_bytes // elem_bytes
     read_vec_bytes = min(k_width * elem_bytes, 16)
@@ -56,17 +51,8 @@ def _make_kv_shared_layouts(head_dim_pow2, elem_bytes, k_width=8, non_k_dim=16, 
 
 @gluon.jit
 def _async_load_fn(smem, base, offsets):
-    """Unmasked async global->LDS copy (AMD ``buffer_load_to_shared``).
-
-    Issues an async copy from scalar base ``base`` + constant int32 ``offsets``
-    into the shared-memory tile ``smem``; the caller owns the matching
-    ``commit_group`` / ``wait_group`` before reading ``smem``.
-
-    Only used for fully in-range tiles. The scalar-base ``buffer_load_to_shared``
-    masked path was unreliable for partial tiles here, so tiles that need per-lane
-    masking (boundary key columns or head-dim padding) go through the pointer-
-    tensor ``global_load_to_shared`` path in ``_async_load_masked_fn`` instead.
-    """
+    """Unmasked async global->LDS copy. Only for fully in-range tiles; masked
+    tiles use _async_load_masked_fn. Caller owns commit_group / wait_group."""
     gl.amd.cdna4.async_copy.buffer_load_to_shared(smem, base, offsets)
 
 
@@ -74,18 +60,9 @@ def _async_load_fn(smem, base, offsets):
 def _async_load_masked_fn(
     smem, base, offsets, offset_first, offset_second, boundary_first, boundary_second
 ):
-    """Masked async global->LDS copy (AMD ``global_load_to_shared``).
-
-    Builds the 64-bit pointer tensor ``base + offsets`` and async-copies it into
-    the shared tile ``smem`` with a per-axis mask, filling masked lanes with
-    ``other=0.0`` so out-of-range key columns / head-dim padding read 0 (required
-    so they contribute 0 to the QK / P@V matmuls). Used for boundary and
-    padded-head tiles so K/V always stage through LDS. Unlike the scalar-base
-    ``buffer_load_to_shared`` fast path, ``global_load_to_shared`` takes a full
-    pointer tensor, which is what supports masked async-to-LDS here. Each axis is
-    masked only when its offset tensor is not ``None`` (a compile-time decision).
-    The caller owns the matching ``commit_group`` / ``wait_group``.
-    """
+    """Masked async global->LDS copy. Masked lanes read other=0 so out-of-range
+    key columns / head-dim padding contribute 0 to the matmuls. Each axis is
+    masked only when its offset tensor is not None. Caller owns commit/wait."""
     ptrs = base + offsets
     if offset_first is not None and offset_second is not None:
         mask = (offset_first[:, None] < boundary_first) & (
@@ -121,27 +98,19 @@ def _issue_kv_copy(
     MASK_STEPS: gl.constexpr,
     PADDED_HEAD: gl.constexpr,
 ):
-    """Issue the async global->LDS copies of one K and one V key block.
-
-    Mirrors the load logic that used to live inline in ``_attn_fwd_inner`` but
-    targets explicit shared-memory buffer slots (``smemK_buf`` / ``smemV_buf``,
-    already selected via ``smem.index(...)``) so the caller can double-buffer and
-    prefetch the next block while the current one is being consumed. K is staged
-    as ``[BLOCK_DMODEL_POW2, BLOCK_N]`` (d on axis 0, n on axis 1); V as
-    ``[BLOCK_N, BLOCK_DMODEL_POW2]``. Fully in-range tiles take the fast
-    scalar-base ``buffer_load_to_shared`` path; boundary / padded-head tiles use
-    the pointer-tensor ``global_load_to_shared`` path with ``other=0`` so masked
-    lanes stage as 0. ``copy_start_n`` is the key-block start of the tile being
-    copied (used only for the boundary n-axis mask). The caller owns the matching
-    ``commit_group`` / ``wait_group``.
-    """
+    """Issue the async global->LDS copies of one K and one V key block into the
+    given buffer slots. K is staged as [BLOCK_DMODEL_POW2, BLOCK_N], V as
+    [BLOCK_N, BLOCK_DMODEL_POW2]. Copy_start_n is the tile's key-block 
+    start (used for the n-axis mask). Caller owns commit/wait."""
+    
+    # buffer_load_to_shared produces NaNs on the masked path, 
+    # so we use global_load_to_shared instead.
     if USE_BUFFER_LOAD:
         _async_load_fn(smemK_buf, k_base, k_offsets)
         _async_load_fn(smemV_buf, v_base, v_offsets)
     else:
-        # Load-space offsets line up with the pointer tensors. The n-axis is
-        # masked only on boundary (masked) blocks; the head-dim axis only when
-        # the head is padded (None => that axis is unmasked).
+        # n-axis masked only on boundary blocks, head-dim only when padded
+        # (None => that axis is unmasked).
         offs_kn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, K_LOAD_LAYOUT))
         offs_vn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, V_LOAD_LAYOUT))
         offs_kd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, K_LOAD_LAYOUT))
@@ -175,15 +144,10 @@ def _attn_qk_nomask(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
-    """QK^T + scale for one already-staged key block (no masking).
-
-    ``k`` has already been read out of LDS into its MFMA dot-operand layout.
-    Returns the ``qk`` scores in ``MFMA_LAYOUT`` (float32). This is the first half
-    of one online-softmax step, split out so the caller can pipeline the QK^T of
-    block ``i+1`` ahead of the softmax / P@V of block ``i`` -- the independent QK
-    MFMA then fills the issue gaps left by the softmax VALU chain, mimicking what
-    mha.py's auto-pipeliner does across loop iterations.
-    """
+    """QK^T + scale for one already-staged key block (no masking). k is already
+    in its MFMA dot-operand layout; returns float32 scores in MFMA_LAYOUT. Split
+    out so the caller can pipeline QK^T of block i+1 ahead of the softmax/P@V of
+    block i, overlapping the QK MFMA with the softmax."""
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
     qk = gl.amd.cdna4.mfma(q, k, qk)
     return qk * qk_scale
@@ -208,22 +172,15 @@ def _attn_qk(
     MASK_STEPS: gl.constexpr,
 ):
     """QK^T (+ scale + boundary/causal mask) for one already-staged key block.
-
-    Wraps ``_attn_qk_nomask`` with the qk-space boundary / causal masks used by the
-    masked tail. The masks are compiled out entirely when ``MASK_STEPS`` /
-    ``IS_CAUSAL`` are ``False``.
-    """
+    Masks are compiled out when MASK_STEPS / IS_CAUSAL are False."""
     qk = _attn_qk_nomask(q, k, qk_scale, MFMA_LAYOUT, BLOCK_M, BLOCK_N)
 
-    # qk-space mask (MFMA layout): boundary + (optionally) causal. Skipped
-    # entirely for full blocks.
     if MASK_STEPS or IS_CAUSAL:
         mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=MFMA_LAYOUT)
         if MASK_STEPS:
-            # Only the last visible block can be partial, and only when seqlen_k
-            # is not a multiple of BLOCK_N. mask_partial is computed
-            # unconditionally and selected via bound_cond so the body stays
-            # branch-free (mirrors mha.py).
+            # Only the last visible block can be partial (seqlen_k not a multiple
+            # of BLOCK_N). mask_partial is selected via bound_cond to stay
+            # branch-free.
             bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
             size_n = start_n + offs_n
             mask_partial = size_n[None, :] < seqlen_k
@@ -239,14 +196,11 @@ def _attn_qk(
 
 @gluon.jit
 def _attn_softmax_pv(acc, l_i, m_i, qk, v, dotP: gl.constexpr):
-    """Online-softmax rescale + P@V accumulation for one key block.
-
-    ``qk`` holds the (already masked) QK^T scores for this block and ``v`` its
-    value tile in the MFMA dot-operand layout. Returns the updated
-    ``(acc, l_i, m_i)``. Second half of one online-softmax step (see ``_attn_qk``).
-    """
+    """Online-softmax rescale + P@V accumulation for one key block. qk holds the
+    (masked) scores, v the value tile in dot-operand layout. Second half of one
+    online-softmax step; returns updated (acc, l_i, m_i)."""
     # Fully-masked rows leave m_ij == -inf and produce NaNs here; those rows are
-    # zeroed out by index in the epilogue (see mha.py for the same scheme).
+    # zeroed out in the epilogue.
     m_ij = gl.maximum(m_i, gl.max(qk, 1))
     p = gl.exp2(qk - m_ij[:, None])
     alpha = gl.exp2(m_i - m_ij)
@@ -291,64 +245,33 @@ def _attn_fwd_inner(
     BLOCK_DMODEL_POW2: gl.constexpr,
     NUM_KV_BUFFERS: gl.constexpr,
 ):
-    """QK-ahead software-pipelined online-softmax loop over ``[block_min, block_max)``.
+    """QK-ahead software-pipelined online-softmax loop over full (unmasked) blocks.
 
-    ``q`` arrives already in the ``dotQ`` layout. ``k_base`` / ``v_base`` are scalar
-    base pointers positioned at ``block_min`` (advanced by one key block per copy
-    issued) and ``k_offsets`` / ``v_offsets`` are the constant int32 offset tiles
-    consumed by the buffer loads. ``smemK`` / ``smemV`` are ``NUM_KV_BUFFERS``-way
-    shared-memory tiles (block ``j`` lives in buffer ``j % NUM_KV_BUFFERS``).
-
-    A 4-stage software pipeline runs four blocks' worth of work concurrently,
-    mirroring what mha.py's auto-pipeliner buys for free. Iteration ``i`` issues::
+    4-stage pipeline running four blocks' work concurrently. Iteration i issues::
 
         copy(i+3)  ->  readK(i+2)  ->  QK(i+1)  ->  readV(i) + softmax+P@V(i)
-        (HBM->LDS)     (LDS->reg)      (MFMA)       (LDS->reg)   (VALU + MFMA)
+        (HBM->LDS)     (LDS->reg)      (MFMA)      (LDS->reg)  (VALU + MFMA)
 
-    * **global prefetch** -- the async copy of block ``i+3`` is in flight while the
-      earlier blocks are consumed (its K read lands one iteration later);
-    * **local K prefetch** -- block ``i+2``'s *keys* are read LDS->register a full
-      iteration before their QK^T, so the ds_read latency is hidden behind the
-      current iteration's compute (this is the extra stage over the 3-stage
-      version). K is carried across one iteration (``k_nxt`` = block ``i+1``);
-    * **compute pipeline** -- the QK^T MFMA of block ``i+1`` runs from that resident
-      ``k_nxt`` and is issued *before* the softmax + P@V of block ``i``, so the
-      independent MFMA overlaps the softmax VALU chain.
-
-    ``V`` is *not* carried: block ``i``'s values are read LDS->register at the top of
-    iteration ``i`` and consumed by the P@V at its end, so the ds_read overlaps the
-    QK MFMA + softmax VALU without needing a second value tile in registers. Only
-    ``qk_cur`` (block ``i``) and ``k_nxt`` (block ``i+1``) cross the loop back-edge.
-
-    Blocks ``i`` (V read + consumed), ``i+1`` (QK from registers), ``i+2`` (K read)
-    and ``i+3`` (async copy) are all live in LDS each iteration; giving every buffer
-    a one-iteration WAR margin before ``copy(i+3)`` reuses it requires
-    ``NUM_KV_BUFFERS >= 4``.
-
-    This runs only the full-block pass, so there is no boundary / causal masking
-    (the masked tail uses the simpler non-pipelined _attn_fwd_inner_masked). n_iter
-    >= 1 (the caller only enters with at least one block); the pipeline degrades
-    gracefully at n_iter in {1, 2, 3}. All copies are drained before returning, so
-    nothing leaks into the masked pass.
+    Block i+3's async copy is in flight; block i+2's keys are read a full iteration
+    before their QK^T to hide ds_read latency; QK^T(i+1) is issued from the carried
+    k_nxt ahead of softmax(i) so the MFMA overlaps the softmax VALU. 
+    Only qk_cur (block i) and k_nxt (block i+1) are loop carried.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
-    # Full (unmasked) blocks: fully in-range tiles take the fast scalar-base
-    # ``buffer_load_to_shared`` path; only head-dim padding forces the pointer-tensor
-    # ``global_load_to_shared`` path with other=0.
+
+    # buffer_load_to_shared produces NaNs on the masked path, 
+    # so we use global_load_to_shared instead.
     USE_BUFFER_LOAD: gl.constexpr = not PADDED_HEAD
 
-    # Dot-operand layouts are derived from the shared MFMA layout.
     dotK: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
     dotP: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=MFMA_LAYOUT, k_width=8)
     dotV: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
 
     n_iter = (block_max - block_min) // BLOCK_N
 
-    # ---- prologue: prime the 4-stage pipeline --------------------------------
-    # Stage the first three blocks (whichever exist) into LDS, then read the *keys*
-    # of blocks 0 and 1 into registers and compute QK^T(block 0). Entering the loop
-    # we hold qk_cur = QK(0) and k_nxt = K(1), and block 2's copy is in flight (its
-    # keys are read at iteration 0). Values are read inside the loop, not here.
+    # Prologue: stage the first three blocks into LDS, read keys of blocks 0/1
+    # and compute QK^T(0). Enter the loop with qk_cur = QK(0), k_nxt = K(1) and
+    # block 2's copy in flight.
     _issue_kv_copy(
         smemK.index(0),
         smemV.index(0),
@@ -419,7 +342,7 @@ def _attn_fwd_inner(
         # blocks 0,1 ready; block 2's copy stays in flight (read at iteration 0).
         gl.amd.cdna4.async_copy.wait_group(1)
     else:
-        # <=2 blocks: no block-2 copy, so drain everything we issued.
+        # <=2 blocks: no block-2 copy, drain everything.
         gl.amd.cdna4.async_copy.wait_group(0)
 
     k = smemK.index(0).load(dotK)
@@ -432,29 +355,20 @@ def _attn_fwd_inner(
         BLOCK_N=BLOCK_N,
     )
 
-    # k_nxt holds block 1's keys for the first QK^T inside the loop. When there is
-    # only one block it is never used, but must still be defined for the JIT, so
-    # alias block 0's keys rather than reading an unwritten buffer.
+    # k_nxt holds block 1's keys for the first in-loop QK^T.
     if n_iter > 1:
         k_nxt = smemK.index(1).load(dotK)
     else:
         k_nxt = k
 
-    # steady state: iteration i runs copy(i+3) / readK(i+2) / QK(i+1) /
-    # readV(i) + softmax+P@V(i) for four blocks at once. QK(i+1) uses the carried
-    # k_nxt (keys read a full iteration ago, LDS latency already hidden) and is
-    # issued ahead of softmax(i) so the MFMA overlaps the softmax VALU. Block i's
-    # values are read here (still resident in LDS) rather than carried.
     for i in range(0, n_iter):
-        # V(i) for this block's P@V: block i is still resident (its buffer is not
-        # reused by copy(i+4) until the next iteration). Read early so the ds_read
-        # overlaps the QK MFMA + softmax VALU below before P@V consumes it.
+        # V(i): read early so the ds_read overlaps the QK MFMA + softmax VALU
+        # before P@V consumes it.
         v_cur = smemV.index(i % NUM_KV_BUFFERS).load(dotV)
 
         if i + 1 < n_iter:
-            # (a) global prefetch: async-copy block i+3 into its buffer. That buffer
-            # last held block i-1 (consumed at iteration i-1), giving a one-iteration
-            # WAR margin before this overwrite.
+            # (a) global prefetch: async-copy block i+3. Its buffer last held
+            # block i-1, so there is a one-iteration WAR margin.
             if i + 3 < n_iter:
                 g_idx = (i + 3) % NUM_KV_BUFFERS
                 _issue_kv_copy(
@@ -479,24 +393,21 @@ def _attn_fwd_inner(
                 k_base += BLOCK_N * stride_kn
                 v_base += BLOCK_N * stride_vn
 
-            # (b) wait so block i+2's copy has landed before we read its keys. With
-            # the copy just issued, {block i+2, block i+3} are in flight -> retire
-            # the older (i+2) via wait_group(1); otherwise drain the last copy.
+            # (b) wait for block i+2's copy to land before reading its keys.
             if i + 3 < n_iter:
                 gl.amd.cdna4.async_copy.wait_group(1)
             elif i + 2 < n_iter:
                 gl.amd.cdna4.async_copy.wait_group(0)
 
-            # (c) local K prefetch: read block i+2's keys LDS->register, a full
-            # iteration ahead of its QK^T (next iteration) so the ds_read is hidden.
+            # (c) local K prefetch: read block i+2's keys a full iteration ahead
+            # of its QK^T so the ds_read is hidden.
             if i + 2 < n_iter:
                 k_rd = smemK.index((i + 2) % NUM_KV_BUFFERS).load(dotK)
             else:
                 # No block i+2: keep k_rd defined (unused past this iteration).
                 k_rd = k_nxt
 
-            # (d) QK^T of block i+1 from the already-resident k_nxt, issued ahead of
-            # the softmax + P@V of block i.
+            # (d) QK^T of block i+1 from the resident k_nxt, ahead of softmax(i).
             qk_nxt = _attn_qk_nomask(
                 q,
                 k_nxt,
@@ -506,9 +417,8 @@ def _attn_fwd_inner(
                 BLOCK_N=BLOCK_N,
             )
 
-            # (e) softmax + P@V for block i; its softmax VALU overlaps the QK MFMA
-            # just issued. Carry qk / keys forward one block (kept in this branch so
-            # k_rd / qk_nxt stay in scope for the JIT).
+            # (e) softmax + P@V for block i, overlapping the QK MFMA just issued.
+            # Carry qk / keys forward one block.
             acc, l_i, m_i = _attn_softmax_pv(acc, l_i, m_i, qk_cur, v_cur, dotP)
             qk_cur = qk_nxt
             k_nxt = k_rd
@@ -551,12 +461,7 @@ def _attn_fwd_inner_masked(
     MASK_STEPS: gl.constexpr,
 ):
     """Non-pipelined online-softmax loop over the boundary / causal masked blocks.
-
-    Deliberately serial: one block at a time, stage K/V into a single LDS buffer,
-    wait, read into registers, then QK^T (+ mask) and softmax + P@V. The masked tail
-    is only a block or two, so the pipeline's extra buffering / register pressure is
-    not worth it here -- this keeps the masked path simple and drains every copy it
-    issues, so nothing leaks across the full -> masked handoff.
+    The masked tail is only a block or two, so the pipeline overhead is not worth it.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
     USE_BUFFER_LOAD: gl.constexpr = (not MASK_STEPS) and (not PADDED_HEAD)
@@ -572,9 +477,7 @@ def _attn_fwd_inner_masked(
     for i in range(0, n_iter):
         start_n = block_min + i * BLOCK_N
 
-        # Stage this block into buffer 0 and wait for it before reading. The QK / P@V
-        # matmuls below retire the ds_reads before the next iteration's copy reuses
-        # buffer 0, so the single buffer is race-free.
+        # Stage this block into buffer 0 and wait before reading.
         _issue_kv_copy(
             smemK.index(0),
             smemV.index(0),
@@ -666,21 +569,18 @@ def _attn_fwd(
     RCP_LN2: gl.constexpr = 1.4426950408889634
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
 
-    # --- program -> (batch, q_head, query block) -------------------------------
-    # SEQLEN_Q is the max query length, so NUM_BLOCKS_M matches the launch grid in
-    # both fixed-length and varlen mode.
+    # program -> (batch, q_head, query block). SEQLEN_Q is the max query length,
+    # so NUM_BLOCKS_M matches the launch grid in both fixed and varlen mode.
     NUM_BLOCKS_M = gl.cdiv(SEQLEN_Q, BLOCK_M)
     pid = gl.program_id(axis=0)
     off_q_head = pid % NUM_Q_HEADS
-    # Re-map the q-head index across XCDs for better cache locality.
+    # Remap the q-head index across XCDs for better cache locality.
     off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
     start_m = (pid // NUM_Q_HEADS) % NUM_BLOCKS_M
     off_z = pid // (NUM_Q_HEADS * NUM_BLOCKS_M) % BATCH
 
-    # --- per-batch sequence bounds ---------------------------------------------
-    # In varlen mode the actual lengths come from cu_seqlens; the batch axis is
-    # collapsed (stride_*z == 0) and the row offset into the packed tensor is the
-    # cumulative start. In fixed mode we fall back to the SEQLEN_Q/SEQLEN_K args.
+    # In varlen mode the lengths come from cu_seqlens and the batch axis is
+    # collapsed (stride_*z == 0); in fixed mode use the SEQLEN_Q/SEQLEN_K args.
     if VARLEN:
         cu_seqlens_q_start = gl.load(cu_seqlens_q + off_z)
         seqlen_q = gl.load(cu_seqlens_q + off_z + 1) - cu_seqlens_q_start
@@ -698,20 +598,15 @@ def _attn_fwd(
     grp_sz: gl.constexpr = NUM_Q_HEADS // NUM_K_HEADS
     off_k_head = off_q_head // grp_sz
 
-    # --- layouts ----------------------------------------------------------------
-    # A single MFMA layout is reused for both matmuls (QK^T and P@V). For bf16/fp16
-    # both dots share the same 16x16x32 instruction shape, so the result
-    # distribution is identical and softmax state can live in its slice layouts.
-    # The dot/load layouts for K/V are recomputed inside _attn_fwd.
+    # One MFMA layout reused for both matmuls (QK^T and P@V).
     mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 2]
     )
     dotQ: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfmaLayout, k_width=8)
 
-    # Coalesced global-load layouts (converted to the dot-operand layouts after
-    # loading), in the same spirit as the GEMM kernel's gLoadLayoutA/B. These are
-    # sized to the padded head dim (BLOCK_DMODEL_POW2); the real head dim is only
-    # used for the head-padding load/store masks.
+    # Coalesced global-load layouts, converted to the dot-operand layouts after
+    # loading. Sized to the padded head dim; the real head dim only drives the
+    # head-padding masks.
     qLoadLayout: gl.constexpr = gl.BlockedLayout(
         [1, 8],
         [512 // BLOCK_DMODEL_POW2, BLOCK_DMODEL_POW2 // 8],
@@ -732,17 +627,16 @@ def _attn_fwd(
         [1, 0],
     )
 
-    # Swizzled shared layouts for the async global->LDS staging of K and V
+    # Swizzled shared layouts for the async global->LDS staging of K and V.
     _KV_SHARED: gl.constexpr = _make_kv_shared_layouts(
         BLOCK_DMODEL_POW2, k_ptr.dtype.element_ty.primitive_bitwidth // 8
     )
     kSharedLayout: gl.constexpr = _KV_SHARED[0]
     vSharedLayout: gl.constexpr = _KV_SHARED[1]
 
-    # --- head-axis byte offsets -------------------------------------------------
-    # When the caller guarantees Q/K/V head strides are multiples of 8 elements
-    # (HEAD_STRIDE_ALIGNED_8), the head-axis offset is 16-byte aligned. Hinting
-    # the multiple lets AxisInfo widen the global loads.
+    # When the caller guarantees Q/K/V head strides are multiples of 8 elements,
+    # the head-axis offset is 16-byte aligned; hinting the multiple lets AxisInfo
+    # widen the global loads.
     qh_off = off_q_head * stride_qh
     kh_off = off_k_head * stride_kh
     vh_off = off_k_head * stride_vh
@@ -751,10 +645,7 @@ def _attn_fwd(
         kh_off = gl.multiple_of(kh_off, 8)
         vh_off = gl.multiple_of(vh_off, 8)
 
-    # --- load Q (stays resident for the whole key loop) -------------------------
-    # The constant per-program part of the address (batch / head / sequence-start
-    # and this program's query-block offset) is folded into the scalar base; the
-    # int32 offset tile carries only the in-tile (row, head-dim) offsets.
+    # Load Q (stays resident for the whole key loop).
     offs_qm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, qLoadLayout))
     offs_qd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, qLoadLayout))
     q_base = (
@@ -768,8 +659,7 @@ def _attn_fwd(
     q_mask = (start_m * BLOCK_M + offs_qm)[:, None] < seqlen_q
     if PADDED_HEAD:
         q_mask = q_mask & (offs_qd[None, :] < BLOCK_DMODEL)
-    # Cache Q at .cg when a single Q block spans at least one full head, so the
-    # repeated head-major reads stay resident.
+    # Cache Q at .cg when a single Q block spans at least one full head.
     if BLOCK_M >= NUM_Q_HEADS:
         q_cache_mod: gl.constexpr = ".cg"
     else:
@@ -779,10 +669,6 @@ def _attn_fwd(
     )
     q = gl.convert_layout(q, layout=dotQ)
 
-    # --- key/value pointer setup ------------------------------------------------
-    # Same base/offset split as Q: the scalar base lands at key block 0 of this
-    # (batch, head) and is advanced one key block per loop iteration inside
-    # _attn_fwd, while the int32 offset tiles stay constant.
     offs_kd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, kLoadLayout))
     offs_kn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kLoadLayout))
     k_base = k_ptr + off_z * stride_kz + kh_off + cu_seqlens_k_start * stride_kn
@@ -793,16 +679,8 @@ def _attn_fwd(
     v_base = v_ptr + off_z * stride_vz + vh_off + cu_seqlens_k_start * stride_vn
     v_offsets = (offs_vn[:, None] * stride_vn + offs_vd[None, :] * stride_vk).to(gl.int32)
 
-    # --- shared-memory tiles for the async K/V staging --------------------------
-    # Quad-buffered (leading dim = NUM_KV_BUFFERS) for _attn_fwd_inner's 4-stage
-    # pipeline, which touches four blocks each iteration: block i (values read +
-    # consumed), block i+1 (QK^T from carried keys), block i+2 (keys read
-    # LDS->register) and block i+3 (async copy in flight). All four map to distinct
-    # buffers, so copy(i+3) never lands on block i's buffer while its values are
-    # still being read; four buffers also give a one-iteration WAR margin before a
-    # buffer is reused. Allocated once and reused across both inner-loop passes
-    # (each pass drains its copies before returning). CDNA4 has 160KB of LDS, so
-    # four K/V buffers fit.
+    # Shared-memory tiles for the async K/V staging. Quad-buffered for
+    # _attn_fwd_inner's 4-stage pipeline (four blocks live per iteration).
     NUM_KV_BUFFERS: gl.constexpr = 4
     smemK = gl.allocate_shared_memory(
         k_ptr.dtype.element_ty, [NUM_KV_BUFFERS, BLOCK_DMODEL_POW2, BLOCK_N], kSharedLayout
@@ -821,7 +699,7 @@ def _attn_fwd(
     # Query positions used for the causal mask, in the MFMA result layout.
     offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout))
 
-    # classify key blocks: full (mask-free) vs masked (boundary/causal)
+    # Classify key blocks: full (mask-free) vs masked (boundary/causal).
     n_blocks = gl.cdiv(seqlen_k, BLOCK_N)
     if IS_CAUSAL:
         n_blocks_causal = gl.cdiv(
@@ -903,8 +781,7 @@ def _attn_fwd(
         block_min = block_max
         block_max = n_blocks * BLOCK_N
 
-    # Remaining blocks carry the boundary / causal masking. These run on the simple
-    # non-pipelined path (the masked tail is only a block or two).
+    # Remaining blocks carry the boundary / causal masking (non-pipelined path).
     if masked_blocks > 0:
         k_base += n_full_blocks * BLOCK_N * stride_kn
         v_base += n_full_blocks * BLOCK_N * stride_vn
@@ -1007,16 +884,12 @@ def _validate_and_launch(
     BLOCK_N,
 ):
     """Shared validation + launch for the fixed-length and varlen wrappers.
-
-    ``*_strides`` are 4-tuples in (batch, head, seq, head_dim) order. ``seqlen_q``
-    is the max query length (used to size the grid); in varlen mode the per-batch
-    lengths are read from ``cu_seqlens_*`` inside the kernel.
-    """
+    *_strides are 4-tuples in (batch, head, seq, head_dim) order; seqlen_q is the
+    max query length used to size the grid."""
     assert q.shape[-1] == k.shape[-1] == v.shape[-1], "head_dim mismatch"
     assert num_q_heads % num_k_heads == 0, "num_q_heads must be divisible by num_k_heads"
-    # The real head dim may be any value; it is padded up to the next power of 2
-    # for the layouts/MFMA. MFMA 16x16x32 needs the padded head-dim contraction to
-    # be a multiple of 32, and the blocked load layouts need it to divide 512.
+    # Pad head dim up to a power of 2 (>=32): MFMA 16x16x32 needs the contraction
+    # to be a multiple of 32 and the blocked load layouts need it to divide 512.
     BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(head_dim), 32)
     assert BLOCK_N % 32 == 0, "BLOCK_N must be a multiple of 32"
 
