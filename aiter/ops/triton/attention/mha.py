@@ -14,7 +14,45 @@ from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 
+# Forward-only Gluon backend (gfx950).
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_gluon import (
+    gluon_forward_unsupported_reason,
+)
+
 _LOGGER = AiterTritonLogger()
+
+
+def _assert_gluon_forward_supported(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    window_size: Tuple[int, int],
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    sink: Optional[torch.Tensor],
+    return_lse: bool,
+    return_attn_probs: bool,
+    block_table: Optional[torch.Tensor] = None,
+):
+    """Reject calls the forward-only Gluon backend can't serve.
+
+    Delegates to :func:`gluon_forward_unsupported_reason` (the shared source of
+    truth also used by the unit tests to *skip* unsupported parametrizations).
+    """
+    reason = gluon_forward_unsupported_reason(
+        dropout_p=dropout_p,
+        window_size=window_size,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        sink=sink,
+        return_lse=return_lse,
+        return_attn_probs=return_attn_probs,
+        is_fp8=types._is_fp8(q),
+        has_positional_encoding=q.shape[-1] != v.shape[-1],
+        block_table=block_table,
+    )
+    assert reason is None, reason
+
 
 global _USE_FUSED_BWD_KERNEL
 _USE_FUSED_BWD_KERNEL = False
@@ -523,6 +561,7 @@ def flash_attn_func(
     return_attn_probs=False,
     sink=None,
     config: Optional[dict[str, any]] = None,
+    backend: Optional[str] = "triton",
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -565,6 +604,10 @@ def flash_attn_func(
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
         sink: (nheads,), attention sink scores (one per Q head), or None
+        backend: "triton" (default) or "gluon". The "gluon" backend runs the
+            forward-only gfx950 Gluon kernel and only supports the base feature
+            set (no dropout/bias/alibi/sink/sliding-window/FP8/positional
+            encoding, no LSE/softmax return and no backward pass).
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -575,8 +618,29 @@ def flash_attn_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     _LOGGER.info(
-        f"FLASH_ATTN:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+        f"FLASH_ATTN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
     )
+
+    if backend == "gluon":
+        _assert_gluon_forward_supported(
+            q,
+            v,
+            dropout_p,
+            window_size,
+            bias,
+            alibi_slopes,
+            sink,
+            return_lse,
+            return_attn_probs,
+        )
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_gluon import (
+            flash_attn_fwd as _gluon_flash_attn_fwd,
+        )
+
+        return _gluon_flash_attn_fwd(q, k, v, causal=causal, sm_scale=softmax_scale)
+
     return _FlashAttnFunc.apply(
         q,
         k,
@@ -829,6 +893,7 @@ def flash_attn_varlen_func(
     out=None,
     sink=None,
     config: Optional[dict[str, any]] = None,
+    backend: Optional[str] = "triton",
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -877,6 +942,10 @@ def flash_attn_varlen_func(
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
         sink: (nheads,), attention sink scores (one per Q head), or None
+        backend: "triton" (default) or "gluon". The "gluon" backend runs the
+            forward-only gfx950 Gluon kernel and only supports the base feature
+            set (no dropout/bias/alibi/sink/sliding-window/FP8/positional
+            encoding, no LSE/softmax return and no backward pass).
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -886,10 +955,42 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
-
     _LOGGER.info(
-        f"FLASH_ATTN_VARLEN:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+        f"FLASH_ATTN_VARLEN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
     )
+
+    if backend == "gluon":
+        _assert_gluon_forward_supported(
+            q,
+            v,
+            dropout_p,
+            window_size,
+            bias,
+            alibi_slopes,
+            sink,
+            return_lse,
+            return_attn_probs,
+            block_table=block_table,
+        )
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_gluon import (
+            flash_attn_varlen_fwd as _gluon_flash_attn_varlen_fwd,
+        )
+
+        return _gluon_flash_attn_varlen_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            sm_scale=softmax_scale,
+            o=out,
+        )
+
     return _FlashAttnVarlenFunc.apply(
         q,
         k,

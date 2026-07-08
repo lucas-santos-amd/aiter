@@ -3,10 +3,11 @@
 
 """Benchmark the naive Gluon flash-attention forward kernel against the Triton one.
 
-Both kernels live under ``aiter/ops/triton/_gluon_kernels/gfx950/attention/``
-(``mha_gluon.py`` and ``mha.py``) and are reached through the same launcher
-``aiter.ops.triton.attention.mha_simplified.flash_attn_func`` via its ``backend``
-switch (``"triton"`` -> ``mha.py::_attn_fwd``, ``"gluon"`` -> ``mha_gluon.py::flash_attn_fwd``).
+The Gluon forward kernel lives under
+``aiter/ops/triton/_gluon_kernels/gfx950/attention/mha_gluon.py`` and is reached
+through ``aiter.ops.triton.attention.mha.flash_attn_func`` via its ``backend``
+switch (``"triton"`` -> the default Triton kernel, ``"gluon"`` ->
+``mha_gluon.py::flash_attn_fwd``).
 
 For each shape this script times both backends with ``triton.testing.do_bench``,
 optionally checks the Gluon output against the Triton output, and prints latency,
@@ -31,7 +32,7 @@ import sys
 import torch
 import triton
 
-from aiter.ops.triton.attention.mha_simplified import (
+from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     _is_gluon_available,

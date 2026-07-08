@@ -24,11 +24,127 @@
 
 import torch
 import triton
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
+from packaging.version import Version
+
+try:
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+
+    _GLUON_IMPORTED = True
+except Exception:  # pragma: no cover - depends on triton build / arch
+    # Keep this module importable on builds without Gluon so the wrapper and
+    # unit tests can query availability / feature support without a hard import
+    # failure. The @jit kernels below are never callable in this mode; callers
+    # guard on is_gluon_available() before dispatching to them.
+    import triton.language as gl  # provides gl.constexpr for the signatures
+
+    _GLUON_IMPORTED = False
+
+    class _GluonFallback:
+        @staticmethod
+        def jit(fn=None, **_kwargs):
+            def _wrap(f):
+                return f
+
+            return _wrap(fn) if fn is not None else _wrap
+
+        @staticmethod
+        def constexpr_function(fn=None, **_kwargs):
+            def _wrap(f):
+                return f
+
+            return _wrap(fn) if fn is not None else _wrap
+
+    gluon = _GluonFallback()
 
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+
+# ---------------------------------------------------------------------------
+# Gluon backend capability helpers
+#
+# This is a forward-only flash-attention kernel and does NOT implement the full
+# feature set of the default Triton MHA backend. These helpers are the single
+# source of truth for "can the Gluon backend serve this call?" and are shared by
+# the mha.py wrapper (to reject unsupported calls) and the unit tests (to skip
+# unsupported parametrizations).
+# ---------------------------------------------------------------------------
+_GLUON_SUPPORTED_ARCHS = ("gfx950",)
+_TRITON_GE_36 = Version(triton.__version__) >= Version("3.6.0")
+
+def is_gluon_available() -> bool:
+    """True when this Gluon MHA forward kernel can actually run on this device."""
+    if not (_GLUON_IMPORTED and _TRITON_GE_36):
+        return False
+    try:
+        arch = get_arch() or ""
+        return any(supported in arch for supported in _GLUON_SUPPORTED_ARCHS)
+    except Exception:
+        return False
+
+
+def gluon_forward_unsupported_reason(
+    *,
+    head_dim=None,
+    num_k_heads=None,
+    dropout_p: float = 0.0,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    sink=None,
+    return_lse: bool = False,
+    return_attn_probs: bool = False,
+    is_fp8: bool = False,
+    has_positional_encoding: bool = False,
+    block_table=None,
+):
+    """Reason (str) why the Gluon forward backend can't serve this config, else None.
+
+    Shared by the mha.py wrapper (which turns a non-None reason into an error) and
+    by the unit tests (which turn it into a ``pytest.skip``). Pass the feature
+    flags and, optionally, ``head_dim`` / ``num_k_heads`` for the shape checks.
+    """
+    if not is_gluon_available():
+        return (
+            f"Gluon MHA backend requires one of {_GLUON_SUPPORTED_ARCHS} with "
+            f"Triton>=3.6 (arch={get_arch()!r}, triton={triton.__version__})"
+        )
+    if dropout_p and dropout_p != 0.0:
+        return "Gluon MHA backend does not support dropout"
+    if tuple(window_size) != (-1, -1):
+        return "Gluon MHA backend does not support sliding window attention"
+    if bias is not None:
+        return "Gluon MHA backend does not support attention bias"
+    if alibi_slopes is not None:
+        return "Gluon MHA backend does not support alibi slopes"
+    if sink is not None:
+        return "Gluon MHA backend does not support attention sink"
+    if return_lse:
+        return "Gluon MHA backend does not support returning LSE"
+    if return_attn_probs:
+        return "Gluon MHA backend does not support returning attention probabilities"
+    if is_fp8:
+        return "Gluon MHA backend does not support FP8"
+    if has_positional_encoding:
+        return "Gluon MHA backend does not support positional encoding"
+    if block_table is not None:
+        return "Gluon MHA backend does not support paged KV (block_table)"
+    if head_dim is not None and num_k_heads is not None:
+        # Known-bugged: a padded head_dim (padded up to a power of 2 >= 32)
+        # combined with a KV sequence stride (num_k_heads * head_dim) that is not
+        # a multiple of 16 elements fails to legalize the masked async
+        # global->LDS copy on gfx950.
+        padded_head = head_dim != max(triton.next_power_of_2(head_dim), 32)
+        if padded_head and (num_k_heads * head_dim) % 16 != 0:
+            return (
+                "Gluon MHA backend: padded head_dim with a non-16-element-aligned "
+                f"KV stride (head_dim={head_dim}, num_k_heads={num_k_heads}) is "
+                "currently broken"
+            )
+    return None
 
 
 @gluon.constexpr_function
@@ -526,7 +642,21 @@ def _attn_fwd_inner_masked(
     return acc, l_i, m_i
 
 
-@gluon.jit
+_attn_fwd_repr = make_kernel_repr(
+    "_attn_fwd",
+    [
+        "IS_CAUSAL",
+        "NUM_Q_HEADS",
+        "NUM_K_HEADS",
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_DMODEL",
+        "VARLEN",
+        "NUM_XCD",    
+    ],
+)
+
+@gluon.jit(repr=_attn_fwd_repr)
 def _attn_fwd(
     q_ptr,
     k_ptr,
@@ -565,6 +695,7 @@ def _attn_fwd(
     PRELOAD_V: gl.constexpr,
     NUM_XCD: gl.constexpr,
     HEAD_STRIDE_ALIGNED_8: gl.constexpr = False,
+    num_warps: gl.constexpr = 4,
 ):
     RCP_LN2: gl.constexpr = 1.4426950408889634
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
@@ -610,20 +741,20 @@ def _attn_fwd(
     qLoadLayout: gl.constexpr = gl.BlockedLayout(
         [1, 8],
         [512 // BLOCK_DMODEL_POW2, BLOCK_DMODEL_POW2 // 8],
-        [4, 1],
+        [num_warps, 1],
         [1, 0],
     )
     # K is read transposed as [BLOCK_DMODEL_POW2, BLOCK_N] (head dim contiguous).
     kLoadLayout: gl.constexpr = gl.BlockedLayout(
         [8, 1],
         [BLOCK_DMODEL_POW2 // 8, 512 // BLOCK_DMODEL_POW2],
-        [1, 4],
+        [1, num_warps],
         [0, 1],
     )
     vLoadLayout: gl.constexpr = gl.BlockedLayout(
         [1, 8],
         [512 // BLOCK_DMODEL_POW2, BLOCK_DMODEL_POW2 // 8],
-        [4, 1],
+        [num_warps, 1],
         [1, 0],
     )
 
@@ -886,6 +1017,10 @@ def _validate_and_launch(
     """Shared validation + launch for the fixed-length and varlen wrappers.
     *_strides are 4-tuples in (batch, head, seq, head_dim) order; seqlen_q is the
     max query length used to size the grid."""
+    assert is_gluon_available(), (
+        f"Gluon MHA backend requires one of {_GLUON_SUPPORTED_ARCHS} with "
+        f"Triton>=3.6 (arch={get_arch()!r}, triton={triton.__version__})"
+    )
     assert q.shape[-1] == k.shape[-1] == v.shape[-1], "head_dim mismatch"
     assert num_q_heads % num_k_heads == 0, "num_q_heads must be divisible by num_k_heads"
     # Pad head dim up to a power of 2 (>=32): MFMA 16x16x32 needs the contraction
