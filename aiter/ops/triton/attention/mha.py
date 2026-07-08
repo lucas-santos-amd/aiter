@@ -24,6 +24,7 @@ _LOGGER = AiterTritonLogger()
 
 def _assert_gluon_forward_supported(
     q: torch.Tensor,
+    k: torch.Tensor,
     v: torch.Tensor,
     dropout_p: float,
     window_size: Tuple[int, int],
@@ -40,6 +41,8 @@ def _assert_gluon_forward_supported(
     truth also used by the unit tests to *skip* unsupported parametrizations).
     """
     reason = gluon_forward_unsupported_reason(
+        head_dim=q.shape[-1],
+        num_k_heads=k.shape[-2],
         dropout_p=dropout_p,
         window_size=window_size,
         bias=bias,
@@ -624,6 +627,7 @@ def flash_attn_func(
     if backend == "gluon":
         _assert_gluon_forward_supported(
             q,
+            k,
             v,
             dropout_p,
             window_size,
@@ -962,6 +966,7 @@ def flash_attn_varlen_func(
     if backend == "gluon":
         _assert_gluon_forward_supported(
             q,
+            k,
             v,
             dropout_p,
             window_size,
