@@ -39,7 +39,10 @@ def _make_kv_shared_layouts(
     read_vec_bytes = min(k_width * elem_bytes, 16)
     num_threads_same_cycle = bank_line_bytes // read_vec_bytes
     per_phase = (bank_line_elems + head_dim_pow2 - 1) // head_dim_pow2
-    swizzle_vec = k_width * max(1, per_phase // 2)
+    # The swizzle vector can't exceed the ds_read width (read_vec_bytes): a wider
+    # vector isn't realized by the hardware read and only inflates the layout,
+    # which at small head dims collapses max_phase to 1
+    swizzle_vec = min(k_width * max(1, per_phase // 2), read_vec_bytes // elem_bytes)
     max_phase = min(
         min(non_k_dim, num_threads_same_cycle) // per_phase,
         bank_line_elems // swizzle_vec,
@@ -89,8 +92,8 @@ def _issue_kv_copy(
     v_offsets,
     copy_start_n,
     seqlen_k,
-    K_LOAD_LAYOUT: gl.constexpr,
-    V_LOAD_LAYOUT: gl.constexpr,
+    kLoadLayout: gl.constexpr,
+    vLoadLayout: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
@@ -111,14 +114,10 @@ def _issue_kv_copy(
     else:
         # n-axis masked only on boundary blocks, head-dim only when padded
         # (None => that axis is unmasked).
-        offs_kn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, K_LOAD_LAYOUT))
-        offs_vn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, V_LOAD_LAYOUT))
-        offs_kd = gl.arange(
-            0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, K_LOAD_LAYOUT)
-        )
-        offs_vd = gl.arange(
-            0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, V_LOAD_LAYOUT)
-        )
+        offs_kn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kLoadLayout))
+        offs_vn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, vLoadLayout))
+        offs_kd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, kLoadLayout))
+        offs_vd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, vLoadLayout))
         if MASK_STEPS:
             k_offs_n = copy_start_n + offs_kn
             v_offs_n = copy_start_n + offs_vn
@@ -144,15 +143,15 @@ def _attn_qk_nomask(
     q,
     k,
     qk_scale,
-    MFMA_LAYOUT: gl.constexpr,
+    mfmaLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
     """QK^T + scale for one already-staged key block (no masking). k is already
-    in its MFMA dot-operand layout; returns float32 scores in MFMA_LAYOUT. Split
+    in its MFMA dot-operand layout; returns float32 scores in mfmaLayout. Split
     out so the caller can pipeline QK^T of block i+1 ahead of the softmax/P@V of
     block i, overlapping the QK MFMA with the softmax."""
-    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
+    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
     qk = gl.amd.cdna4.mfma(q, k, qk)
     return qk * qk_scale
 
@@ -169,7 +168,7 @@ def _attn_qk(
     offs_m,
     offs_n,
     qk_scale,
-    MFMA_LAYOUT: gl.constexpr,
+    mfmaLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
@@ -177,10 +176,10 @@ def _attn_qk(
 ):
     """QK^T (+ scale + boundary/causal mask) for one already-staged key block.
     Masks are compiled out when MASK_STEPS / IS_CAUSAL are False."""
-    qk = _attn_qk_nomask(q, k, qk_scale, MFMA_LAYOUT, BLOCK_M, BLOCK_N)
+    qk = _attn_qk_nomask(q, k, qk_scale, mfmaLayout, BLOCK_M, BLOCK_N)
 
     if MASK_STEPS or IS_CAUSAL:
-        mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=MFMA_LAYOUT)
+        mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=mfmaLayout)
         if MASK_STEPS:
             # Only the last visible block can be partial (seqlen_k not a multiple
             # of BLOCK_N). mask_partial is selected via bound_cond to stay
@@ -211,8 +210,7 @@ def _attn_softmax_pv(acc, l_i, m_i, qk, v, dotP: gl.constexpr):
 
     acc = acc * alpha[:, None]
 
-    # TODO: Layout conversion is not trivial
-    p = gl.convert_layout(p.to(v.dtype), layout=dotP)
+    p = gl.convert_layout(p.to(v.dtype), layout=dotP, assert_trivial=True)
     acc = gl.amd.cdna4.mfma(p, v, acc)
 
     l_i = l_i * alpha + l_ij
@@ -239,9 +237,9 @@ def _attn_fwd_inner(
     block_min,
     block_max,
     qk_scale,
-    MFMA_LAYOUT: gl.constexpr,
-    K_LOAD_LAYOUT: gl.constexpr,
-    V_LOAD_LAYOUT: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+    kLoadLayout: gl.constexpr,
+    vLoadLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
@@ -267,13 +265,13 @@ def _attn_fwd_inner(
     USE_BUFFER_LOAD: gl.constexpr = not PADDED_HEAD
 
     dotK: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=MFMA_LAYOUT, k_width=8
+        operand_index=1, parent=mfmaLayout, k_width=8
     )
     dotP: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=MFMA_LAYOUT, k_width=8
+        operand_index=0, parent=mfmaLayout, k_width=4
     )
     dotV: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=MFMA_LAYOUT, k_width=8
+        operand_index=1, parent=mfmaLayout, k_width=4
     )
 
     n_iter = (block_max - block_min) // BLOCK_N
@@ -290,8 +288,8 @@ def _attn_fwd_inner(
         v_offsets,
         block_min,
         seqlen_k,
-        K_LOAD_LAYOUT,
-        V_LOAD_LAYOUT,
+        kLoadLayout,
+        vLoadLayout,
         BLOCK_N,
         BLOCK_DMODEL,
         BLOCK_DMODEL_POW2,
@@ -313,8 +311,8 @@ def _attn_fwd_inner(
             v_offsets,
             block_min + BLOCK_N,
             seqlen_k,
-            K_LOAD_LAYOUT,
-            V_LOAD_LAYOUT,
+            kLoadLayout,
+            vLoadLayout,
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
@@ -336,8 +334,8 @@ def _attn_fwd_inner(
             v_offsets,
             block_min + 2 * BLOCK_N,
             seqlen_k,
-            K_LOAD_LAYOUT,
-            V_LOAD_LAYOUT,
+            kLoadLayout,
+            vLoadLayout,
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
@@ -359,7 +357,7 @@ def _attn_fwd_inner(
         q,
         k,
         qk_scale,
-        MFMA_LAYOUT=MFMA_LAYOUT,
+        mfmaLayout=mfmaLayout,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
     )
@@ -389,8 +387,8 @@ def _attn_fwd_inner(
                     v_offsets,
                     block_min + (i + 3) * BLOCK_N,
                     seqlen_k,
-                    K_LOAD_LAYOUT,
-                    V_LOAD_LAYOUT,
+                    kLoadLayout,
+                    vLoadLayout,
                     BLOCK_N,
                     BLOCK_DMODEL,
                     BLOCK_DMODEL_POW2,
@@ -421,7 +419,7 @@ def _attn_fwd_inner(
                 q,
                 k_nxt,
                 qk_scale,
-                MFMA_LAYOUT=MFMA_LAYOUT,
+                mfmaLayout=mfmaLayout,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
             )
@@ -459,9 +457,9 @@ def _attn_fwd_inner_masked(
     n_extra_tokens,
     offs_m,
     qk_scale,
-    MFMA_LAYOUT: gl.constexpr,
-    K_LOAD_LAYOUT: gl.constexpr,
-    V_LOAD_LAYOUT: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+    kLoadLayout: gl.constexpr,
+    vLoadLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
@@ -476,16 +474,16 @@ def _attn_fwd_inner_masked(
     USE_BUFFER_LOAD: gl.constexpr = (not MASK_STEPS) and (not PADDED_HEAD)
 
     dotK: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=MFMA_LAYOUT, k_width=8
+        operand_index=1, parent=mfmaLayout, k_width=8
     )
     dotP: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=MFMA_LAYOUT, k_width=8
+        operand_index=0, parent=mfmaLayout, k_width=4
     )
     dotV: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=MFMA_LAYOUT, k_width=8
+        operand_index=1, parent=mfmaLayout, k_width=4
     )
 
-    offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, MFMA_LAYOUT))
+    offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
 
     n_iter = (block_max - block_min) // BLOCK_N
 
@@ -502,8 +500,8 @@ def _attn_fwd_inner_masked(
             v_offsets,
             start_n,
             seqlen_k,
-            K_LOAD_LAYOUT,
-            V_LOAD_LAYOUT,
+            kLoadLayout,
+            vLoadLayout,
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
@@ -530,7 +528,7 @@ def _attn_fwd_inner_masked(
             offs_m,
             offs_n,
             qk_scale,
-            MFMA_LAYOUT=MFMA_LAYOUT,
+            mfmaLayout=mfmaLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             IS_CAUSAL=IS_CAUSAL,
@@ -675,7 +673,10 @@ def _attn_fwd(
 
     # One MFMA layout reused for both matmuls (QK^T and P@V).
     mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 2]
+        version=4,
+        instr_shape=[32, 32, 16],
+        transposed=True,
+        warps_per_cta=[num_warps, 1],
     )
     dotQ: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfmaLayout, k_width=8
@@ -801,10 +802,12 @@ def _attn_fwd(
         n_blocks = min(n_blocks, n_blocks_causal)
 
         if n_blocks <= 0:
+            storeLayout: gl.constexpr = qLoadLayout
             offs_od = gl.arange(
-                0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, mfmaLayout)
+                0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, storeLayout)
             )
-            offs_rm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout))
+            offs_rm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, storeLayout))
+            offs_om = start_m * BLOCK_M + offs_rm
             o_base = (
                 o_ptr
                 + off_z * stride_oz
@@ -818,9 +821,9 @@ def _attn_fwd(
             zeros = gl.zeros(
                 [BLOCK_M, BLOCK_DMODEL_POW2],
                 dtype=o_ptr.dtype.element_ty,
-                layout=mfmaLayout,
+                layout=storeLayout,
             )
-            o_mask = offs_m[:, None] < seqlen_q
+            o_mask = offs_om[:, None] < seqlen_q
             if PADDED_HEAD:
                 o_mask = o_mask & (offs_od[None, :] < BLOCK_DMODEL)
             gl.amd.cdna4.buffer_store(zeros, ptr=o_base, offsets=o_offsets, mask=o_mask)
@@ -864,9 +867,9 @@ def _attn_fwd(
             block_min,
             block_max,
             qk_scale,
-            MFMA_LAYOUT=mfmaLayout,
-            K_LOAD_LAYOUT=kLoadLayout,
-            V_LOAD_LAYOUT=vLoadLayout,
+            mfmaLayout=mfmaLayout,
+            kLoadLayout=kLoadLayout,
+            vLoadLayout=vLoadLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_DMODEL=BLOCK_DMODEL,
@@ -900,9 +903,9 @@ def _attn_fwd(
             n_extra_tokens,
             offs_m,
             qk_scale,
-            MFMA_LAYOUT=mfmaLayout,
-            K_LOAD_LAYOUT=kLoadLayout,
-            V_LOAD_LAYOUT=vLoadLayout,
+            mfmaLayout=mfmaLayout,
+            kLoadLayout=kLoadLayout,
+            vLoadLayout=vLoadLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_DMODEL=BLOCK_DMODEL,
@@ -913,10 +916,6 @@ def _attn_fwd(
 
     # epilogue: normalize and write
     acc = acc / l_i[:, None]
-
-    offs_rm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout))
-    offs_om = start_m * BLOCK_M + offs_rm
-    offs_od = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, mfmaLayout))
 
     # If seqlen_q > seqlen_k but the delta is not a multiple of BLOCK_M,
     # then we have one block with a row of all NaNs which come from computing
@@ -941,6 +940,13 @@ def _attn_fwd(
 
     out = acc.to(o_ptr.dtype.element_ty)
 
+    storeLayout: gl.constexpr = qLoadLayout
+    out = gl.convert_layout(out, layout=storeLayout)
+
+    offs_rm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, storeLayout))
+    offs_om = start_m * BLOCK_M + offs_rm
+    offs_od = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, storeLayout))
+
     o_base = (
         o_ptr
         + off_z * stride_oz
@@ -953,7 +959,7 @@ def _attn_fwd(
     )
 
     overflow_size = end_m_idx - seqlen_q
-    out_mask = gl.full([BLOCK_M, 1], True, dtype=gl.int1, layout=mfmaLayout)
+    out_mask = gl.full([BLOCK_M, 1], True, dtype=gl.int1, layout=storeLayout)
     if overflow_size > 0:
         out_mask = out_mask & (offs_om[:, None] < seqlen_q)
     if PADDED_HEAD:
