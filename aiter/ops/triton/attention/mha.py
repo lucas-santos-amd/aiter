@@ -91,11 +91,16 @@ def gluon_forward_unsupported_reason(
     if block_table is not None:
         return "Gluon MHA backend does not support paged KV (block_table)"
     if head_dim is not None:
-        # Known-bug: a padded head_dim (padded up to a power of 2 >= 32) whose
-        # per-head size is not a multiple of 16 elements fails to legalize the
-        # masked async global->LDS copy during compilation on gfx950.
-        padded_head = head_dim != max(triton.next_power_of_2(head_dim), 32)
-        if padded_head and head_dim % 16 != 0:
+        # The kernel rounds head_dim up to a multiple of 8 (see
+        # _gluon_flash_attn_forward), then pads that up to a power of 2 (>=16)
+        # for the MFMA tile. Known-bug: a padded head whose (rounded) per-head
+        # size is not a multiple of 16 elements fails to legalize the masked
+        # async global->LDS copy during compilation on gfx950.
+        padded_head_dim = head_dim + (-head_dim % 8)
+        padded_head = padded_head_dim != max(
+            triton.next_power_of_2(padded_head_dim), 16
+        )
+        if padded_head and padded_head_dim % 16 != 0:
             return (
                 "Gluon MHA backend: padded head_dim that is not 16-element-aligned "
                 f"(head_dim={head_dim}) is currently broken"
@@ -115,7 +120,7 @@ def _gluon_flash_attn_forward(
     max_seqlen_q=None,
     max_seqlen_k=None,
     BLOCK_M=128,
-    BLOCK_N=64,
+    BLOCK_N=32,
 ):
     """Validate + launch the Gluon forward kernel for both fixed-length (bshd)
     and varlen (thd) batches.
@@ -159,7 +164,17 @@ def _gluon_flash_attn_forward(
 
     if sm_scale is None:
         sm_scale = head_dim ** (-0.5)
-    if o is None:
+
+    head_size_og = head_dim
+    if head_size_og % 8 != 0:
+        pad = 8 - head_size_og % 8
+        q = torch.nn.functional.pad(q, [0, pad])
+        k = torch.nn.functional.pad(k, [0, pad])
+        v = torch.nn.functional.pad(v, [0, pad])
+        head_dim = q.shape[-1]
+
+    o_provided = o
+    if o is None or head_dim != head_size_og:
         o = torch.empty_like(q)
 
     if varlen:
@@ -175,9 +190,9 @@ def _gluon_flash_attn_forward(
         v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
         o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
 
-    # Pad head dim up to a power of 2 (>=32): MFMA 16x16x32 needs the contraction
-    # to be a multiple of 32.
-    BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(head_dim), 32)
+    # Pad head dim up to a power of 2 (>=16): the 32x32x16 MFMA needs the
+    # contraction (head dim) to be a multiple of 16.
+    BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(head_dim), 16)
 
     head_stride_aligned_8 = (
         q_strides[1] % 8 == 0 and k_strides[1] % 8 == 0 and v_strides[1] % 8 == 0
@@ -215,6 +230,12 @@ def _gluon_flash_attn_forward(
         num_warps=4,
         waves_per_eu=2,
     )
+
+    if head_dim != head_size_og:
+        o = o[..., :head_size_og]
+        if o_provided is not None:
+            o_provided.copy_(o)
+            o = o_provided
     return o
 
 
