@@ -11,6 +11,7 @@ from aiter.ops.triton.attention.mha import (
     mha_set_use_int64_strides,
     gluon_forward_unsupported_reason,
 )
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_with_tol,
@@ -145,6 +146,88 @@ def test_mha(
         backend=backend,
         dtype=dtype,
     )
+
+
+def _fp8_assert_close(actual, expected, atol=2.0, cos_sim_threshold=0.94):
+    """Loose fp8 comparison: bounded max-abs error plus cosine similarity.
+
+    fp8 attention has larger elementwise error than bf16, so we check direction
+    (cosine similarity) in addition to a bounded absolute error. Tolerances are
+    intentionally loose; tighten after validating on gfx950 hardware.
+    """
+    a = actual.float().flatten()
+    b = expected.float().flatten()
+    max_abs = (a - b).abs().max().item()
+    assert max_abs <= atol, f"Max absolute error {max_abs:.4f} > {atol}"
+    if b.norm().item() > 1e-3:
+        cos_sim = torch.nn.functional.cosine_similarity(
+            a.unsqueeze(0), b.unsqueeze(0)
+        ).item()
+        assert (
+            cos_sim >= cos_sim_threshold
+        ), f"Cosine similarity {cos_sim:.6f} < {cos_sim_threshold}"
+
+
+def _quantize_fp8_per_bh(x, fp8_dtype):
+    """Per-(batch, head) symmetric fp8 quantization.
+
+    x: [batch, seqlen, heads, head_dim] high-precision tensor. Returns
+    (x_fp8, descale) where descale is [batch, heads] fp32 (amax / fp8_max), the
+    per-(batch, head) dequant scalar consumed by the Gluon kernel.
+    """
+    fp8_max = torch.finfo(fp8_dtype).max
+    amax = x.abs().amax(dim=(1, 3)).clamp(min=1e-9)  # [batch, heads]
+    scale = fp8_max / amax
+    x_fp8 = (x * scale[:, None, :, None]).to(fp8_dtype)
+    descale = (amax / fp8_max).to(torch.float32)
+    return x_fp8, descale
+
+
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (512, 2048)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 8), (16, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_fp8_gluon(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    dtype=torch.bfloat16,
+):
+    """FP8 forward on the Gluon backend: pre-quantize q/k/v to fp8 e4m3 with
+    per-(batch, head) descales, run the Gluon kernel (fp32 output), and compare
+    against the high-precision torch reference with a loose fp8 tolerance."""
+    _skip_if_gluon_unsupported("gluon", HEAD_SZ, NUM_K_HEADS, is_fp8=True)
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = _quantize_fp8_per_bh(q, fp8_dtype)
+    k_fp8, k_descale = _quantize_fp8_per_bh(k, fp8_dtype)
+    v_fp8, v_descale = _quantize_fp8_per_bh(v, fp8_dtype)
+
+    gluon_out = flash_attn_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        causal=CAUSAL,
+        backend="gluon",
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    torch_out, _, _ = attention_ref(q, k, v, causal=CAUSAL)
+
+    _fp8_assert_close(gluon_out, torch_out.to(gluon_out.dtype))
 
 
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1)])

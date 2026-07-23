@@ -84,8 +84,6 @@ def gluon_forward_unsupported_reason(
         return "Gluon MHA backend does not support returning LSE"
     if return_attn_probs:
         return "Gluon MHA backend does not support returning attention probabilities"
-    if is_fp8:
-        return "Gluon MHA backend does not support FP8"
     if has_positional_encoding:
         return "Gluon MHA backend does not support positional encoding"
     if block_table is not None:
@@ -96,11 +94,10 @@ def gluon_forward_unsupported_reason(
         # for the MFMA tile. Known-bug: a padded head whose (rounded) per-head
         # size is not a multiple of 16 elements fails to legalize the masked
         # async global->LDS copy during compilation on gfx950.
-        padded_head_dim = head_dim + (-head_dim % 8)
-        padded_head = padded_head_dim != max(
-            triton.next_power_of_2(padded_head_dim), 16
-        )
-        if padded_head and padded_head_dim % 16 != 0:
+        min_pad = 64 if is_fp8 else 16
+        head_dim = head_dim + (-head_dim % 8)
+        padded_head = head_dim != max(triton.next_power_of_2(head_dim), min_pad)
+        if padded_head and head_dim % 16 != 0:
             return (
                 "Gluon MHA backend: padded head_dim that is not 16-element-aligned "
                 f"(head_dim={head_dim}) is currently broken"
@@ -119,6 +116,9 @@ def _gluon_flash_attn_forward(
     cu_seqlens_k=None,
     max_seqlen_q=None,
     max_seqlen_k=None,
+    descale_q=None,
+    descale_k=None,
+    descale_v=None,
     BLOCK_M=128,
     BLOCK_N=32,
 ):
@@ -129,15 +129,21 @@ def _gluon_flash_attn_forward(
     ``[total_tokens, heads, head_dim]`` and the grid is sized by ``max_seqlen_q``.
     Otherwise q/k/v are ``[batch, seqlen, heads, head_dim]`` and the grid is sized by ``batch``.
 
+    FP8 is selected when q/k/v are fp8 tensors; then ``descale_q/k/v`` (per-batch,
+    per-head fp32 dequant scalars) are required and accumulation is fp32.
+
     Arguments:
         q, k, v: query / key / value tensors (layout per the mode above).
         causal: whether to apply a (bottom-right aligned) causal mask.
         sm_scale: QK^T scale. Defaults to 1 / sqrt(head_dim).
-        o: optional preallocated output; defaults to ``torch.empty_like(q)``.
+        o: optional preallocated output. defaults to ``torch.empty_like(q)`` (fp32 for fp8).
         cu_seqlens_q/cu_seqlens_k: (batch + 1,) int32 cumulative lengths (varlen).
         max_seqlen_q/max_seqlen_k: max sequence lengths in the batch (varlen).
+        descale_q: (batch, num_q_heads) fp32 dequant scalars for q (fp8 only).
+        descale_k/descale_v: (batch, num_k_heads) fp32 dequant scalars for k/v (fp8 only).
     Return:
-        o: same layout as q.
+        o: same layout as q. Dtype is fp32 for fp8 inputs unless the caller passed
+            an ``o`` of a different dtype, in which case that dtype is returned.
     """
     varlen = cu_seqlens_q is not None
 
@@ -147,6 +153,25 @@ def _gluon_flash_attn_forward(
     )
     assert q.shape[-1] == k.shape[-1] == v.shape[-1], "head_dim mismatch"
     assert BLOCK_N % 32 == 0, "BLOCK_N must be a multiple of 32"
+
+    IS_FP8 = types._is_fp8(q)
+    FP8_MAX = torch.finfo(q.dtype).max if IS_FP8 else 0.0
+    if IS_FP8:
+        assert (
+            descale_q is not None and descale_k is not None and descale_v is not None
+        ), "FP8 Gluon MHA requires descale_q/descale_k/descale_v"
+        assert (
+            q.dtype == types.e4m3_dtype
+            and k.dtype == types.e4m3_dtype
+            and v.dtype == types.e4m3_dtype
+        ), (
+            f"FP8 Gluon MHA only supports the e4m3 fp8 dtype ({types.e4m3_dtype}) "
+            f"(got q={q.dtype}, k={k.dtype}, v={v.dtype})"
+        )
+        # The scaled f8f6f4 MFMA is 32x32x64 (K=64), so the P@V contraction
+        # (BLOCK_N) must be a multiple of 64.
+        if BLOCK_N < 64:
+            BLOCK_N = 64
 
     if varlen:
         _, num_q_heads, head_dim = q.shape
@@ -174,7 +199,9 @@ def _gluon_flash_attn_forward(
         head_dim = q.shape[-1]
 
     o_provided = o
-    if o is None or head_dim != head_size_og:
+    if IS_FP8:
+        o = torch.empty_like(q, dtype=torch.float32)
+    elif o is None or head_dim != head_size_og:
         o = torch.empty_like(q)
 
     if varlen:
@@ -190,9 +217,8 @@ def _gluon_flash_attn_forward(
         v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
         o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
 
-    # Pad head dim up to a power of 2 (>=16): the 32x32x16 MFMA needs the
-    # contraction (head dim) to be a multiple of 16.
-    BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(head_dim), 16)
+    min_pad = 64 if IS_FP8 else 16
+    BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(head_dim), min_pad)
 
     head_stride_aligned_8 = (
         q_strides[1] % 8 == 0 and k_strides[1] % 8 == 0 and v_strides[1] % 8 == 0
@@ -205,6 +231,9 @@ def _gluon_flash_attn_forward(
         k,
         v,
         o,
+        descale_q,
+        descale_k,
+        descale_v,
         sm_scale,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -214,6 +243,9 @@ def _gluon_flash_attn_forward(
         *k_strides,  #
         *v_strides,  #
         *o_strides,  #
+        descale_q.stride(0) if descale_q is not None else 0,
+        descale_k.stride(0) if descale_k is not None else 0,
+        descale_v.stride(0) if descale_v is not None else 0,
         NUM_Q_HEADS=num_q_heads,
         NUM_K_HEADS=num_k_heads,
         IS_CAUSAL=causal,
@@ -226,6 +258,8 @@ def _gluon_flash_attn_forward(
         PRELOAD_V=True,
         NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
+        IS_FP8=IS_FP8,
+        FP8_MAX=FP8_MAX,
         HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
         num_warps=4,
         waves_per_eu=2,
@@ -233,9 +267,9 @@ def _gluon_flash_attn_forward(
 
     if head_dim != head_size_og:
         o = o[..., :head_size_og]
-        if o_provided is not None:
-            o_provided.copy_(o)
-            o = o_provided
+    if o_provided is not None and o_provided.data_ptr() != o.data_ptr():
+        o_provided.copy_(o)
+        o = o_provided
     return o
 
 
@@ -745,6 +779,9 @@ def flash_attn_func(
     return_lse=False,
     return_attn_probs=False,
     sink=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
     config: Optional[dict[str, any]] = None,
     backend: Optional[str] = "triton",
 ):
@@ -789,10 +826,14 @@ def flash_attn_func(
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
         sink: (nheads,), attention sink scores (one per Q head), or None
+        q_descale, k_descale, v_descale: optional fp8 dequant scalars, honored only
+            by the "gluon" backend when q/k/v are fp8. Shapes (batch, num_q_heads)
+            for q and (batch, num_k_heads) for k/v; the output is fp32.
         backend: "triton" (default) or "gluon". The "gluon" backend runs the
             forward-only gfx950 Gluon kernel and only supports the base feature
-            set (no dropout/bias/alibi/sink/sliding-window/FP8/positional
-            encoding, no LSE/softmax return and no backward pass).
+            set plus FP8 (no dropout/bias/alibi/sink/sliding-window/positional
+            encoding, no LSE/softmax return and no backward pass). For FP8, pass
+            pre-quantized fp8 q/k/v with q_descale/k_descale/v_descale.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -821,7 +862,16 @@ def flash_attn_func(
             has_positional_encoding=q.shape[-1] != v.shape[-1],
         )
         assert reason is None, reason
-        return _gluon_flash_attn_forward(q, k, v, causal=causal, sm_scale=softmax_scale)
+        return _gluon_flash_attn_forward(
+            q,
+            k,
+            v,
+            causal=causal,
+            sm_scale=softmax_scale,
+            descale_q=q_descale,
+            descale_k=k_descale,
+            descale_v=v_descale,
+        )
 
     return _FlashAttnFunc.apply(
         q,
@@ -1074,6 +1124,9 @@ def flash_attn_varlen_func(
     block_table=None,
     out=None,
     sink=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
     config: Optional[dict[str, any]] = None,
     backend: Optional[str] = "triton",
 ):
@@ -1124,10 +1177,14 @@ def flash_attn_varlen_func(
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
         sink: (nheads,), attention sink scores (one per Q head), or None
+        q_descale, k_descale, v_descale: optional fp8 dequant scalars, honored only
+            by the "gluon" backend when q/k/v are fp8. Shapes (batch, num_q_heads)
+            for q and (batch, num_k_heads) for k/v; the output is fp32.
         backend: "triton" (default) or "gluon". The "gluon" backend runs the
             forward-only gfx950 Gluon kernel and only supports the base feature
-            set (no dropout/bias/alibi/sink/sliding-window/FP8/positional
-            encoding, no LSE/softmax return and no backward pass).
+            set plus FP8 (no dropout/bias/alibi/sink/sliding-window/positional
+            encoding, no LSE/softmax return and no backward pass). For FP8, pass
+            pre-quantized fp8 q/k/v with q_descale/k_descale/v_descale.
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -1168,6 +1225,9 @@ def flash_attn_varlen_func(
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            descale_q=q_descale,
+            descale_k=k_descale,
+            descale_v=v_descale,
         )
 
     return _FlashAttnVarlenFunc.apply(
