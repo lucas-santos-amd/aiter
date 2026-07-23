@@ -27,6 +27,9 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.mha_kernel_utils import (
+    _compute_fp8_scaling_factors,
+)
 
 
 @gluon.constexpr_function
@@ -146,13 +149,19 @@ def _attn_qk_nomask(
     mfmaLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     """QK^T + scale for one already-staged key block (no masking). k is already
     in its MFMA dot-operand layout; returns float32 scores in mfmaLayout. Split
     out so the caller can pipeline QK^T of block i+1 ahead of the softmax/P@V of
-    block i, overlapping the QK MFMA with the softmax."""
+    block i, overlapping the QK MFMA with the softmax.
+
+    For FP8 the QK^T uses the CDNA4 scaled MFMA (32x32x64)"""
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-    qk = gl.amd.cdna4.mfma(q, k, qk)
+    if IS_FP8:
+        qk = gl.amd.cdna4.mfma_scaled(q, None, "e4m3", k, None, "e4m3", qk)
+    else:
+        qk = gl.amd.cdna4.mfma(q, k, qk)
     return qk * qk_scale
 
 
@@ -173,10 +182,11 @@ def _attn_qk(
     BLOCK_N: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
     MASK_STEPS: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     """QK^T (+ scale + boundary/causal mask) for one already-staged key block.
     Masks are compiled out when MASK_STEPS / IS_CAUSAL are False."""
-    qk = _attn_qk_nomask(q, k, qk_scale, mfmaLayout, BLOCK_M, BLOCK_N)
+    qk = _attn_qk_nomask(q, k, qk_scale, mfmaLayout, BLOCK_M, BLOCK_N, IS_FP8)
 
     if MASK_STEPS or IS_CAUSAL:
         mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=mfmaLayout)
@@ -198,7 +208,20 @@ def _attn_qk(
 
 
 @gluon.jit
-def _attn_softmax_pv(acc, l_i, m_i, qk, v, dotP: gl.constexpr):
+def _attn_softmax_pv(
+    acc,
+    l_i,
+    m_i,
+    qk,
+    v,
+    descale_v,
+    dotP: gl.constexpr,
+    mfmaLayout: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_DMODEL_POW2: gl.constexpr,
+    IS_FP8: gl.constexpr,
+    FP8_MAX: gl.constexpr,
+):
     """Online-softmax rescale + P@V accumulation for one key block. qk holds the
     (masked) scores, v the value tile in dot-operand layout. Second half of one
     online-softmax step; returns updated (acc, l_i, m_i)."""
@@ -210,8 +233,17 @@ def _attn_softmax_pv(acc, l_i, m_i, qk, v, dotP: gl.constexpr):
 
     acc = acc * alpha[:, None]
 
-    p = gl.convert_layout(p.to(v.dtype), layout=dotP, assert_trivial=True)
-    acc = gl.amd.cdna4.mfma(p, v, acc)
+    if IS_FP8:
+        scale_p, descale_p = _compute_fp8_scaling_factors(p, FP8_MAX)
+        p = gl.convert_layout(
+            (p * scale_p).to(v.dtype), layout=dotP, assert_trivial=True
+        )
+        pv = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=mfmaLayout)
+        pv = gl.amd.cdna4.mfma_scaled(p, None, "e4m3", v, None, "e4m3", pv)
+        acc = acc + pv * (descale_p * descale_v)
+    else:
+        p = gl.convert_layout(p.to(v.dtype), layout=dotP, assert_trivial=True)
+        acc = gl.amd.cdna4.mfma(p, v, acc)
 
     l_i = l_i * alpha + l_ij
     m_i = m_ij
@@ -237,7 +269,11 @@ def _attn_fwd_inner(
     block_min,
     block_max,
     qk_scale,
+    descale_v,
     mfmaLayout: gl.constexpr,
+    dotK: gl.constexpr,
+    dotP: gl.constexpr,
+    dotV: gl.constexpr,
     kLoadLayout: gl.constexpr,
     vLoadLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
@@ -245,6 +281,8 @@ def _attn_fwd_inner(
     BLOCK_DMODEL: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
     NUM_KV_BUFFERS: gl.constexpr,
+    IS_FP8: gl.constexpr,
+    FP8_MAX: gl.constexpr,
 ):
     """QK-ahead software-pipelined online-softmax loop over full (unmasked) blocks.
 
@@ -263,16 +301,6 @@ def _attn_fwd_inner(
     # buffer_load_to_shared produces NaNs on the masked path,
     # so we use global_load_to_shared instead.
     USE_BUFFER_LOAD: gl.constexpr = not PADDED_HEAD
-
-    dotK: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfmaLayout, k_width=8
-    )
-    dotP: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfmaLayout, k_width=4
-    )
-    dotV: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfmaLayout, k_width=4
-    )
 
     n_iter = (block_max - block_min) // BLOCK_N
 
@@ -360,6 +388,7 @@ def _attn_fwd_inner(
         mfmaLayout=mfmaLayout,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        IS_FP8=IS_FP8,
     )
 
     # k_nxt holds block 1's keys for the first in-loop QK^T.
@@ -422,16 +451,43 @@ def _attn_fwd_inner(
                 mfmaLayout=mfmaLayout,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
+                IS_FP8=IS_FP8,
             )
 
             # (e) softmax + P@V for block i, overlapping the QK MFMA just issued.
             # Carry qk / keys forward one block.
-            acc, l_i, m_i = _attn_softmax_pv(acc, l_i, m_i, qk_cur, v_cur, dotP)
+            acc, l_i, m_i = _attn_softmax_pv(
+                acc,
+                l_i,
+                m_i,
+                qk_cur,
+                v_cur,
+                descale_v,
+                dotP,
+                mfmaLayout,
+                BLOCK_M,
+                BLOCK_DMODEL_POW2,
+                IS_FP8,
+                FP8_MAX,
+            )
             qk_cur = qk_nxt
             k_nxt = k_rd
         else:
             # Final block: pipeline drained, just the softmax + P@V remains.
-            acc, l_i, m_i = _attn_softmax_pv(acc, l_i, m_i, qk_cur, v_cur, dotP)
+            acc, l_i, m_i = _attn_softmax_pv(
+                acc,
+                l_i,
+                m_i,
+                qk_cur,
+                v_cur,
+                descale_v,
+                dotP,
+                mfmaLayout,
+                BLOCK_M,
+                BLOCK_DMODEL_POW2,
+                IS_FP8,
+                FP8_MAX,
+            )
 
     return acc, l_i, m_i
 
@@ -457,7 +513,11 @@ def _attn_fwd_inner_masked(
     n_extra_tokens,
     offs_m,
     qk_scale,
+    descale_v,
     mfmaLayout: gl.constexpr,
+    dotK: gl.constexpr,
+    dotP: gl.constexpr,
+    dotV: gl.constexpr,
     kLoadLayout: gl.constexpr,
     vLoadLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
@@ -466,22 +526,14 @@ def _attn_fwd_inner_masked(
     BLOCK_DMODEL_POW2: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
     MASK_STEPS: gl.constexpr,
+    IS_FP8: gl.constexpr,
+    FP8_MAX: gl.constexpr,
 ):
     """Non-pipelined online-softmax loop over the boundary / causal masked blocks.
     The masked tail is only a block or two, so the pipeline overhead is not worth it.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
     USE_BUFFER_LOAD: gl.constexpr = (not MASK_STEPS) and (not PADDED_HEAD)
-
-    dotK: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfmaLayout, k_width=8
-    )
-    dotP: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfmaLayout, k_width=4
-    )
-    dotV: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfmaLayout, k_width=4
-    )
 
     offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
 
@@ -533,8 +585,22 @@ def _attn_fwd_inner_masked(
             BLOCK_N=BLOCK_N,
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=MASK_STEPS,
+            IS_FP8=IS_FP8,
         )
-        acc, l_i, m_i = _attn_softmax_pv(acc, l_i, m_i, qk, v, dotP)
+        acc, l_i, m_i = _attn_softmax_pv(
+            acc,
+            l_i,
+            m_i,
+            qk,
+            v,
+            descale_v,
+            dotP,
+            mfmaLayout,
+            BLOCK_M,
+            BLOCK_DMODEL_POW2,
+            IS_FP8,
+            FP8_MAX,
+        )
 
     return acc, l_i, m_i
 
@@ -551,6 +617,7 @@ _attn_fwd_repr = make_kernel_repr(
         "VARLEN",
         "NUM_XCD",
         "USE_INT64_STRIDES",
+        "IS_FP8",
     ],
 )
 
@@ -561,6 +628,9 @@ def _attn_fwd(
     k_ptr,
     v_ptr,
     o_ptr,
+    descale_q_ptr,
+    descale_k_ptr,
+    descale_v_ptr,
     sm_scale,
     cu_seqlens_q,
     cu_seqlens_k,
@@ -582,6 +652,9 @@ def _attn_fwd(
     stride_oh_in,
     stride_om_in,
     stride_on_in,  #
+    stride_descale_q_z_in,
+    stride_descale_k_z_in,
+    stride_descale_v_z_in,
     NUM_Q_HEADS: gl.constexpr,
     NUM_K_HEADS: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
@@ -594,6 +667,8 @@ def _attn_fwd(
     PRELOAD_V: gl.constexpr,
     NUM_XCD: gl.constexpr,
     USE_INT64_STRIDES: gl.constexpr,
+    IS_FP8: gl.constexpr,
+    FP8_MAX: gl.constexpr,
     HEAD_STRIDE_ALIGNED_8: gl.constexpr = False,
     num_warps: gl.constexpr = 4,
 ):
@@ -620,6 +695,10 @@ def _attn_fwd(
         stride_vh = gl.cast(stride_vh_in, gl.int64)
         stride_vn = gl.cast(stride_vn_in, gl.int64)
         stride_vk = gl.cast(stride_vk_in, gl.int64)
+        if IS_FP8:
+            stride_descale_q_z = gl.cast(stride_descale_q_z_in, gl.int64)
+            stride_descale_k_z = gl.cast(stride_descale_k_z_in, gl.int64)
+            stride_descale_v_z = gl.cast(stride_descale_v_z_in, gl.int64)
         stride_oz = gl.cast(stride_oz_in, gl.int64)
         stride_oh = gl.cast(stride_oh_in, gl.int64)
         stride_om = gl.cast(stride_om_in, gl.int64)
@@ -637,6 +716,9 @@ def _attn_fwd(
         stride_vh = stride_vh_in
         stride_vn = stride_vn_in
         stride_vk = stride_vk_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
         stride_oz = stride_oz_in
         stride_oh = stride_oh_in
         stride_om = stride_om_in
@@ -671,43 +753,65 @@ def _attn_fwd(
     grp_sz: gl.constexpr = NUM_Q_HEADS // NUM_K_HEADS
     off_k_head = off_q_head // grp_sz
 
-    # One MFMA layout reused for both matmuls (QK^T and P@V).
+    if IS_FP8:
+        descale_q = gl.load(descale_q_ptr + off_z * stride_descale_q_z + off_q_head)
+        descale_k = gl.load(descale_k_ptr + off_z * stride_descale_k_z + off_k_head)
+        descale_v = gl.load(descale_v_ptr + off_z * stride_descale_v_z + off_k_head)
+    else:
+        descale_q = 1.0
+        descale_k = 1.0
+        descale_v = 1.0
+
+    MFMA_INSTR: gl.constexpr = [32, 32, 64] if IS_FP8 else [32, 32, 16]
     mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[32, 32, 16],
+        instr_shape=MFMA_INSTR,
         transposed=True,
         warps_per_cta=[num_warps, 1],
     )
+
+    K_WIDTH: gl.constexpr = 16 if IS_FP8 else 8
+    PV_K_WIDTH: gl.constexpr = 4
     dotQ: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfmaLayout, k_width=8
+        operand_index=0, parent=mfmaLayout, k_width=K_WIDTH
+    )
+    dotK: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfmaLayout, k_width=K_WIDTH
+    )
+    dotP: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfmaLayout, k_width=PV_K_WIDTH
+    )
+    dotV: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfmaLayout, k_width=PV_K_WIDTH
     )
 
-    # Coalesced global-load layouts, converted to the dot-operand layouts after
-    # loading. Sized to the padded head dim; the real head dim only drives the
-    # head-padding masks.
+    LOAD_VEC: gl.constexpr = 16 if IS_FP8 else 8
+    WARP_ELEMS: gl.constexpr = 64 * LOAD_VEC
     qLoadLayout: gl.constexpr = gl.BlockedLayout(
-        [1, 8],
-        [512 // BLOCK_DMODEL_POW2, BLOCK_DMODEL_POW2 // 8],
+        [1, LOAD_VEC],
+        [WARP_ELEMS // BLOCK_DMODEL_POW2, BLOCK_DMODEL_POW2 // LOAD_VEC],
         [num_warps, 1],
         [1, 0],
     )
     # K is read transposed as [BLOCK_DMODEL_POW2, BLOCK_N] (head dim contiguous).
     kLoadLayout: gl.constexpr = gl.BlockedLayout(
-        [8, 1],
-        [BLOCK_DMODEL_POW2 // 8, 512 // BLOCK_DMODEL_POW2],
+        [LOAD_VEC, 1],
+        [BLOCK_DMODEL_POW2 // LOAD_VEC, WARP_ELEMS // BLOCK_DMODEL_POW2],
         [1, num_warps],
         [0, 1],
     )
     vLoadLayout: gl.constexpr = gl.BlockedLayout(
-        [1, 8],
-        [512 // BLOCK_DMODEL_POW2, BLOCK_DMODEL_POW2 // 8],
+        [1, LOAD_VEC],
+        [WARP_ELEMS // BLOCK_DMODEL_POW2, BLOCK_DMODEL_POW2 // LOAD_VEC],
         [num_warps, 1],
         [1, 0],
     )
 
     # Swizzled shared layouts for the async global->LDS staging of K and V.
     _KV_SHARED: gl.constexpr = _make_kv_shared_layouts(
-        BLOCK_DMODEL_POW2, k_ptr.dtype.element_ty.primitive_bitwidth // 8
+        BLOCK_DMODEL_POW2,
+        k_ptr.dtype.element_ty.primitive_bitwidth // 8,
+        k_width=K_WIDTH,
     )
     kSharedLayout: gl.constexpr = _KV_SHARED[0]
     vSharedLayout: gl.constexpr = _KV_SHARED[1]
@@ -787,6 +891,8 @@ def _attn_fwd(
     acc = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=mfmaLayout)
 
     qk_scale = sm_scale * RCP_LN2
+    if IS_FP8:
+        qk_scale = qk_scale * descale_q * descale_k
 
     # Query positions used for the causal mask, in the MFMA result layout.
     offs_m = start_m * BLOCK_M + gl.arange(
@@ -867,7 +973,11 @@ def _attn_fwd(
             block_min,
             block_max,
             qk_scale,
+            descale_v,
             mfmaLayout=mfmaLayout,
+            dotK=dotK,
+            dotP=dotP,
+            dotV=dotV,
             kLoadLayout=kLoadLayout,
             vLoadLayout=vLoadLayout,
             BLOCK_M=BLOCK_M,
@@ -875,6 +985,8 @@ def _attn_fwd(
             BLOCK_DMODEL=BLOCK_DMODEL,
             BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
             NUM_KV_BUFFERS=NUM_KV_BUFFERS,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -903,7 +1015,11 @@ def _attn_fwd(
             n_extra_tokens,
             offs_m,
             qk_scale,
+            descale_v,
             mfmaLayout=mfmaLayout,
+            dotK=dotK,
+            dotP=dotP,
+            dotV=dotV,
             kLoadLayout=kLoadLayout,
             vLoadLayout=vLoadLayout,
             BLOCK_M=BLOCK_M,
@@ -912,6 +1028,8 @@ def _attn_fwd(
             BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=True,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
         )
 
     # epilogue: normalize and write
