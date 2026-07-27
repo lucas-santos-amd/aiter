@@ -8,6 +8,9 @@ import triton
 import triton.language as tl
 from packaging.version import Version
 
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+    _attn_fwd as _gluon_attn_fwd,
+)
 from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
@@ -16,10 +19,6 @@ from aiter.ops.triton.utils import types
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-
-from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
-    _attn_fwd as _gluon_attn_fwd,
-)
 
 _LOGGER = AiterTritonLogger()
 
@@ -35,6 +34,8 @@ _LOGGER = AiterTritonLogger()
 _GLUON_SUPPORTED_ARCHS = ("gfx950",)
 _TRITON_GE_36 = Version(triton.__version__) >= Version("3.6.0")
 
+_USE_FUSED_BWD_KERNEL = False
+
 
 def is_gluon_available() -> bool:
     """True when the Gluon MHA forward kernel can actually run on this device."""
@@ -47,10 +48,39 @@ def is_gluon_available() -> bool:
         return False
 
 
+def mha_set_use_fused_bwd_kernel(value: bool):
+    """
+    Set whether to use fused backward kernel (with atomics) or one-kernel backward (without atomics).
+    Fused backward is faster but doesn't support positional encoding.
+    """
+    global _USE_FUSED_BWD_KERNEL
+    _USE_FUSED_BWD_KERNEL = value
+
+
+_MHA_IMPL: Literal["default", "dao_ai"] = "default"
+
+
+def mha_set_impl(impl: Literal["default", "dao_ai"]):
+    """Set MHA forward implementation: 'default' (_attn_fwd) or 'dao_ai' (flash_attn_triton_amd)."""
+    global _MHA_IMPL
+    _MHA_IMPL = impl
+
+
+_USE_INT64_STRIDES = True
+
+
+def mha_set_use_int64_strides(value: bool):
+    """Use 64-bit integer strides to prevent integer overflows with very large tensors."""
+    global _USE_INT64_STRIDES
+    _USE_INT64_STRIDES = value
+
+
+def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
+    return max(int(window_size[0]), 0)
+
+
 def gluon_forward_unsupported_reason(
     *,
-    head_dim=None,
-    num_k_heads=None,
     dropout_p: float = 0.0,
     window_size=(-1, -1),
     bias=None,
@@ -58,13 +88,12 @@ def gluon_forward_unsupported_reason(
     sink=None,
     return_lse: bool = False,
     return_attn_probs: bool = False,
-    is_fp8: bool = False,
     has_positional_encoding: bool = False,
     block_table=None,
 ):
     """Reason (str) why the Gluon forward backend can't serve this config, else None.
 
-    Pass the feature flags and, optionally, ``head_dim`` / ``num_k_heads`` for the shape checks.
+    Pass the feature flags for the support checks.
     """
     if not is_gluon_available():
         return (
@@ -89,20 +118,6 @@ def gluon_forward_unsupported_reason(
         return "Gluon MHA backend does not support positional encoding"
     if block_table is not None:
         return "Gluon MHA backend does not support paged KV (block_table)"
-    if head_dim is not None:
-        # The kernel rounds head_dim up to a multiple of 8 (see
-        # _gluon_flash_attn_forward), then pads that up to a power of 2 (>=16)
-        # for the MFMA tile. Known-bug: a padded head whose (rounded) per-head
-        # size is not a multiple of 16 elements fails to legalize the masked
-        # async global->LDS copy during compilation on gfx950.
-        min_pad = 64 if is_fp8 else 16
-        head_dim = head_dim + (-head_dim % 8)
-        padded_head = head_dim != max(triton.next_power_of_2(head_dim), min_pad)
-        if padded_head and head_dim % 16 != 0:
-            return (
-                "Gluon MHA backend: padded head_dim that is not 16-element-aligned "
-                f"(head_dim={head_dim}) is currently broken"
-            )
     return None
 
 
@@ -171,8 +186,7 @@ def _gluon_flash_attn_forward(
         )
         # The scaled f8f6f4 MFMA is 32x32x64 (K=64), so the P@V contraction
         # (BLOCK_N) must be a multiple of 64.
-        if BLOCK_N < 64:
-            BLOCK_N = 64
+        BLOCK_N = max(BLOCK_N, 64)
 
     if varlen:
         _, num_q_heads, head_dim = q.shape
@@ -240,10 +254,10 @@ def _gluon_flash_attn_forward(
         cu_seqlens_k,
         seqlen_q,
         seqlen_k,
-        *q_strides,  #
-        *k_strides,  #
-        *v_strides,  #
-        *o_strides,  #
+        *q_strides,
+        *k_strides,
+        *v_strides,
+        *o_strides,
         descale_q.stride(0) if descale_q is not None else 0,
         descale_k.stride(0) if descale_k is not None else 0,
         descale_v.stride(0) if descale_v is not None else 0,
@@ -272,40 +286,6 @@ def _gluon_flash_attn_forward(
         o_provided.copy_(o)
         o = o_provided
     return o
-
-
-_USE_FUSED_BWD_KERNEL = False
-
-
-def mha_set_use_fused_bwd_kernel(value: bool):
-    """
-    Set whether to use fused backward kernel (with atomics) or one-kernel backward (without atomics).
-    Fused backward is faster but doesn't support positional encoding.
-    """
-    global _USE_FUSED_BWD_KERNEL
-    _USE_FUSED_BWD_KERNEL = value
-
-
-_MHA_IMPL: Literal["default", "dao_ai"] = "default"
-
-
-def mha_set_impl(impl: Literal["default", "dao_ai"]):
-    """Set MHA forward implementation: 'default' (_attn_fwd) or 'dao_ai' (flash_attn_triton_amd)."""
-    global _MHA_IMPL
-    _MHA_IMPL = impl
-
-
-_USE_INT64_STRIDES = True
-
-
-def mha_set_use_int64_strides(value: bool):
-    """Use 64-bit integer strides to prevent integer overflows with very large tensors."""
-    global _USE_INT64_STRIDES
-    _USE_INT64_STRIDES = value
-
-
-def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
-    return max(int(window_size[0]), 0)
 
 
 def _flash_attn_forward(
@@ -849,8 +829,6 @@ def flash_attn_func(
 
     if backend == "gluon":
         reason = gluon_forward_unsupported_reason(
-            head_dim=q.shape[-1],
-            num_k_heads=k.shape[-2],
             dropout_p=dropout_p,
             window_size=window_size,
             bias=bias,
@@ -858,7 +836,6 @@ def flash_attn_func(
             sink=sink,
             return_lse=return_lse,
             return_attn_probs=return_attn_probs,
-            is_fp8=types._is_fp8(q),
             has_positional_encoding=q.shape[-1] != v.shape[-1],
         )
         assert reason is None, reason
@@ -1200,8 +1177,6 @@ def flash_attn_varlen_func(
 
     if backend == "gluon":
         reason = gluon_forward_unsupported_reason(
-            head_dim=q.shape[-1],
-            num_k_heads=k.shape[-2],
             dropout_p=dropout_p,
             window_size=window_size,
             bias=bias,
@@ -1209,7 +1184,6 @@ def flash_attn_varlen_func(
             sink=sink,
             return_lse=return_lse,
             return_attn_probs=return_attn_probs,
-            is_fp8=types._is_fp8(q),
             has_positional_encoding=q.shape[-1] != v.shape[-1],
             block_table=block_table,
         )

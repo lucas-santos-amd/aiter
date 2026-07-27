@@ -25,26 +25,23 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
 )
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 
 
 @gluon.constexpr_function
 def _make_kv_shared_layouts(
     head_dim_pow2, elem_bytes, k_width=8, non_k_dim=16, banks=64
 ):
-    """Swizzled LDS layouts for the async K/V staging tiles."""
+    """Swizzled LDS layouts for the K/V staging tiles."""
     bank_line_bytes = banks * 4
     bank_line_elems = bank_line_bytes // elem_bytes
     read_vec_bytes = min(k_width * elem_bytes, 16)
     num_threads_same_cycle = bank_line_bytes // read_vec_bytes
     per_phase = (bank_line_elems + head_dim_pow2 - 1) // head_dim_pow2
-    # The swizzle vector can't exceed the ds_read width (read_vec_bytes): a wider
-    # vector isn't realized by the hardware read and only inflates the layout,
-    # which at small head dims collapses max_phase to 1
     swizzle_vec = min(k_width * max(1, per_phase // 2), read_vec_bytes // elem_bytes)
     max_phase = min(
         min(non_k_dim, num_threads_same_cycle) // per_phase,
@@ -56,89 +53,78 @@ def _make_kv_shared_layouts(
 
 
 @gluon.jit
-def _async_load_fn(smem, base, offsets):
-    """Unmasked async global->LDS copy. Only for fully in-range tiles; masked
-    tiles use _async_load_masked_fn. Caller owns commit_group / wait_group."""
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(smem, base, offsets)
-
-
-@gluon.jit
-def _async_load_masked_fn(
-    smem, base, offsets, offset_first, offset_second, boundary_first, boundary_second
+def _buffer_load_2d(
+    base, offsets, offset_first, offset_second, boundary_first, boundary_second
 ):
-    """Masked async global->LDS copy. Masked lanes read other=0 so out-of-range
-    key columns / head-dim padding contribute 0 to the matmuls. Each axis is
-    masked only when its offset tensor is not None. Caller owns commit/wait."""
-    ptrs = base + offsets
+    """buffer_load of one tile into registers; masked lanes read 0."""
     if offset_first is not None and offset_second is not None:
         mask = (offset_first[:, None] < boundary_first) & (
             offset_second[None, :] < boundary_second
         )
-        gl.amd.cdna4.async_copy.global_load_to_shared(smem, ptrs, mask=mask, other=0.0)
+        tile = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets, mask=mask, other=0.0)
     elif offset_first is not None:
         mask = offset_first[:, None] < boundary_first
-        gl.amd.cdna4.async_copy.global_load_to_shared(smem, ptrs, mask=mask, other=0.0)
+        tile = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets, mask=mask, other=0.0)
     elif offset_second is not None:
         mask = offset_second[None, :] < boundary_second
-        gl.amd.cdna4.async_copy.global_load_to_shared(smem, ptrs, mask=mask, other=0.0)
+        tile = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets, mask=mask, other=0.0)
     else:
-        gl.amd.cdna4.async_copy.global_load_to_shared(smem, ptrs)
+        tile = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets)
+    return tile
 
 
 @gluon.jit
-def _issue_kv_copy(
-    smemK_buf,
-    smemV_buf,
+def _load_k(
     k_base,
-    v_base,
     k_offsets,
-    v_offsets,
-    copy_start_n,
+    load_start_n,
     seqlen_k,
     kLoadLayout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_DMODEL: gl.constexpr,
+    BLOCK_DMODEL_POW2: gl.constexpr,
+    MASK_STEPS: gl.constexpr,
+    PADDED_HEAD: gl.constexpr,
+):
+    """buffer_load one K block ([BLOCK_DMODEL_POW2, BLOCK_N]) into registers."""
+    k_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kLoadLayout))
+    k_offs_d = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, kLoadLayout))
+    if MASK_STEPS:
+        k_n = load_start_n + k_offs_n
+    else:
+        k_n = None
+    if PADDED_HEAD:
+        k_d = k_offs_d
+    else:
+        k_d = None
+    return _buffer_load_2d(k_base, k_offsets, k_d, k_n, BLOCK_DMODEL, seqlen_k)
+
+
+@gluon.jit
+def _load_v(
+    v_base,
+    v_offsets,
+    load_start_n,
+    seqlen_k,
     vLoadLayout: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
-    USE_BUFFER_LOAD: gl.constexpr,
     MASK_STEPS: gl.constexpr,
     PADDED_HEAD: gl.constexpr,
 ):
-    """Issue the async global->LDS copies of one K and one V key block into the
-    given buffer slots. K is staged as [BLOCK_DMODEL_POW2, BLOCK_N], V as
-    [BLOCK_N, BLOCK_DMODEL_POW2]. Copy_start_n is the tile's key-block
-    start (used for the n-axis mask). Caller owns commit/wait."""
-
-    # buffer_load_to_shared produces NaNs on the masked path,
-    # so we use global_load_to_shared instead.
-    if USE_BUFFER_LOAD:
-        _async_load_fn(smemK_buf, k_base, k_offsets)
-        _async_load_fn(smemV_buf, v_base, v_offsets)
+    """buffer_load one V block ([BLOCK_N, BLOCK_DMODEL_POW2]) into registers."""
+    v_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, vLoadLayout))
+    v_offs_d = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, vLoadLayout))
+    if MASK_STEPS:
+        v_n = load_start_n + v_offs_n
     else:
-        # n-axis masked only on boundary blocks, head-dim only when padded
-        # (None => that axis is unmasked).
-        offs_kn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kLoadLayout))
-        offs_vn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, vLoadLayout))
-        offs_kd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, kLoadLayout))
-        offs_vd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, vLoadLayout))
-        if MASK_STEPS:
-            k_offs_n = copy_start_n + offs_kn
-            v_offs_n = copy_start_n + offs_vn
-        else:
-            k_offs_n = None
-            v_offs_n = None
-        if PADDED_HEAD:
-            k_offs_d = offs_kd
-            v_offs_d = offs_vd
-        else:
-            k_offs_d = None
-            v_offs_d = None
-        _async_load_masked_fn(
-            smemK_buf, k_base, k_offsets, k_offs_d, k_offs_n, BLOCK_DMODEL, seqlen_k
-        )
-        _async_load_masked_fn(
-            smemV_buf, v_base, v_offsets, v_offs_n, v_offs_d, seqlen_k, BLOCK_DMODEL
-        )
+        v_n = None
+    if PADDED_HEAD:
+        v_d = v_offs_d
+    else:
+        v_d = None
+    return _buffer_load_2d(v_base, v_offsets, v_n, v_d, seqlen_k, BLOCK_DMODEL)
 
 
 @gluon.jit
@@ -184,16 +170,14 @@ def _attn_qk(
     MASK_STEPS: gl.constexpr,
     IS_FP8: gl.constexpr,
 ):
-    """QK^T (+ scale + boundary/causal mask) for one already-staged key block.
-    Masks are compiled out when MASK_STEPS / IS_CAUSAL are False."""
+    """QK^T (+ scale + boundary/causal mask) for one key block."""
     qk = _attn_qk_nomask(q, k, qk_scale, mfmaLayout, BLOCK_M, BLOCK_N, IS_FP8)
 
     if MASK_STEPS or IS_CAUSAL:
         mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=mfmaLayout)
         if MASK_STEPS:
             # Only the last visible block can be partial (seqlen_k not a multiple
-            # of BLOCK_N). mask_partial is selected via bound_cond to stay
-            # branch-free.
+            # of BLOCK_N).
             bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
             size_n = start_n + offs_n
             mask_partial = size_n[None, :] < seqlen_k
@@ -222,9 +206,8 @@ def _attn_softmax_pv(
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
 ):
-    """Online-softmax rescale + P@V accumulation for one key block. qk holds the
-    (masked) scores, v the value tile in dot-operand layout. Second half of one
-    online-softmax step; returns updated (acc, l_i, m_i)."""
+    """Online-softmax rescale + P@V accumulation for one key block.
+    Returns updated (acc, l_i, m_i)."""
 
     m_ij = gl.maximum(m_i, gl.max(qk, 1))
     p = gl.exp2(qk - m_ij[:, None])
@@ -285,102 +268,68 @@ def _attn_fwd_inner(
     FP8_MAX: gl.constexpr,
 ):
     """QK-ahead software-pipelined online-softmax loop over full (unmasked) blocks.
-
-    4-stage pipeline running four blocks' work concurrently. Iteration i issues::
-
-        copy(i+3)  ->  readK(i+2)  ->  QK(i+1)  ->  readV(i) + softmax+P@V(i)
-        (HBM->LDS)     (LDS->reg)      (MFMA)      (LDS->reg)  (VALU + MFMA)
-
-    Block i+3's async copy is in flight; block i+2's keys are read a full iteration
-    before their QK^T to hide ds_read latency; QK^T(i+1) is issued from the carried
-    k_nxt ahead of softmax(i) so the MFMA overlaps the softmax VALU.
-    Only qk_cur (block i) and k_nxt (block i+1) are loop carried.
+    The loop is pipelined so that the softmax+P@V of block i can overlap the QK^T of block i+1.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
 
-    # buffer_load_to_shared produces NaNs on the masked path,
-    # so we use global_load_to_shared instead.
-    USE_BUFFER_LOAD: gl.constexpr = not PADDED_HEAD
-
     n_iter = (block_max - block_min) // BLOCK_N
 
-    # Prologue: stage the first three blocks into LDS, read keys of blocks 0/1
-    # and compute QK^T(0). Enter the loop with qk_cur = QK(0), k_nxt = K(1) and
-    # block 2's copy in flight.
-    _issue_kv_copy(
-        smemK.index(0),
-        smemV.index(0),
+    k_tile = _load_k(
         k_base,
-        v_base,
         k_offsets,
-        v_offsets,
         block_min,
         seqlen_k,
         kLoadLayout,
+        BLOCK_N,
+        BLOCK_DMODEL,
+        BLOCK_DMODEL_POW2,
+        False,
+        PADDED_HEAD,
+    )
+    v_tile = _load_v(
+        v_base,
+        v_offsets,
+        block_min,
+        seqlen_k,
         vLoadLayout,
         BLOCK_N,
         BLOCK_DMODEL,
         BLOCK_DMODEL_POW2,
-        USE_BUFFER_LOAD,
         False,
         PADDED_HEAD,
     )
-    gl.amd.cdna4.async_copy.commit_group()
-    k_base += BLOCK_N * stride_kn
-    v_base += BLOCK_N * stride_vn
+    smemK.index(0).store(k_tile)
+    smemV.index(0).store(v_tile)
+    k = smemK.index(0).load(dotK)
 
     if n_iter > 1:
-        _issue_kv_copy(
-            smemK.index(1),
-            smemV.index(1),
-            k_base,
-            v_base,
+        k_tile = _load_k(
+            k_base + BLOCK_N * stride_kn,
             k_offsets,
-            v_offsets,
             block_min + BLOCK_N,
             seqlen_k,
             kLoadLayout,
-            vLoadLayout,
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
-            USE_BUFFER_LOAD,
             False,
             PADDED_HEAD,
         )
-        gl.amd.cdna4.async_copy.commit_group()
-        k_base += BLOCK_N * stride_kn
-        v_base += BLOCK_N * stride_vn
-
-    if n_iter > 2:
-        _issue_kv_copy(
-            smemK.index(2),
-            smemV.index(2),
-            k_base,
-            v_base,
-            k_offsets,
+        v_tile = _load_v(
+            v_base + BLOCK_N * stride_vn,
             v_offsets,
-            block_min + 2 * BLOCK_N,
+            block_min + BLOCK_N,
             seqlen_k,
-            kLoadLayout,
             vLoadLayout,
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
-            USE_BUFFER_LOAD,
             False,
             PADDED_HEAD,
         )
-        gl.amd.cdna4.async_copy.commit_group()
-        k_base += BLOCK_N * stride_kn
-        v_base += BLOCK_N * stride_vn
-        # blocks 0,1 ready; block 2's copy stays in flight (read at iteration 0).
-        gl.amd.cdna4.async_copy.wait_group(1)
-    else:
-        # <=2 blocks: no block-2 copy, drain everything.
-        gl.amd.cdna4.async_copy.wait_group(0)
+        smemK.index(1).store(k_tile)
+        smemV.index(1).store(v_tile)
 
-    k = smemK.index(0).load(dotK)
     qk_cur = _attn_qk_nomask(
         q,
         k,
@@ -391,103 +340,184 @@ def _attn_fwd_inner(
         IS_FP8=IS_FP8,
     )
 
-    # k_nxt holds block 1's keys for the first in-loop QK^T.
+    if n_iter > 2:
+        k_tile = _load_k(
+            k_base + 2 * BLOCK_N * stride_kn,
+            k_offsets,
+            block_min + 2 * BLOCK_N,
+            seqlen_k,
+            kLoadLayout,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            False,
+            PADDED_HEAD,
+        )
+        smemK.index(0).store(k_tile)
+
+    for i in range(n_iter - 3):
+        k_buf = (i + 1) % NUM_KV_BUFFERS
+        v_buf = i % NUM_KV_BUFFERS
+
+        # Read K i+1 and V i out of LDS.
+        k_nxt = smemK.index(k_buf).load(dotK)
+        v_cur = smemV.index(v_buf).load(dotV)
+
+        # Issue K i+3 / V i+2
+        k_pf = _load_k(
+            k_base + (i + 3) * BLOCK_N * stride_kn,
+            k_offsets,
+            block_min + (i + 3) * BLOCK_N,
+            seqlen_k,
+            kLoadLayout,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            False,
+            PADDED_HEAD,
+        )
+        v_pf = _load_v(
+            v_base + (i + 2) * BLOCK_N * stride_vn,
+            v_offsets,
+            block_min + (i + 2) * BLOCK_N,
+            seqlen_k,
+            vLoadLayout,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            False,
+            PADDED_HEAD,
+        )
+
+        # QK^T i+1
+        qk_nxt = _attn_qk_nomask(
+            q,
+            k_nxt,
+            qk_scale,
+            mfmaLayout=mfmaLayout,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            IS_FP8=IS_FP8,
+        )
+
+        # Stage K i+3 / V i+2 back into the buffers read at the top.
+        smemK.index(k_buf).store(k_pf)
+        smemV.index(v_buf).store(v_pf)
+
+        # softmax + P@V i
+        acc, l_i, m_i = _attn_softmax_pv(
+            acc,
+            l_i,
+            m_i,
+            qk_cur,
+            v_cur,
+            descale_v,
+            dotP,
+            mfmaLayout,
+            BLOCK_M,
+            BLOCK_DMODEL_POW2,
+            IS_FP8,
+            FP8_MAX,
+        )
+
+        qk_cur = qk_nxt
+
+    # Block n_iter-3
+    if n_iter > 2:
+        k_buf = (n_iter - 2) % NUM_KV_BUFFERS
+        v_buf = (n_iter - 3) % NUM_KV_BUFFERS
+
+        k_nxt = smemK.index(k_buf).load(dotK)
+        v_cur = smemV.index(v_buf).load(dotV)
+
+        # V's last block
+        v_pf = _load_v(
+            v_base + (n_iter - 1) * BLOCK_N * stride_vn,
+            v_offsets,
+            block_min + (n_iter - 1) * BLOCK_N,
+            seqlen_k,
+            vLoadLayout,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            False,
+            PADDED_HEAD,
+        )
+
+        qk_nxt = _attn_qk_nomask(
+            q,
+            k_nxt,
+            qk_scale,
+            mfmaLayout=mfmaLayout,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            IS_FP8=IS_FP8,
+        )
+
+        acc, l_i, m_i = _attn_softmax_pv(
+            acc,
+            l_i,
+            m_i,
+            qk_cur,
+            v_cur,
+            descale_v,
+            dotP,
+            mfmaLayout,
+            BLOCK_M,
+            BLOCK_DMODEL_POW2,
+            IS_FP8,
+            FP8_MAX,
+        )
+
+        smemV.index(v_buf).store(v_pf)
+
+        qk_cur = qk_nxt
+
+    # Block n_iter-2, QK-ahead of the final block
     if n_iter > 1:
-        k_nxt = smemK.index(1).load(dotK)
-    else:
-        k_nxt = k
+        k_nxt = smemK.index((n_iter - 1) % NUM_KV_BUFFERS).load(dotK)
+        v_cur = smemV.index((n_iter - 2) % NUM_KV_BUFFERS).load(dotV)
+        qk_nxt = _attn_qk_nomask(
+            q,
+            k_nxt,
+            qk_scale,
+            mfmaLayout=mfmaLayout,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            IS_FP8=IS_FP8,
+        )
+        acc, l_i, m_i = _attn_softmax_pv(
+            acc,
+            l_i,
+            m_i,
+            qk_cur,
+            v_cur,
+            descale_v,
+            dotP,
+            mfmaLayout,
+            BLOCK_M,
+            BLOCK_DMODEL_POW2,
+            IS_FP8,
+            FP8_MAX,
+        )
+        qk_cur = qk_nxt
 
-    for i in range(0, n_iter):
-        # V(i): read early so the ds_read overlaps the QK MFMA + softmax VALU
-        # before P@V consumes it.
-        v_cur = smemV.index(i % NUM_KV_BUFFERS).load(dotV)
-
-        if i + 1 < n_iter:
-            # (a) global prefetch: async-copy block i+3. Its buffer last held
-            # block i-1, so there is a one-iteration WAR margin.
-            if i + 3 < n_iter:
-                g_idx = (i + 3) % NUM_KV_BUFFERS
-                _issue_kv_copy(
-                    smemK.index(g_idx),
-                    smemV.index(g_idx),
-                    k_base,
-                    v_base,
-                    k_offsets,
-                    v_offsets,
-                    block_min + (i + 3) * BLOCK_N,
-                    seqlen_k,
-                    kLoadLayout,
-                    vLoadLayout,
-                    BLOCK_N,
-                    BLOCK_DMODEL,
-                    BLOCK_DMODEL_POW2,
-                    USE_BUFFER_LOAD,
-                    False,
-                    PADDED_HEAD,
-                )
-                gl.amd.cdna4.async_copy.commit_group()
-                k_base += BLOCK_N * stride_kn
-                v_base += BLOCK_N * stride_vn
-
-            # (b) wait for block i+2's copy to land before reading its keys.
-            if i + 3 < n_iter:
-                gl.amd.cdna4.async_copy.wait_group(1)
-            elif i + 2 < n_iter:
-                gl.amd.cdna4.async_copy.wait_group(0)
-
-            # (c) local K prefetch: read block i+2's keys a full iteration ahead
-            # of its QK^T so the ds_read is hidden.
-            if i + 2 < n_iter:
-                k_rd = smemK.index((i + 2) % NUM_KV_BUFFERS).load(dotK)
-            else:
-                # No block i+2: keep k_rd defined (unused past this iteration).
-                k_rd = k_nxt
-
-            # (d) QK^T of block i+1 from the resident k_nxt, ahead of softmax(i).
-            qk_nxt = _attn_qk_nomask(
-                q,
-                k_nxt,
-                qk_scale,
-                mfmaLayout=mfmaLayout,
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
-                IS_FP8=IS_FP8,
-            )
-
-            # (e) softmax + P@V for block i, overlapping the QK MFMA just issued.
-            # Carry qk / keys forward one block.
-            acc, l_i, m_i = _attn_softmax_pv(
-                acc,
-                l_i,
-                m_i,
-                qk_cur,
-                v_cur,
-                descale_v,
-                dotP,
-                mfmaLayout,
-                BLOCK_M,
-                BLOCK_DMODEL_POW2,
-                IS_FP8,
-                FP8_MAX,
-            )
-            qk_cur = qk_nxt
-            k_nxt = k_rd
-        else:
-            # Final block: pipeline drained, just the softmax + P@V remains.
-            acc, l_i, m_i = _attn_softmax_pv(
-                acc,
-                l_i,
-                m_i,
-                qk_cur,
-                v_cur,
-                descale_v,
-                dotP,
-                mfmaLayout,
-                BLOCK_M,
-                BLOCK_DMODEL_POW2,
-                IS_FP8,
-                FP8_MAX,
-            )
+    # Final block (n_iter - 1)
+    v_cur = smemV.index((n_iter - 1) % NUM_KV_BUFFERS).load(dotV)
+    acc, l_i, m_i = _attn_softmax_pv(
+        acc,
+        l_i,
+        m_i,
+        qk_cur,
+        v_cur,
+        descale_v,
+        dotP,
+        mfmaLayout,
+        BLOCK_M,
+        BLOCK_DMODEL_POW2,
+        IS_FP8,
+        FP8_MAX,
+    )
 
     return acc, l_i, m_i
 
@@ -533,36 +563,40 @@ def _attn_fwd_inner_masked(
     The masked tail is only a block or two, so the pipeline overhead is not worth it.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
-    USE_BUFFER_LOAD: gl.constexpr = (not MASK_STEPS) and (not PADDED_HEAD)
 
     offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
 
     n_iter = (block_max - block_min) // BLOCK_N
 
-    for i in range(0, n_iter):
+    for i in range(n_iter):
         start_n = block_min + i * BLOCK_N
 
-        # Stage this block into buffer 0 and wait before reading.
-        _issue_kv_copy(
-            smemK.index(0),
-            smemV.index(0),
+        k_tile = _load_k(
             k_base,
-            v_base,
             k_offsets,
-            v_offsets,
             start_n,
             seqlen_k,
             kLoadLayout,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            MASK_STEPS,
+            PADDED_HEAD,
+        )
+        v_tile = _load_v(
+            v_base,
+            v_offsets,
+            start_n,
+            seqlen_k,
             vLoadLayout,
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
-            USE_BUFFER_LOAD,
             MASK_STEPS,
             PADDED_HEAD,
         )
-        gl.amd.cdna4.async_copy.commit_group()
-        gl.amd.cdna4.async_copy.wait_group(0)
+        smemK.index(0).store(k_tile)
+        smemV.index(0).store(v_tile)
         k_base += BLOCK_N * stride_kn
         v_base += BLOCK_N * stride_vn
 
@@ -639,19 +673,19 @@ def _attn_fwd(
     stride_qz_in,
     stride_qh_in,
     stride_qm_in,
-    stride_qk_in,  #
+    stride_qk_in,
     stride_kz_in,
     stride_kh_in,
     stride_kn_in,
-    stride_kk_in,  #
+    stride_kk_in,
     stride_vz_in,
     stride_vh_in,
     stride_vn_in,
-    stride_vk_in,  #
+    stride_vk_in,
     stride_oz_in,
     stride_oh_in,
     stride_om_in,
-    stride_on_in,  #
+    stride_on_in,
     stride_descale_q_z_in,
     stride_descale_k_z_in,
     stride_descale_v_z_in,
@@ -807,7 +841,8 @@ def _attn_fwd(
         [1, 0],
     )
 
-    # Swizzled shared layouts for the async global->LDS staging of K and V.
+    # Swizzled shared layouts for the reg->LDS staging of K and V (conflict-free
+    # ds_write / ds_read).
     _KV_SHARED: gl.constexpr = _make_kv_shared_layouts(
         BLOCK_DMODEL_POW2,
         k_ptr.dtype.element_ty.primitive_bitwidth // 8,
@@ -867,9 +902,8 @@ def _attn_fwd(
         gl.int32
     )
 
-    # Shared-memory tiles for the async K/V staging. Quad-buffered for
-    # _attn_fwd_inner's 4-stage pipeline (four blocks live per iteration).
-    NUM_KV_BUFFERS: gl.constexpr = 4
+    # Shared-memory tiles for the K/V staging.
+    NUM_KV_BUFFERS: gl.constexpr = 2
     smemK = gl.allocate_shared_memory(
         k_ptr.dtype.element_ty,
         [NUM_KV_BUFFERS, BLOCK_DMODEL_POW2, BLOCK_N],

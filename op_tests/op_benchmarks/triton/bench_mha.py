@@ -13,7 +13,6 @@ from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
-    gluon_forward_unsupported_reason,
     mha_set_impl,
     mha_set_use_fused_bwd_kernel,
 )
@@ -585,21 +584,10 @@ def run_benchmark(run: BenchRun):
             if is_bwd or is_decode:
                 warnings.warn("Skipping: Gluon backend only supports fwd / fwd_varlen.")
                 return 0
-            if dtype == "fp8":
-                warnings.warn("Skipping: Gluon backend does not support fp8.")
-                return 0
             if has_pe or run.sink or has_sliding_window:
                 warnings.warn(
                     "Skipping: Gluon backend does not support PE, sink, or sliding window."
                 )
-                return 0
-            # Catch shape configs the kernel can't compile (e.g. a padded head_dim
-            # with a non-16-element-aligned KV stride) before launching
-            gluon_reason = gluon_forward_unsupported_reason(
-                head_dim=D_HEAD, num_k_heads=HK
-            )
-            if gluon_reason:
-                warnings.warn(f"Skipping: {gluon_reason}")
                 return 0
         mha_set_use_fused_bwd_kernel(fused)
         make_fn = get_make_fn(function, dtype)
