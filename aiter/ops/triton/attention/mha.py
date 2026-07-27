@@ -41,11 +41,8 @@ def is_gluon_available() -> bool:
     """True when the Gluon MHA forward kernel can actually run on this device."""
     if not _TRITON_GE_36:
         return False
-    try:
-        arch = get_arch() or ""
-        return any(supported in arch for supported in _GLUON_SUPPORTED_ARCHS)
-    except Exception:
-        return False
+    arch = get_arch() or ""
+    return any(supported in arch for supported in _GLUON_SUPPORTED_ARCHS)
 
 
 def mha_set_use_fused_bwd_kernel(value: bool):

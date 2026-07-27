@@ -1076,7 +1076,7 @@ def _attn_fwd(
     end_m_idx = (start_m + 1) * BLOCK_M
     start_m_idx = start_m * BLOCK_M
     causal_start_idx = seqlen_q - seqlen_k
-    if IS_CAUSAL:
+    if IS_CAUSAL:  # noqa: SIM102
         if (causal_start_idx > start_m_idx) and (causal_start_idx < end_m_idx):
             out_mask_boundary = gl.full(
                 [BLOCK_DMODEL_POW2],
