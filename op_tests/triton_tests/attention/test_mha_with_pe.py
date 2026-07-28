@@ -7,6 +7,7 @@ import torch
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
+    gluon_forward_unsupported_reason,
     mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -20,6 +21,15 @@ from op_tests.triton_tests.attention.mha_test_utils import pad_rearrange_dropout
 arch = get_arch()
 
 
+def _skip_if_gluon_unsupported(backend: str, **feature_flags):
+    """Skip forward tests the Gluon backend can't run."""
+    if backend != "gluon":
+        return
+    reason = gluon_forward_unsupported_reason(**feature_flags)
+    if reason:
+        pytest.skip(reason)
+
+
 @pytest.mark.parametrize("BATCH", [1, 3])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -29,6 +39,7 @@ arch = get_arch()
 @pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(128, 64), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.25])
 @pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
@@ -39,10 +50,16 @@ def test_mha_with_pe(
     HEAD_SZ_V: int,
     DROPOUT: float,
     CAUSAL: bool,
+    backend: str,
 ):
     HAS_DROPOUT: bool = DROPOUT > 0.0
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
+
+    _skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+    )
 
     # TODO: Enable these test cases once this is fixed
     if arch == "gfx942" and (CAUSAL or HAS_DROPOUT):
@@ -72,6 +89,7 @@ def test_mha_with_pe(
         causal=CAUSAL,
         return_lse=HAS_DROPOUT,
         return_attn_probs=HAS_DROPOUT,
+        backend=backend,
     )
     if HAS_DROPOUT:
         assert len(triton_out) == 3
@@ -102,6 +120,7 @@ def test_mha_with_pe(
 @pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(96, 64), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.17])
 @pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_varlen_with_pe(
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -111,11 +130,17 @@ def test_mha_varlen_with_pe(
     HEAD_SZ_V: int,
     DROPOUT: float,
     CAUSAL: bool,
+    backend: str,
 ):
     BATCH = 5
     HAS_DROPOUT: bool = DROPOUT > 0.0
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
+
+    _skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+    )
 
     # TODO: Enable these test cases once this is fixed
     if arch == "gfx942" and (CAUSAL or HAS_DROPOUT):
@@ -166,6 +191,7 @@ def test_mha_varlen_with_pe(
         causal=CAUSAL,
         return_lse=HAS_DROPOUT,
         return_attn_probs=HAS_DROPOUT,
+        backend=backend,
     )
     if HAS_DROPOUT:
         assert len(triton_out) == 3

@@ -52,6 +52,25 @@ def _make_kv_shared_layouts(
     return k_shared, v_shared
 
 
+@gluon.constexpr_function
+def _make_load_layout(block_dmodel, load_vec, num_warps, transposed, lanes=64):
+    """Blocked layout for one tile load."""
+    warp_elems = lanes * load_vec
+    if transposed:
+        return gl.BlockedLayout(
+            [load_vec, 1],
+            [block_dmodel // load_vec, warp_elems // block_dmodel],
+            [1, num_warps],
+            [0, 1],
+        )
+    return gl.BlockedLayout(
+        [1, load_vec],
+        [warp_elems // block_dmodel, block_dmodel // load_vec],
+        [num_warps, 1],
+        [1, 0],
+    )
+
+
 @gluon.jit
 def _buffer_load_2d(
     base, offsets, offset_first, offset_second, boundary_first, boundary_second
@@ -77,16 +96,20 @@ def _buffer_load_2d(
 def _load_k(
     k_base,
     k_offsets,
+    k_pe_offsets,
     load_start_n,
     seqlen_k,
     kLoadLayout: gl.constexpr,
+    kPeLoadLayout: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
+    BLOCK_DMODEL_PE: gl.constexpr,
     MASK_STEPS: gl.constexpr,
     PADDED_HEAD: gl.constexpr,
+    HAS_PE: gl.constexpr,
 ):
-    """buffer_load one K block ([BLOCK_DMODEL_POW2, BLOCK_N]) into registers."""
+    """buffer_load one K block ([BLOCK_DMODEL_POW2, BLOCK_N]), and its PE ([BLOCK_DMODEL_PE, BLOCK_N]) when PE is on (else None)."""
     k_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kLoadLayout))
     k_offs_d = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, kLoadLayout))
     if MASK_STEPS:
@@ -97,7 +120,20 @@ def _load_k(
         k_d = k_offs_d
     else:
         k_d = None
-    return _buffer_load_2d(k_base, k_offsets, k_d, k_n, BLOCK_DMODEL, seqlen_k)
+    k_tile = _buffer_load_2d(k_base, k_offsets, k_d, k_n, BLOCK_DMODEL, seqlen_k)
+
+    if HAS_PE:
+        if MASK_STEPS:
+            k_pe_n = load_start_n + gl.arange(
+                0, BLOCK_N, layout=gl.SliceLayout(0, kPeLoadLayout)
+            )
+        else:
+            k_pe_n = None
+        return k_tile, _buffer_load_2d(
+            k_base, k_pe_offsets, None, k_pe_n, BLOCK_DMODEL_PE, seqlen_k
+        )
+    else:
+        return k_tile, None
 
 
 @gluon.jit
@@ -128,13 +164,32 @@ def _load_v(
 
 
 @gluon.jit
+def _store_k_smem(smemK, smemKpe, buf, k_tile, k_pe_tile, HAS_PE: gl.constexpr):
+    smemK.index(buf).store(k_tile)
+    if HAS_PE:
+        smemKpe.index(buf).store(k_pe_tile)
+
+
+@gluon.jit
+def _load_k_smem(smemK, smemKpe, buf, dotK: gl.constexpr, HAS_PE: gl.constexpr):
+    k = smemK.index(buf).load(dotK)
+    if HAS_PE:
+        return k, smemKpe.index(buf).load(dotK)
+    else:
+        return k, None
+
+
+@gluon.jit
 def _attn_qk_nomask(
     q,
     k,
+    q_pe,
+    k_pe,
     qk_scale,
     mfmaLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    HAS_PE: gl.constexpr,
     IS_FP8: gl.constexpr,
 ):
     """QK^T + scale for one already-staged key block (no masking). k is already
@@ -145,8 +200,12 @@ def _attn_qk_nomask(
     For FP8 the QK^T uses the CDNA4 scaled MFMA (32x32x64)"""
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
     if IS_FP8:
+        if HAS_PE:
+            qk = gl.amd.cdna4.mfma_scaled(q_pe, None, "e4m3", k_pe, None, "e4m3", qk)
         qk = gl.amd.cdna4.mfma_scaled(q, None, "e4m3", k, None, "e4m3", qk)
     else:
+        if HAS_PE:
+            qk = gl.amd.cdna4.mfma(q_pe, k_pe, qk)
         qk = gl.amd.cdna4.mfma(q, k, qk)
     return qk * qk_scale
 
@@ -155,6 +214,8 @@ def _attn_qk_nomask(
 def _attn_qk(
     q,
     k,
+    q_pe,
+    k_pe,
     start_n,
     seqlen_q,
     seqlen_k,
@@ -168,10 +229,13 @@ def _attn_qk(
     BLOCK_N: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
     MASK_STEPS: gl.constexpr,
+    HAS_PE: gl.constexpr,
     IS_FP8: gl.constexpr,
 ):
     """QK^T (+ scale + boundary/causal mask) for one key block."""
-    qk = _attn_qk_nomask(q, k, qk_scale, mfmaLayout, BLOCK_M, BLOCK_N, IS_FP8)
+    qk = _attn_qk_nomask(
+        q, k, q_pe, k_pe, qk_scale, mfmaLayout, BLOCK_M, BLOCK_N, HAS_PE, IS_FP8
+    )
 
     if MASK_STEPS or IS_CAUSAL:
         mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=mfmaLayout)
@@ -240,11 +304,14 @@ def _attn_fwd_inner(
     l_i,
     m_i,
     q,
+    q_pe,
     k_base,
     k_offsets,
+    k_pe_offsets,
     v_base,
     v_offsets,
     smemK,
+    smemKpe,
     smemV,
     stride_kn,
     stride_vn,
@@ -258,11 +325,14 @@ def _attn_fwd_inner(
     dotP: gl.constexpr,
     dotV: gl.constexpr,
     kLoadLayout: gl.constexpr,
+    kPeLoadLayout: gl.constexpr,
     vLoadLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
+    BLOCK_DMODEL_PE: gl.constexpr,
+    HAS_PE: gl.constexpr,
     NUM_KV_BUFFERS: gl.constexpr,
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
@@ -274,17 +344,21 @@ def _attn_fwd_inner(
 
     n_iter = (block_max - block_min) // BLOCK_N
 
-    k_tile = _load_k(
+    k_tile, k_pe_tile = _load_k(
         k_base,
         k_offsets,
+        k_pe_offsets,
         block_min,
         seqlen_k,
         kLoadLayout,
+        kPeLoadLayout,
         BLOCK_N,
         BLOCK_DMODEL,
         BLOCK_DMODEL_POW2,
+        BLOCK_DMODEL_PE,
         False,
         PADDED_HEAD,
+        HAS_PE,
     )
     v_tile = _load_v(
         v_base,
@@ -298,22 +372,26 @@ def _attn_fwd_inner(
         False,
         PADDED_HEAD,
     )
-    smemK.index(0).store(k_tile)
+    _store_k_smem(smemK, smemKpe, 0, k_tile, k_pe_tile, HAS_PE)
     smemV.index(0).store(v_tile)
-    k = smemK.index(0).load(dotK)
+    k, k_pe = _load_k_smem(smemK, smemKpe, 0, dotK, HAS_PE)
 
     if n_iter > 1:
-        k_tile = _load_k(
+        k_tile, k_pe_tile = _load_k(
             k_base + BLOCK_N * stride_kn,
             k_offsets,
+            k_pe_offsets,
             block_min + BLOCK_N,
             seqlen_k,
             kLoadLayout,
+            kPeLoadLayout,
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE,
             False,
             PADDED_HEAD,
+            HAS_PE,
         )
         v_tile = _load_v(
             v_base + BLOCK_N * stride_vn,
@@ -327,54 +405,65 @@ def _attn_fwd_inner(
             False,
             PADDED_HEAD,
         )
-        smemK.index(1).store(k_tile)
+        _store_k_smem(smemK, smemKpe, 1, k_tile, k_pe_tile, HAS_PE)
         smemV.index(1).store(v_tile)
 
     qk_cur = _attn_qk_nomask(
         q,
         k,
+        q_pe,
+        k_pe,
         qk_scale,
         mfmaLayout=mfmaLayout,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        HAS_PE=HAS_PE,
         IS_FP8=IS_FP8,
     )
 
     if n_iter > 2:
-        k_tile = _load_k(
+        k_tile, k_pe_tile = _load_k(
             k_base + 2 * BLOCK_N * stride_kn,
             k_offsets,
+            k_pe_offsets,
             block_min + 2 * BLOCK_N,
             seqlen_k,
             kLoadLayout,
+            kPeLoadLayout,
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE,
             False,
             PADDED_HEAD,
+            HAS_PE,
         )
-        smemK.index(0).store(k_tile)
+        _store_k_smem(smemK, smemKpe, 0, k_tile, k_pe_tile, HAS_PE)
 
     for i in range(n_iter - 3):
         k_buf = (i + 1) % NUM_KV_BUFFERS
         v_buf = i % NUM_KV_BUFFERS
 
         # Read K i+1 and V i out of LDS.
-        k_nxt = smemK.index(k_buf).load(dotK)
+        k_nxt, k_pe_nxt = _load_k_smem(smemK, smemKpe, k_buf, dotK, HAS_PE)
         v_cur = smemV.index(v_buf).load(dotV)
 
         # Issue K i+3 / V i+2
-        k_pf = _load_k(
+        k_pf, k_pe_pf = _load_k(
             k_base + (i + 3) * BLOCK_N * stride_kn,
             k_offsets,
+            k_pe_offsets,
             block_min + (i + 3) * BLOCK_N,
             seqlen_k,
             kLoadLayout,
+            kPeLoadLayout,
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE,
             False,
             PADDED_HEAD,
+            HAS_PE,
         )
         v_pf = _load_v(
             v_base + (i + 2) * BLOCK_N * stride_vn,
@@ -393,15 +482,18 @@ def _attn_fwd_inner(
         qk_nxt = _attn_qk_nomask(
             q,
             k_nxt,
+            q_pe,
+            k_pe_nxt,
             qk_scale,
             mfmaLayout=mfmaLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
+            HAS_PE=HAS_PE,
             IS_FP8=IS_FP8,
         )
 
         # Stage K i+3 / V i+2 back into the buffers read at the top.
-        smemK.index(k_buf).store(k_pf)
+        _store_k_smem(smemK, smemKpe, k_buf, k_pf, k_pe_pf, HAS_PE)
         smemV.index(v_buf).store(v_pf)
 
         # softmax + P@V i
@@ -427,7 +519,7 @@ def _attn_fwd_inner(
         k_buf = (n_iter - 2) % NUM_KV_BUFFERS
         v_buf = (n_iter - 3) % NUM_KV_BUFFERS
 
-        k_nxt = smemK.index(k_buf).load(dotK)
+        k_nxt, k_pe_nxt = _load_k_smem(smemK, smemKpe, k_buf, dotK, HAS_PE)
         v_cur = smemV.index(v_buf).load(dotV)
 
         # V's last block
@@ -447,13 +539,16 @@ def _attn_fwd_inner(
         qk_nxt = _attn_qk_nomask(
             q,
             k_nxt,
+            q_pe,
+            k_pe_nxt,
             qk_scale,
             mfmaLayout=mfmaLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
+            HAS_PE=HAS_PE,
             IS_FP8=IS_FP8,
         )
-
+        smemV.index(v_buf).store(v_pf)
         acc, l_i, m_i = _attn_softmax_pv(
             acc,
             l_i,
@@ -468,22 +563,24 @@ def _attn_fwd_inner(
             IS_FP8,
             FP8_MAX,
         )
-
-        smemV.index(v_buf).store(v_pf)
-
         qk_cur = qk_nxt
 
     # Block n_iter-2, QK-ahead of the final block
     if n_iter > 1:
-        k_nxt = smemK.index((n_iter - 1) % NUM_KV_BUFFERS).load(dotK)
+        k_nxt, k_pe_nxt = _load_k_smem(
+            smemK, smemKpe, (n_iter - 1) % NUM_KV_BUFFERS, dotK, HAS_PE
+        )
         v_cur = smemV.index((n_iter - 2) % NUM_KV_BUFFERS).load(dotV)
         qk_nxt = _attn_qk_nomask(
             q,
             k_nxt,
+            q_pe,
+            k_pe_nxt,
             qk_scale,
             mfmaLayout=mfmaLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
+            HAS_PE=HAS_PE,
             IS_FP8=IS_FP8,
         )
         acc, l_i, m_i = _attn_softmax_pv(
@@ -528,11 +625,14 @@ def _attn_fwd_inner_masked(
     l_i,
     m_i,
     q,
+    q_pe,
     k_base,
     k_offsets,
+    k_pe_offsets,
     v_base,
     v_offsets,
     smemK,
+    smemKpe,
     smemV,
     stride_kn,
     stride_vn,
@@ -549,11 +649,14 @@ def _attn_fwd_inner_masked(
     dotP: gl.constexpr,
     dotV: gl.constexpr,
     kLoadLayout: gl.constexpr,
+    kPeLoadLayout: gl.constexpr,
     vLoadLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
+    BLOCK_DMODEL_PE: gl.constexpr,
+    HAS_PE: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
     MASK_STEPS: gl.constexpr,
     IS_FP8: gl.constexpr,
@@ -571,17 +674,21 @@ def _attn_fwd_inner_masked(
     for i in range(n_iter):
         start_n = block_min + i * BLOCK_N
 
-        k_tile = _load_k(
+        k_tile, k_pe_tile = _load_k(
             k_base,
             k_offsets,
+            k_pe_offsets,
             start_n,
             seqlen_k,
             kLoadLayout,
+            kPeLoadLayout,
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE,
             MASK_STEPS,
             PADDED_HEAD,
+            HAS_PE,
         )
         v_tile = _load_v(
             v_base,
@@ -595,17 +702,19 @@ def _attn_fwd_inner_masked(
             MASK_STEPS,
             PADDED_HEAD,
         )
-        smemK.index(0).store(k_tile)
+        _store_k_smem(smemK, smemKpe, 0, k_tile, k_pe_tile, HAS_PE)
         smemV.index(0).store(v_tile)
         k_base += BLOCK_N * stride_kn
         v_base += BLOCK_N * stride_vn
 
-        k = smemK.index(0).load(dotK)
+        k, k_pe = _load_k_smem(smemK, smemKpe, 0, dotK, HAS_PE)
         v = smemV.index(0).load(dotV)
 
         qk = _attn_qk(
             q,
             k,
+            q_pe,
+            k_pe,
             start_n,
             seqlen_q,
             seqlen_k,
@@ -619,6 +728,7 @@ def _attn_fwd_inner_masked(
             BLOCK_N=BLOCK_N,
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=MASK_STEPS,
+            HAS_PE=HAS_PE,
             IS_FP8=IS_FP8,
         )
         acc, l_i, m_i = _attn_softmax_pv(
@@ -648,10 +758,10 @@ _attn_fwd_repr = make_kernel_repr(
         "BLOCK_M",
         "BLOCK_N",
         "BLOCK_DMODEL",
+        "IS_FP8",
         "VARLEN",
         "NUM_XCD",
         "USE_INT64_STRIDES",
-        "IS_FP8",
     ],
 )
 
@@ -698,6 +808,7 @@ def _attn_fwd(
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
+    BLOCK_DMODEL_PE: gl.constexpr,  # zero, or a power of 2 >= 16
     PRELOAD_V: gl.constexpr,
     NUM_XCD: gl.constexpr,
     USE_INT64_STRIDES: gl.constexpr,
@@ -708,6 +819,7 @@ def _attn_fwd(
 ):
     RCP_LN2: gl.constexpr = 1.4426950408889634
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
+    HAS_PE: gl.constexpr = BLOCK_DMODEL_PE > 0
 
     # NOTE:
     # Base-pointer and seqlen-loop offset arithmetic is performed using the
@@ -820,36 +932,40 @@ def _attn_fwd(
     )
 
     LOAD_VEC: gl.constexpr = 16 if IS_FP8 else 8
-    WARP_ELEMS: gl.constexpr = 64 * LOAD_VEC
-    qLoadLayout: gl.constexpr = gl.BlockedLayout(
-        [1, LOAD_VEC],
-        [WARP_ELEMS // BLOCK_DMODEL_POW2, BLOCK_DMODEL_POW2 // LOAD_VEC],
-        [num_warps, 1],
-        [1, 0],
+    qLoadLayout: gl.constexpr = _make_load_layout(
+        BLOCK_DMODEL_POW2, LOAD_VEC, num_warps, transposed=False
     )
-    # K is read transposed as [BLOCK_DMODEL_POW2, BLOCK_N] (head dim contiguous).
-    kLoadLayout: gl.constexpr = gl.BlockedLayout(
-        [LOAD_VEC, 1],
-        [BLOCK_DMODEL_POW2 // LOAD_VEC, WARP_ELEMS // BLOCK_DMODEL_POW2],
-        [1, num_warps],
-        [0, 1],
+    kLoadLayout: gl.constexpr = _make_load_layout(
+        BLOCK_DMODEL_POW2, LOAD_VEC, num_warps, transposed=True
     )
-    vLoadLayout: gl.constexpr = gl.BlockedLayout(
-        [1, LOAD_VEC],
-        [WARP_ELEMS // BLOCK_DMODEL_POW2, BLOCK_DMODEL_POW2 // LOAD_VEC],
-        [num_warps, 1],
-        [1, 0],
+    vLoadLayout: gl.constexpr = _make_load_layout(
+        BLOCK_DMODEL_POW2, LOAD_VEC, num_warps, transposed=False
     )
 
     # Swizzled shared layouts for the reg->LDS staging of K and V (conflict-free
     # ds_write / ds_read).
+    ELEM_BYTES: gl.constexpr = k_ptr.dtype.element_ty.primitive_bitwidth // 8
     _KV_SHARED: gl.constexpr = _make_kv_shared_layouts(
-        BLOCK_DMODEL_POW2,
-        k_ptr.dtype.element_ty.primitive_bitwidth // 8,
-        k_width=K_WIDTH,
+        BLOCK_DMODEL_POW2, ELEM_BYTES, k_width=K_WIDTH
     )
     kSharedLayout: gl.constexpr = _KV_SHARED[0]
     vSharedLayout: gl.constexpr = _KV_SHARED[1]
+
+    if HAS_PE:
+        qPeLoadLayout: gl.constexpr = _make_load_layout(
+            BLOCK_DMODEL_PE, LOAD_VEC, num_warps, transposed=False
+        )
+        kPeLoadLayout: gl.constexpr = _make_load_layout(
+            BLOCK_DMODEL_PE, LOAD_VEC, num_warps, transposed=True
+        )
+        _KPE_SHARED: gl.constexpr = _make_kv_shared_layouts(
+            BLOCK_DMODEL_PE, ELEM_BYTES, k_width=K_WIDTH
+        )
+        kPeSharedLayout: gl.constexpr = _KPE_SHARED[0]
+    else:
+        qPeLoadLayout: gl.constexpr = None
+        kPeLoadLayout: gl.constexpr = None
+        kPeSharedLayout: gl.constexpr = None
 
     # When the caller guarantees Q/K/V head strides are multiples of 8 elements,
     # the head-axis offset is 16-byte aligned; hinting the multiple lets AxisInfo
@@ -888,12 +1004,46 @@ def _attn_fwd(
     )
     q = gl.convert_layout(q, layout=dotQ)
 
+    # The PE slice sits immediately after the NOPE slice along the head dim of
+    # Q and K, so it shares their base pointer and only shifts the head-dim
+    # offsets by BLOCK_DMODEL. V and the output only span the NOPE slice.
+    if HAS_PE:
+        offs_qpm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, qPeLoadLayout))
+        offs_qpd = BLOCK_DMODEL + gl.arange(
+            0, BLOCK_DMODEL_PE, layout=gl.SliceLayout(0, qPeLoadLayout)
+        )
+        q_pe_offsets = (
+            offs_qpm[:, None] * stride_qm + offs_qpd[None, :] * stride_qk
+        ).to(gl.int32)
+        q_pe_mask = (start_m * BLOCK_M + offs_qpm)[:, None] < seqlen_q
+        q_pe = gl.amd.cdna4.buffer_load(
+            ptr=q_base,
+            offsets=q_pe_offsets,
+            mask=q_pe_mask,
+            other=0.0,
+            cache=q_cache_mod,
+        )
+        q_pe = gl.convert_layout(q_pe, layout=dotQ)
+    else:
+        q_pe = None
+
     offs_kd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, kLoadLayout))
     offs_kn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kLoadLayout))
     k_base = k_ptr + off_z * stride_kz + kh_off + cu_seqlens_k_start * stride_kn
     k_offsets = (offs_kd[:, None] * stride_kk + offs_kn[None, :] * stride_kn).to(
         gl.int32
     )
+
+    if HAS_PE:
+        offs_kpd = BLOCK_DMODEL + gl.arange(
+            0, BLOCK_DMODEL_PE, layout=gl.SliceLayout(1, kPeLoadLayout)
+        )
+        offs_kpn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kPeLoadLayout))
+        k_pe_offsets = (
+            offs_kpd[:, None] * stride_kk + offs_kpn[None, :] * stride_kn
+        ).to(gl.int32)
+    else:
+        k_pe_offsets = None
 
     offs_vn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, vLoadLayout))
     offs_vd = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, vLoadLayout))
@@ -914,6 +1064,14 @@ def _attn_fwd(
         [NUM_KV_BUFFERS, BLOCK_N, BLOCK_DMODEL_POW2],
         vSharedLayout,
     )
+    if HAS_PE:
+        smemKpe = gl.allocate_shared_memory(
+            k_ptr.dtype.element_ty,
+            [NUM_KV_BUFFERS, BLOCK_DMODEL_PE, BLOCK_N],
+            kPeSharedLayout,
+        )
+    else:
+        smemKpe = None
 
     # online-softmax state
     m_i = gl.full(
@@ -995,11 +1153,14 @@ def _attn_fwd(
             l_i,
             m_i,
             q,
+            q_pe,
             k_base,
             k_offsets,
+            k_pe_offsets,
             v_base,
             v_offsets,
             smemK,
+            smemKpe,
             smemV,
             stride_kn,
             stride_vn,
@@ -1013,11 +1174,14 @@ def _attn_fwd(
             dotP=dotP,
             dotV=dotV,
             kLoadLayout=kLoadLayout,
+            kPeLoadLayout=kPeLoadLayout,
             vLoadLayout=vLoadLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_DMODEL=BLOCK_DMODEL,
             BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE=BLOCK_DMODEL_PE,
+            HAS_PE=HAS_PE,
             NUM_KV_BUFFERS=NUM_KV_BUFFERS,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
@@ -1034,11 +1198,14 @@ def _attn_fwd(
             l_i,
             m_i,
             q,
+            q_pe,
             k_base,
             k_offsets,
+            k_pe_offsets,
             v_base,
             v_offsets,
             smemK,
+            smemKpe,
             smemV,
             stride_kn,
             stride_vn,
@@ -1055,11 +1222,14 @@ def _attn_fwd(
             dotP=dotP,
             dotV=dotV,
             kLoadLayout=kLoadLayout,
+            kPeLoadLayout=kPeLoadLayout,
             vLoadLayout=vLoadLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_DMODEL=BLOCK_DMODEL,
             BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE=BLOCK_DMODEL_PE,
+            HAS_PE=HAS_PE,
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=True,
             IS_FP8=IS_FP8,

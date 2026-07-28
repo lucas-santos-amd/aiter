@@ -85,7 +85,6 @@ def gluon_forward_unsupported_reason(
     sink=None,
     return_lse: bool = False,
     return_attn_probs: bool = False,
-    has_positional_encoding: bool = False,
     block_table=None,
 ):
     """Reason (str) why the Gluon forward backend can't serve this config, else None.
@@ -111,8 +110,6 @@ def gluon_forward_unsupported_reason(
         return "Gluon MHA backend does not support returning LSE"
     if return_attn_probs:
         return "Gluon MHA backend does not support returning attention probabilities"
-    if has_positional_encoding:
-        return "Gluon MHA backend does not support positional encoding"
     if block_table is not None:
         return "Gluon MHA backend does not support paged KV (block_table)"
     return None
@@ -138,18 +135,12 @@ def _gluon_flash_attn_forward(
     """Validate + launch the Gluon forward kernel for both fixed-length (bshd)
     and varlen (thd) batches.
 
-    Varlen mode is selected when ``cu_seqlens_q`` is given; then q/k/v are packed
-    ``[total_tokens, heads, head_dim]`` and the grid is sized by ``max_seqlen_q``.
-    Otherwise q/k/v are ``[batch, seqlen, heads, head_dim]`` and the grid is sized by ``batch``.
-
-    FP8 is selected when q/k/v are fp8 tensors; then ``descale_q/k/v`` (per-batch,
-    per-head fp32 dequant scalars) are required and accumulation is fp32.
-
     Arguments:
         q, k, v: query / key / value tensors (layout per the mode above).
         causal: whether to apply a (bottom-right aligned) causal mask.
-        sm_scale: QK^T scale. Defaults to 1 / sqrt(head_dim).
-        o: optional preallocated output. defaults to ``torch.empty_like(q)`` (fp32 for fp8).
+        sm_scale: QK^T scale. Defaults to 1 / sqrt(head_dim_qk).
+        o: optional preallocated output, shaped like q but with V's head dim.
+            Defaults to a fresh tensor (fp32 for fp8).
         cu_seqlens_q/cu_seqlens_k: (batch + 1,) int32 cumulative lengths (varlen).
         max_seqlen_q/max_seqlen_k: max sequence lengths in the batch (varlen).
         descale_q: (batch, num_q_heads) fp32 dequant scalars for q (fp8 only).
@@ -164,11 +155,15 @@ def _gluon_flash_attn_forward(
         f"Gluon MHA backend requires one of {_GLUON_SUPPORTED_ARCHS} with "
         f"Triton>=3.6 (arch={get_arch()!r}, triton={triton.__version__})"
     )
-    assert q.shape[-1] == k.shape[-1] == v.shape[-1], "head_dim mismatch"
+    assert q.shape[-1] == k.shape[-1], "q/k head_dim mismatch"
     assert BLOCK_N % 32 == 0, "BLOCK_N must be a multiple of 32"
 
     IS_FP8 = types._is_fp8(q)
     FP8_MAX = torch.finfo(q.dtype).max if IS_FP8 else 0.0
+
+    qk_head_dim = q.shape[-1]
+    v_head_dim = v.shape[-1]
+    pe_head_dim = qk_head_dim - v_head_dim
     if IS_FP8:
         assert (
             descale_q is not None and descale_k is not None and descale_v is not None
@@ -186,13 +181,13 @@ def _gluon_flash_attn_forward(
         BLOCK_N = max(BLOCK_N, 64)
 
     if varlen:
-        _, num_q_heads, head_dim = q.shape
+        _, num_q_heads, _ = q.shape
         _, num_k_heads, _ = k.shape
         batch = cu_seqlens_q.numel() - 1
         seqlen_q = int(max_seqlen_q)
         seqlen_k = int(max_seqlen_k)
     else:
-        batch, seqlen_q, num_q_heads, head_dim = q.shape
+        batch, seqlen_q, num_q_heads, _ = q.shape
         _, seqlen_k, num_k_heads, _ = k.shape
 
     assert (
@@ -200,21 +195,28 @@ def _gluon_flash_attn_forward(
     ), "num_q_heads must be divisible by num_k_heads"
 
     if sm_scale is None:
-        sm_scale = head_dim ** (-0.5)
+        sm_scale = qk_head_dim ** (-0.5)
 
-    head_size_og = head_dim
+    # Pad to a vectorizable head dim. Unreachable with positional encoding,
+    # which requires unpadded power-of-2 head sizes.
+    head_size_og = v_head_dim
     if head_size_og % 8 != 0:
         pad = 8 - head_size_og % 8
         q = torch.nn.functional.pad(q, [0, pad])
         k = torch.nn.functional.pad(k, [0, pad])
         v = torch.nn.functional.pad(v, [0, pad])
-        head_dim = q.shape[-1]
+        v_head_dim = v.shape[-1]
 
     o_provided = o
-    if IS_FP8:
-        o = torch.empty_like(q, dtype=torch.float32)
-    elif o is None or head_dim != head_size_og:
-        o = torch.empty_like(q)
+    if IS_FP8 or o is None or v_head_dim != head_size_og:
+        o_dtype = torch.float32 if IS_FP8 else q.dtype
+        if pe_head_dim > 0:
+            # Q/K carry the PE slice, the output only spans V's head dim.
+            o = torch.empty(
+                q.shape[:-1] + (v_head_dim,), dtype=o_dtype, device=q.device
+            )
+        else:
+            o = torch.empty_like(q, dtype=o_dtype)
 
     if varlen:
         # (total_tokens, head, head_dim)
@@ -230,8 +232,21 @@ def _gluon_flash_attn_forward(
         o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
 
     min_pad = 64 if IS_FP8 else 16
-    BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(head_dim), min_pad)
-
+    BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(v_head_dim), min_pad)
+    BLOCK_DMODEL_PE_POW2 = (
+        0 if pe_head_dim == 0 else max(triton.next_power_of_2(pe_head_dim), 16)
+    )
+    assert (pe_head_dim == 0 and BLOCK_DMODEL_PE_POW2 == 0) or (
+        v_head_dim == BLOCK_DMODEL_POW2 and pe_head_dim == BLOCK_DMODEL_PE_POW2
+    ), "Positional encoding support requires NOPE and PE head sizes to be unpadded powers of 2."
+    assert (not IS_FP8) or (
+        IS_FP8 and pe_head_dim == 0
+    ), "Positional encoding doesn't support FP8."
+    # FP8 uses 32x32x64 (K=64) scaled MFMA, so the PE head size must be a multiple of 64.
+    # TODO: Enable this assert if the assert above is ever lifted.
+    # assert (not IS_FP8) or (
+    #     pe_head_dim % 64 == 0
+    # ), "FP8 positional encoding requires the PE head size to be a multiple of 64."
     head_stride_aligned_8 = (
         q_strides[1] % 8 == 0 and k_strides[1] % 8 == 0 and v_strides[1] % 8 == 0
     )
@@ -265,8 +280,9 @@ def _gluon_flash_attn_forward(
         BATCH=batch,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=head_dim,
+        BLOCK_DMODEL=v_head_dim,
         BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+        BLOCK_DMODEL_PE=pe_head_dim,
         PRELOAD_V=True,
         NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
@@ -277,7 +293,7 @@ def _gluon_flash_attn_forward(
         waves_per_eu=2,
     )
 
-    if head_dim != head_size_og:
+    if v_head_dim != head_size_og:
         o = o[..., :head_size_og]
     if o_provided is not None and o_provided.data_ptr() != o.data_ptr():
         o_provided.copy_(o)
@@ -808,9 +824,9 @@ def flash_attn_func(
             for q and (batch, num_k_heads) for k/v; the output is fp32.
         backend: "triton" (default) or "gluon". The "gluon" backend runs the
             forward-only gfx950 Gluon kernel and only supports the base feature
-            set plus FP8 (no dropout/bias/alibi/sink/sliding-window/positional
-            encoding, no LSE/softmax return and no backward pass). For FP8, pass
-            pre-quantized fp8 q/k/v with q_descale/k_descale/v_descale.
+            set plus FP8 and positional encoding (no dropout/bias/alibi/sink/
+            sliding-window, no LSE/softmax return and no backward pass). For FP8,
+            pass pre-quantized fp8 q/k/v with q_descale/k_descale/v_descale.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -833,7 +849,6 @@ def flash_attn_func(
             sink=sink,
             return_lse=return_lse,
             return_attn_probs=return_attn_probs,
-            has_positional_encoding=q.shape[-1] != v.shape[-1],
         )
         assert reason is None, reason
         return _gluon_flash_attn_forward(
@@ -1156,9 +1171,9 @@ def flash_attn_varlen_func(
             for q and (batch, num_k_heads) for k/v; the output is fp32.
         backend: "triton" (default) or "gluon". The "gluon" backend runs the
             forward-only gfx950 Gluon kernel and only supports the base feature
-            set plus FP8 (no dropout/bias/alibi/sink/sliding-window/positional
-            encoding, no LSE/softmax return and no backward pass). For FP8, pass
-            pre-quantized fp8 q/k/v with q_descale/k_descale/v_descale.
+            set plus FP8 and positional encoding (no dropout/bias/alibi/sink/
+            sliding-window, no LSE/softmax return and no backward pass). For FP8,
+            pass pre-quantized fp8 q/k/v with q_descale/k_descale/v_descale.
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -1181,7 +1196,6 @@ def flash_attn_varlen_func(
             sink=sink,
             return_lse=return_lse,
             return_attn_probs=return_attn_probs,
-            has_positional_encoding=q.shape[-1] != v.shape[-1],
             block_table=block_table,
         )
         assert reason is None, reason
