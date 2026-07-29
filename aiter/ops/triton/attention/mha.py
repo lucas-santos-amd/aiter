@@ -79,10 +79,8 @@ def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
 def gluon_forward_unsupported_reason(
     *,
     dropout_p: float = 0.0,
-    window_size=(-1, -1),
     bias=None,
     alibi_slopes=None,
-    sink=None,
     return_lse: bool = False,
     return_attn_probs: bool = False,
     block_table=None,
@@ -98,14 +96,10 @@ def gluon_forward_unsupported_reason(
         )
     if dropout_p and dropout_p != 0.0:
         return "Gluon MHA backend does not support dropout"
-    if tuple(window_size) != (-1, -1):
-        return "Gluon MHA backend does not support sliding window attention"
     if bias is not None:
         return "Gluon MHA backend does not support attention bias"
     if alibi_slopes is not None:
         return "Gluon MHA backend does not support alibi slopes"
-    if sink is not None:
-        return "Gluon MHA backend does not support attention sink"
     if return_lse:
         return "Gluon MHA backend does not support returning LSE"
     if return_attn_probs:
@@ -129,6 +123,8 @@ def _gluon_flash_attn_forward(
     descale_q=None,
     descale_k=None,
     descale_v=None,
+    sink=None,
+    window_size=(-1, -1),
     BLOCK_M=128,
     BLOCK_N=32,
 ):
@@ -145,6 +141,10 @@ def _gluon_flash_attn_forward(
         max_seqlen_q/max_seqlen_k: max sequence lengths in the batch (varlen).
         descale_q: (batch, num_q_heads) fp32 dequant scalars for q (fp8 only).
         descale_k/descale_v: (batch, num_k_heads) fp32 dequant scalars for k/v (fp8 only).
+        sink: (num_q_heads,) attention sink logits, or None. Each one acts as an
+            extra softmax column with no value vector.
+        window_size: (left, right) local attention window. Only a left window is
+            supported, so right must be -1.
     Return:
         o: same layout as q. Dtype is fp32 for fp8 inputs unless the caller passed
             an ``o`` of a different dtype, in which case that dtype is returned.
@@ -157,6 +157,10 @@ def _gluon_flash_attn_forward(
     )
     assert q.shape[-1] == k.shape[-1], "q/k head_dim mismatch"
     assert BLOCK_N % 32 == 0, "BLOCK_N must be a multiple of 32"
+
+    if int(window_size[1]) != -1:
+        raise ValueError("window_size_right is not supported yet in the Gluon Backend")
+    sliding_window = _get_sliding_window_size(window_size)
 
     IS_FP8 = types._is_fp8(q)
     FP8_MAX = torch.finfo(q.dtype).max if IS_FP8 else 0.0
@@ -193,6 +197,9 @@ def _gluon_flash_attn_forward(
     assert (
         num_q_heads % num_k_heads == 0
     ), "num_q_heads must be divisible by num_k_heads"
+    assert (sink is None) or (
+        sink.dim() == 1 and sink.shape[0] == num_q_heads
+    ), "Sink must be 1D and have one element per query head."
 
     if sm_scale is None:
         sm_scale = qk_head_dim ** (-0.5)
@@ -261,6 +268,7 @@ def _gluon_flash_attn_forward(
         descale_q,
         descale_k,
         descale_v,
+        sink,
         sm_scale,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -288,6 +296,8 @@ def _gluon_flash_attn_forward(
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
         IS_FP8=IS_FP8,
         FP8_MAX=FP8_MAX,
+        ENABLE_SINK=sink is not None,
+        SLIDING_WINDOW=sliding_window,
         HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
         num_warps=4,
         waves_per_eu=2,
@@ -823,10 +833,11 @@ def flash_attn_func(
             by the "gluon" backend when q/k/v are fp8. Shapes (batch, num_q_heads)
             for q and (batch, num_k_heads) for k/v; the output is fp32.
         backend: "triton" (default) or "gluon". The "gluon" backend runs the
-            forward-only gfx950 Gluon kernel and only supports the base feature
-            set plus FP8 and positional encoding (no dropout/bias/alibi/sink/
-            sliding-window, no LSE/softmax return and no backward pass). For FP8,
-            pass pre-quantized fp8 q/k/v with q_descale/k_descale/v_descale.
+            forward-only gfx950 Gluon kernel and supports the base feature set
+            plus FP8, positional encoding, attention sink and a left sliding
+            window (no dropout/bias/alibi, no right window, no LSE/softmax return
+            and no backward pass). For FP8, pass pre-quantized fp8 q/k/v with
+            q_descale/k_descale/v_descale.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -843,10 +854,8 @@ def flash_attn_func(
     if backend == "gluon":
         reason = gluon_forward_unsupported_reason(
             dropout_p=dropout_p,
-            window_size=window_size,
             bias=bias,
             alibi_slopes=alibi_slopes,
-            sink=sink,
             return_lse=return_lse,
             return_attn_probs=return_attn_probs,
         )
@@ -860,6 +869,8 @@ def flash_attn_func(
             descale_q=q_descale,
             descale_k=k_descale,
             descale_v=v_descale,
+            sink=sink,
+            window_size=window_size,
         )
 
     return _FlashAttnFunc.apply(
@@ -1170,10 +1181,11 @@ def flash_attn_varlen_func(
             by the "gluon" backend when q/k/v are fp8. Shapes (batch, num_q_heads)
             for q and (batch, num_k_heads) for k/v; the output is fp32.
         backend: "triton" (default) or "gluon". The "gluon" backend runs the
-            forward-only gfx950 Gluon kernel and only supports the base feature
-            set plus FP8 and positional encoding (no dropout/bias/alibi/sink/
-            sliding-window, no LSE/softmax return and no backward pass). For FP8,
-            pass pre-quantized fp8 q/k/v with q_descale/k_descale/v_descale.
+            forward-only gfx950 Gluon kernel and supports the base feature set
+            plus FP8, positional encoding, attention sink and a left sliding
+            window (no dropout/bias/alibi, no right window, no LSE/softmax return
+            and no backward pass). For FP8, pass pre-quantized fp8 q/k/v with
+            q_descale/k_descale/v_descale.
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -1190,10 +1202,8 @@ def flash_attn_varlen_func(
     if backend == "gluon":
         reason = gluon_forward_unsupported_reason(
             dropout_p=dropout_p,
-            window_size=window_size,
             bias=bias,
             alibi_slopes=alibi_slopes,
-            sink=sink,
             return_lse=return_lse,
             return_attn_probs=return_attn_probs,
             block_table=block_table,
@@ -1213,6 +1223,8 @@ def flash_attn_varlen_func(
             descale_q=q_descale,
             descale_k=k_descale,
             descale_v=v_descale,
+            sink=sink,
+            window_size=window_size,
         )
 
     return _FlashAttnVarlenFunc.apply(

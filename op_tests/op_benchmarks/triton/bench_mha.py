@@ -578,17 +578,11 @@ def run_benchmark(run: BenchRun):
                 "Skipping: PE, sink, or sliding window not supported with fused bwd / fp8."
             )
             return 0
-        if is_gluon:
-            # Forward-only gfx950 kernel: no backward, KV cache, sink or sliding
-            # window (see aiter.ops.triton.attention.mha gluon backend).
-            if is_bwd or is_decode:
-                warnings.warn("Skipping: Gluon backend only supports fwd / fwd_varlen.")
-                return 0
-            if run.sink or has_sliding_window:
-                warnings.warn(
-                    "Skipping: Gluon backend does not support sink or sliding window."
-                )
-                return 0
+        # The Gluon kernel is forward-only and has no KV cache path
+        # (see aiter.ops.triton.attention.mha gluon backend).
+        if is_gluon and (is_bwd or is_decode):
+            warnings.warn("Skipping: Gluon backend only supports fwd / fwd_varlen.")
+            return 0
         mha_set_use_fused_bwd_kernel(fused)
         make_fn = get_make_fn(function, dtype)
 

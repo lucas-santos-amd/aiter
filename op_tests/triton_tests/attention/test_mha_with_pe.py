@@ -7,7 +7,6 @@ import torch
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
-    gluon_forward_unsupported_reason,
     mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -16,18 +15,12 @@ from aiter.test_mha_common import (
     generate_qkv,
     generate_random_padding_mask,
 )
-from op_tests.triton_tests.attention.mha_test_utils import pad_rearrange_dropout_mask
+from op_tests.triton_tests.attention.mha_test_utils import (
+    pad_rearrange_dropout_mask,
+    skip_if_gluon_unsupported,
+)
 
 arch = get_arch()
-
-
-def _skip_if_gluon_unsupported(backend: str, **feature_flags):
-    """Skip forward tests the Gluon backend can't run."""
-    if backend != "gluon":
-        return
-    reason = gluon_forward_unsupported_reason(**feature_flags)
-    if reason:
-        pytest.skip(reason)
 
 
 @pytest.mark.parametrize("BATCH", [1, 3])
@@ -56,7 +49,7 @@ def test_mha_with_pe(
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
 
-    _skip_if_gluon_unsupported(
+    skip_if_gluon_unsupported(
         backend,
         dropout_p=DROPOUT,
     )
@@ -137,7 +130,7 @@ def test_mha_varlen_with_pe(
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
 
-    _skip_if_gluon_unsupported(
+    skip_if_gluon_unsupported(
         backend,
         dropout_p=DROPOUT,
     )

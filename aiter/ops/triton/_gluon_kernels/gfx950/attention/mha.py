@@ -180,24 +180,33 @@ def _load_k_smem(smemK, smemKpe, buf, dotK: gl.constexpr, HAS_PE: gl.constexpr):
 
 
 @gluon.jit
-def _attn_qk_nomask(
+def _attn_qk(
     q,
     k,
     q_pe,
     k_pe,
+    start_n,
+    offs_n,
+    window_min,
     qk_scale,
     mfmaLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     HAS_PE: gl.constexpr,
     IS_FP8: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr,
+    seqlen_q=None,
+    seqlen_k=None,
+    block_max=None,
+    n_extra_tokens=None,
+    offs_m=None,
+    IS_CAUSAL: gl.constexpr = False,
+    MASK_STEPS: gl.constexpr = False,
 ):
-    """QK^T + scale for one already-staged key block (no masking). k is already
-    in its MFMA dot-operand layout; returns float32 scores in mfmaLayout. Split
-    out so the caller can pipeline QK^T of block i+1 ahead of the softmax/P@V of
-    block i, overlapping the QK MFMA with the softmax.
-
-    For FP8 the QK^T uses the CDNA4 scaled MFMA (32x32x64)"""
+    """QK^T + scale + mask for one already-staged key block. ``k`` is already in
+    its MFMA dot-operand layout; returns float32 scores in ``mfmaLayout``. For
+    FP8 the QK^T uses the CDNA4 scaled MFMA (32x32x64).
+    """
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
     if IS_FP8:
         if HAS_PE:
@@ -207,49 +216,22 @@ def _attn_qk_nomask(
         if HAS_PE:
             qk = gl.amd.cdna4.mfma(q_pe, k_pe, qk)
         qk = gl.amd.cdna4.mfma(q, k, qk)
-    return qk * qk_scale
+    qk = qk * qk_scale
 
-
-@gluon.jit
-def _attn_qk(
-    q,
-    k,
-    q_pe,
-    k_pe,
-    start_n,
-    seqlen_q,
-    seqlen_k,
-    block_max,
-    n_extra_tokens,
-    offs_m,
-    offs_n,
-    qk_scale,
-    mfmaLayout: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    IS_CAUSAL: gl.constexpr,
-    MASK_STEPS: gl.constexpr,
-    HAS_PE: gl.constexpr,
-    IS_FP8: gl.constexpr,
-):
-    """QK^T (+ scale + boundary/causal mask) for one key block."""
-    qk = _attn_qk_nomask(
-        q, k, q_pe, k_pe, qk_scale, mfmaLayout, BLOCK_M, BLOCK_N, HAS_PE, IS_FP8
-    )
-
-    if MASK_STEPS or IS_CAUSAL:
+    if MASK_STEPS or IS_CAUSAL or SLIDING_WINDOW > 0:
+        key_pos = start_n + offs_n
         mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=mfmaLayout)
         if MASK_STEPS:
             # Only the last visible block can be partial (seqlen_k not a multiple
             # of BLOCK_N).
             bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
-            size_n = start_n + offs_n
-            mask_partial = size_n[None, :] < seqlen_k
+            mask_partial = key_pos[None, :] < seqlen_k
             mask = gl.where(bound_cond, mask_partial, mask)
         if IS_CAUSAL:
-            causal_boundary = start_n + offs_n + (seqlen_q - seqlen_k)
-            causal_mask = offs_m[:, None] >= causal_boundary[None, :]
-            mask = mask & causal_mask
+            causal_boundary = key_pos + (seqlen_q - seqlen_k)
+            mask = mask & (offs_m[:, None] >= causal_boundary[None, :])
+        if SLIDING_WINDOW > 0:
+            mask = mask & (window_min[:, None] <= key_pos[None, :])
         qk = gl.where(mask, qk, float("-inf"))
 
     return qk
@@ -318,6 +300,7 @@ def _attn_fwd_inner(
     seqlen_k,
     block_min,
     block_max,
+    window_min,
     qk_scale,
     descale_v,
     mfmaLayout: gl.constexpr,
@@ -336,11 +319,18 @@ def _attn_fwd_inner(
     NUM_KV_BUFFERS: gl.constexpr,
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr,
 ):
-    """QK-ahead software-pipelined online-softmax loop over full (unmasked) blocks.
+    """QK-ahead software-pipelined online-softmax loop over the blocks that need no
+    boundary or causal mask (the sliding-window mask, if any, still applies).
     The loop is pipelined so that the softmax+P@V of block i can overlap the QK^T of block i+1.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
+
+    if SLIDING_WINDOW > 0:
+        offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
+    else:
+        offs_n = None
 
     n_iter = (block_max - block_min) // BLOCK_N
 
@@ -408,17 +398,21 @@ def _attn_fwd_inner(
         _store_k_smem(smemK, smemKpe, 1, k_tile, k_pe_tile, HAS_PE)
         smemV.index(1).store(v_tile)
 
-    qk_cur = _attn_qk_nomask(
+    qk_cur = _attn_qk(
         q,
         k,
         q_pe,
         k_pe,
+        block_min,
+        offs_n,
+        window_min,
         qk_scale,
         mfmaLayout=mfmaLayout,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         HAS_PE=HAS_PE,
         IS_FP8=IS_FP8,
+        SLIDING_WINDOW=SLIDING_WINDOW,
     )
 
     if n_iter > 2:
@@ -479,17 +473,21 @@ def _attn_fwd_inner(
         )
 
         # QK^T i+1
-        qk_nxt = _attn_qk_nomask(
+        qk_nxt = _attn_qk(
             q,
             k_nxt,
             q_pe,
             k_pe_nxt,
+            block_min + (i + 1) * BLOCK_N,
+            offs_n,
+            window_min,
             qk_scale,
             mfmaLayout=mfmaLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             HAS_PE=HAS_PE,
             IS_FP8=IS_FP8,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
 
         # Stage K i+3 / V i+2 back into the buffers read at the top.
@@ -536,17 +534,21 @@ def _attn_fwd_inner(
             PADDED_HEAD,
         )
 
-        qk_nxt = _attn_qk_nomask(
+        qk_nxt = _attn_qk(
             q,
             k_nxt,
             q_pe,
             k_pe_nxt,
+            block_min + (n_iter - 2) * BLOCK_N,
+            offs_n,
+            window_min,
             qk_scale,
             mfmaLayout=mfmaLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             HAS_PE=HAS_PE,
             IS_FP8=IS_FP8,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
         smemV.index(v_buf).store(v_pf)
         acc, l_i, m_i = _attn_softmax_pv(
@@ -571,17 +573,21 @@ def _attn_fwd_inner(
             smemK, smemKpe, (n_iter - 1) % NUM_KV_BUFFERS, dotK, HAS_PE
         )
         v_cur = smemV.index((n_iter - 2) % NUM_KV_BUFFERS).load(dotV)
-        qk_nxt = _attn_qk_nomask(
+        qk_nxt = _attn_qk(
             q,
             k_nxt,
             q_pe,
             k_pe_nxt,
+            block_min + (n_iter - 1) * BLOCK_N,
+            offs_n,
+            window_min,
             qk_scale,
             mfmaLayout=mfmaLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             HAS_PE=HAS_PE,
             IS_FP8=IS_FP8,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
         acc, l_i, m_i = _attn_softmax_pv(
             acc,
@@ -642,6 +648,7 @@ def _attn_fwd_inner_masked(
     block_max,
     n_extra_tokens,
     offs_m,
+    window_min,
     qk_scale,
     descale_v,
     mfmaLayout: gl.constexpr,
@@ -661,9 +668,10 @@ def _attn_fwd_inner_masked(
     MASK_STEPS: gl.constexpr,
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr,
 ):
-    """Non-pipelined online-softmax loop over the boundary / causal masked blocks.
-    The masked tail is only a block or two, so the pipeline overhead is not worth it.
+    """Non-pipelined online-softmax loop over the boundary / causal (and, if
+    enabled, sliding-window) masked blocks.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
 
@@ -716,20 +724,22 @@ def _attn_fwd_inner_masked(
             q_pe,
             k_pe,
             start_n,
-            seqlen_q,
-            seqlen_k,
-            block_max,
-            n_extra_tokens,
-            offs_m,
             offs_n,
+            window_min,
             qk_scale,
             mfmaLayout=mfmaLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
-            IS_CAUSAL=IS_CAUSAL,
-            MASK_STEPS=MASK_STEPS,
             HAS_PE=HAS_PE,
             IS_FP8=IS_FP8,
+            SLIDING_WINDOW=SLIDING_WINDOW,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            block_max=block_max,
+            n_extra_tokens=n_extra_tokens,
+            offs_m=offs_m,
+            IS_CAUSAL=IS_CAUSAL,
+            MASK_STEPS=MASK_STEPS,
         )
         acc, l_i, m_i = _attn_softmax_pv(
             acc,
@@ -762,6 +772,8 @@ _attn_fwd_repr = make_kernel_repr(
         "VARLEN",
         "NUM_XCD",
         "USE_INT64_STRIDES",
+        "ENABLE_SINK",
+        "SLIDING_WINDOW",
     ],
 )
 
@@ -775,6 +787,7 @@ def _attn_fwd(
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
+    sink_ptr,
     sm_scale,
     cu_seqlens_q,
     cu_seqlens_k,
@@ -814,6 +827,8 @@ def _attn_fwd(
     USE_INT64_STRIDES: gl.constexpr,
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
+    ENABLE_SINK: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr,
     HEAD_STRIDE_ALIGNED_8: gl.constexpr = False,
     num_warps: gl.constexpr = 4,
 ):
@@ -1073,9 +1088,19 @@ def _attn_fwd(
     else:
         smemKpe = None
 
-    # online-softmax state
+    # online-softmax state.
+    if ENABLE_SINK:
+        m_i_init = gl.load(sink_ptr + off_q_head).to(gl.float32) * RCP_LN2
+    elif SLIDING_WINDOW > 0:
+        # A sliding-window block can be fully masked for some rows, and -inf as the
+        # running max would then make exp2(-inf - m_i) NaN. A finite floor keeps the
+        # probabilities at 0 and the rescale factor at exactly 1.0.
+        m_i_init = -1.0e30
+    else:
+        m_i_init = float("-inf")
+
     m_i = gl.full(
-        [BLOCK_M], float("-inf"), dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout)
+        [BLOCK_M], m_i_init, dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout)
     )
     l_i = gl.full(
         [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout)
@@ -1091,7 +1116,14 @@ def _attn_fwd(
         0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout)
     )
 
-    # Classify key blocks: full (mask-free) vs masked (boundary/causal).
+    # Lowest key index each query row may attend. Like the causal mask, the
+    # window is aligned to the bottom right corner.
+    if SLIDING_WINDOW > 0:
+        window_min = offs_m + (seqlen_k - seqlen_q - SLIDING_WINDOW)
+    else:
+        window_min = None
+
+    # Classify key blocks: full (no boundary/causal mask) vs masked.
     n_blocks = gl.cdiv(seqlen_k, BLOCK_N)
     if IS_CAUSAL:
         n_blocks_causal = gl.cdiv(
@@ -1135,19 +1167,37 @@ def _attn_fwd(
     padded_block_k = n_extra_tokens != 0
     is_modulo_mn = (not padded_block_k) and (seqlen_q % BLOCK_M == 0)
 
+    # Skip K blocks that are fully left of the earliest key position
+    # reachable by this Q block. The first retained block can still be
+    # partially outside the window, so we keep the per-element mask below.
+    skipped_blocks = 0
+    if SLIDING_WINDOW > 0:
+        window_start_n = start_m * BLOCK_M + seqlen_k - seqlen_q - SLIDING_WINDOW
+        skipped_blocks = min(max(window_start_n, 0) // BLOCK_N, n_blocks)
+
     if IS_CAUSAL:
+        # There are always at least BLOCK_M // BLOCK_N masked blocks.
+        # Additionally there might be one more due to dissimilar seqlens.
         masked_blocks = BLOCK_M // BLOCK_N + (not is_modulo_mn)
     else:
         masked_blocks = padded_block_k
 
-    masked_blocks = min(masked_blocks, n_blocks)
-    n_full_blocks = n_blocks - masked_blocks
-    block_min = 0
+    # if IS_CAUSAL, not is_modulo_mn does not always result in an additional block.
+    # In this case we might exceed n_blocks so pick the min.
+    visible_blocks = n_blocks - skipped_blocks
+    masked_blocks = min(masked_blocks, visible_blocks)
+    n_full_blocks = visible_blocks - masked_blocks
+    block_min = skipped_blocks * BLOCK_N
     block_max = n_blocks * BLOCK_N
+
+    if SLIDING_WINDOW > 0:
+        # k_base also anchors the PE slice, which shares K's base pointer.
+        k_base += skipped_blocks * BLOCK_N * stride_kn
+        v_base += skipped_blocks * BLOCK_N * stride_vn
 
     # Full blocks: no boundary mask, no causal mask.
     if n_full_blocks > 0:
-        block_max = n_full_blocks * BLOCK_N
+        block_max = block_min + n_full_blocks * BLOCK_N
         acc, l_i, m_i = _attn_fwd_inner(
             acc,
             l_i,
@@ -1167,6 +1217,7 @@ def _attn_fwd(
             seqlen_k,
             block_min,
             block_max,
+            window_min,
             qk_scale,
             descale_v,
             mfmaLayout=mfmaLayout,
@@ -1185,6 +1236,7 @@ def _attn_fwd(
             NUM_KV_BUFFERS=NUM_KV_BUFFERS,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -1215,6 +1267,7 @@ def _attn_fwd(
             block_max,
             n_extra_tokens,
             offs_m,
+            window_min,
             qk_scale,
             descale_v,
             mfmaLayout=mfmaLayout,
@@ -1234,6 +1287,7 @@ def _attn_fwd(
             MASK_STEPS=True,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
 
     # epilogue: normalize and write
