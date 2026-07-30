@@ -20,9 +20,11 @@ from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     generate_qkv,
     generate_random_padding_mask,
+    quantize_fp8_per_bh,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -230,8 +232,61 @@ _MAKE_FN_FP8 = {
 }
 
 
-def get_make_fn(function: str, dtype: str) -> Callable:
+# Gluon fp8 entry points
+# Unlike mha_v3's fp8 wrappers, which take high-precision inputs and quantize on
+# every call, the gluon kernel takes pre-quantized fp8 q/k/v plus descales.
+def _make_fp8_gluon_fn(q, k, v, **kw):
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = quantize_fp8_per_bh(q, fp8_dtype)
+    k_fp8, k_descale = quantize_fp8_per_bh(k, fp8_dtype)
+    v_fp8, v_descale = quantize_fp8_per_bh(v, fp8_dtype)
+    return lambda: flash_attn_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+        window_size=kw.get("window_size", (-1, -1)),
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        backend="gluon",
+    )
+
+
+def _make_fp8_varlen_gluon_fn(q, k, v, **kw):
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = quantize_fp8_per_bh(q, fp8_dtype, kw["cu_seqlens_q"])
+    k_fp8, k_descale = quantize_fp8_per_bh(k, fp8_dtype, kw["cu_seqlens_k"])
+    v_fp8, v_descale = quantize_fp8_per_bh(v, fp8_dtype, kw["cu_seqlens_k"])
+    return lambda: flash_attn_varlen_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        kw["cu_seqlens_q"],
+        kw["cu_seqlens_k"],
+        kw["max_seqlen_q"],
+        kw["max_seqlen_k"],
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+        window_size=kw.get("window_size", (-1, -1)),
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        backend="gluon",
+    )
+
+
+_MAKE_FN_FP8_GLUON = {
+    "fwd": _make_fp8_gluon_fn,
+    "fwd_varlen": _make_fp8_varlen_gluon_fn,
+}
+
+
+def get_make_fn(function: str, dtype: str, backend: str = "triton") -> Callable:
     if dtype == "fp8":
+        if backend == "gluon":
+            return _MAKE_FN_FP8_GLUON[function]
         return _MAKE_FN_FP8[function]
     return _MAKE_FN[function]
 
@@ -584,7 +639,7 @@ def run_benchmark(run: BenchRun):
             warnings.warn("Skipping: Gluon backend only supports fwd / fwd_varlen.")
             return 0
         mha_set_use_fused_bwd_kernel(fused)
-        make_fn = get_make_fn(function, dtype)
+        make_fn = get_make_fn(function, dtype, run.backend)
 
         # Default softmax scale to match standard attention
         if sm_scale is None:
