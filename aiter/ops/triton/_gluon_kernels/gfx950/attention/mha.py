@@ -321,9 +321,8 @@ def _attn_fwd_inner(
     FP8_MAX: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
 ):
-    """QK-ahead software-pipelined online-softmax loop over the blocks that need no
+    """Software-pipelined online-softmax loop over the blocks that need no
     boundary or causal mask (the sliding-window mask, if any, still applies).
-    The loop is pipelined so that the softmax+P@V of block i can overlap the QK^T of block i+1.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
 
@@ -334,6 +333,7 @@ def _attn_fwd_inner(
 
     n_iter = (block_max - block_min) // BLOCK_N
 
+    # Prologue
     k_tile, k_pe_tile = _load_k(
         k_base,
         k_offsets,
@@ -364,7 +364,6 @@ def _attn_fwd_inner(
     )
     _store_k_smem(smemK, smemKpe, 0, k_tile, k_pe_tile, HAS_PE)
     smemV.index(0).store(v_tile)
-    k, k_pe = _load_k_smem(smemK, smemKpe, 0, dotK, HAS_PE)
 
     if n_iter > 1:
         k_tile, k_pe_tile = _load_k(
@@ -398,56 +397,19 @@ def _attn_fwd_inner(
         _store_k_smem(smemK, smemKpe, 1, k_tile, k_pe_tile, HAS_PE)
         smemV.index(1).store(v_tile)
 
-    qk_cur = _attn_qk(
-        q,
-        k,
-        q_pe,
-        k_pe,
-        block_min,
-        offs_n,
-        window_min,
-        qk_scale,
-        mfmaLayout=mfmaLayout,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        HAS_PE=HAS_PE,
-        IS_FP8=IS_FP8,
-        SLIDING_WINDOW=SLIDING_WINDOW,
-    )
+    for i in range(n_iter - NUM_KV_BUFFERS):
+        buf = i % NUM_KV_BUFFERS
 
-    if n_iter > 2:
-        k_tile, k_pe_tile = _load_k(
-            k_base + 2 * BLOCK_N * stride_kn,
-            k_offsets,
-            k_pe_offsets,
-            block_min + 2 * BLOCK_N,
-            seqlen_k,
-            kLoadLayout,
-            kPeLoadLayout,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            BLOCK_DMODEL_PE,
-            False,
-            PADDED_HEAD,
-            HAS_PE,
-        )
-        _store_k_smem(smemK, smemKpe, 0, k_tile, k_pe_tile, HAS_PE)
+        # Read block i
+        k, k_pe = _load_k_smem(smemK, smemKpe, buf, dotK, HAS_PE)
+        v = smemV.index(buf).load(dotV)
 
-    for i in range(n_iter - 3):
-        k_buf = (i + 1) % NUM_KV_BUFFERS
-        v_buf = i % NUM_KV_BUFFERS
-
-        # Read K i+1 and V i out of LDS.
-        k_nxt, k_pe_nxt = _load_k_smem(smemK, smemKpe, k_buf, dotK, HAS_PE)
-        v_cur = smemV.index(v_buf).load(dotV)
-
-        # Issue K i+3 / V i+2
+        # Issue block i+2
         k_pf, k_pe_pf = _load_k(
-            k_base + (i + 3) * BLOCK_N * stride_kn,
+            k_base + (i + 2) * BLOCK_N * stride_kn,
             k_offsets,
             k_pe_offsets,
-            block_min + (i + 3) * BLOCK_N,
+            block_min + (i + 2) * BLOCK_N,
             seqlen_k,
             kLoadLayout,
             kPeLoadLayout,
@@ -472,13 +434,12 @@ def _attn_fwd_inner(
             PADDED_HEAD,
         )
 
-        # QK^T i+1
-        qk_nxt = _attn_qk(
+        qk = _attn_qk(
             q,
-            k_nxt,
+            k,
             q_pe,
-            k_pe_nxt,
-            block_min + (i + 1) * BLOCK_N,
+            k_pe,
+            block_min + i * BLOCK_N,
             offs_n,
             window_min,
             qk_scale,
@@ -490,17 +451,12 @@ def _attn_fwd_inner(
             SLIDING_WINDOW=SLIDING_WINDOW,
         )
 
-        # Stage K i+3 / V i+2 back into the buffers read at the top.
-        _store_k_smem(smemK, smemKpe, k_buf, k_pf, k_pe_pf, HAS_PE)
-        smemV.index(v_buf).store(v_pf)
-
-        # softmax + P@V i
         acc, l_i, m_i = _attn_softmax_pv(
             acc,
             l_i,
             m_i,
-            qk_cur,
-            v_cur,
+            qk,
+            v,
             descale_v,
             dotP,
             mfmaLayout,
@@ -510,35 +466,20 @@ def _attn_fwd_inner(
             FP8_MAX,
         )
 
-        qk_cur = qk_nxt
+        # Store block i+2
+        _store_k_smem(smemK, smemKpe, buf, k_pf, k_pe_pf, HAS_PE)
+        smemV.index(buf).store(v_pf)
 
-    # Block n_iter-3
-    if n_iter > 2:
-        k_buf = (n_iter - 2) % NUM_KV_BUFFERS
-        v_buf = (n_iter - 3) % NUM_KV_BUFFERS
-
-        k_nxt, k_pe_nxt = _load_k_smem(smemK, smemKpe, k_buf, dotK, HAS_PE)
-        v_cur = smemV.index(v_buf).load(dotV)
-
-        # V's last block
-        v_pf = _load_v(
-            v_base + (n_iter - 1) * BLOCK_N * stride_vn,
-            v_offsets,
-            block_min + (n_iter - 1) * BLOCK_N,
-            seqlen_k,
-            vLoadLayout,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            False,
-            PADDED_HEAD,
-        )
-
-        qk_nxt = _attn_qk(
+    # Epilogue
+    if n_iter > 1:
+        buf = (n_iter - 2) % NUM_KV_BUFFERS
+        k, k_pe = _load_k_smem(smemK, smemKpe, buf, dotK, HAS_PE)
+        v = smemV.index(buf).load(dotV)
+        qk = _attn_qk(
             q,
-            k_nxt,
+            k,
             q_pe,
-            k_pe_nxt,
+            k_pe,
             block_min + (n_iter - 2) * BLOCK_N,
             offs_n,
             window_min,
@@ -550,13 +491,12 @@ def _attn_fwd_inner(
             IS_FP8=IS_FP8,
             SLIDING_WINDOW=SLIDING_WINDOW,
         )
-        smemV.index(v_buf).store(v_pf)
         acc, l_i, m_i = _attn_softmax_pv(
             acc,
             l_i,
             m_i,
-            qk_cur,
-            v_cur,
+            qk,
+            v,
             descale_v,
             dotP,
             mfmaLayout,
@@ -565,54 +505,32 @@ def _attn_fwd_inner(
             IS_FP8,
             FP8_MAX,
         )
-        qk_cur = qk_nxt
 
-    # Block n_iter-2, QK-ahead of the final block
-    if n_iter > 1:
-        k_nxt, k_pe_nxt = _load_k_smem(
-            smemK, smemKpe, (n_iter - 1) % NUM_KV_BUFFERS, dotK, HAS_PE
-        )
-        v_cur = smemV.index((n_iter - 2) % NUM_KV_BUFFERS).load(dotV)
-        qk_nxt = _attn_qk(
-            q,
-            k_nxt,
-            q_pe,
-            k_pe_nxt,
-            block_min + (n_iter - 1) * BLOCK_N,
-            offs_n,
-            window_min,
-            qk_scale,
-            mfmaLayout=mfmaLayout,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            HAS_PE=HAS_PE,
-            IS_FP8=IS_FP8,
-            SLIDING_WINDOW=SLIDING_WINDOW,
-        )
-        acc, l_i, m_i = _attn_softmax_pv(
-            acc,
-            l_i,
-            m_i,
-            qk_cur,
-            v_cur,
-            descale_v,
-            dotP,
-            mfmaLayout,
-            BLOCK_M,
-            BLOCK_DMODEL_POW2,
-            IS_FP8,
-            FP8_MAX,
-        )
-        qk_cur = qk_nxt
-
-    # Final block (n_iter - 1)
-    v_cur = smemV.index((n_iter - 1) % NUM_KV_BUFFERS).load(dotV)
+    buf = (n_iter - 1) % NUM_KV_BUFFERS
+    k, k_pe = _load_k_smem(smemK, smemKpe, buf, dotK, HAS_PE)
+    v = smemV.index(buf).load(dotV)
+    qk = _attn_qk(
+        q,
+        k,
+        q_pe,
+        k_pe,
+        block_min + (n_iter - 1) * BLOCK_N,
+        offs_n,
+        window_min,
+        qk_scale,
+        mfmaLayout=mfmaLayout,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        HAS_PE=HAS_PE,
+        IS_FP8=IS_FP8,
+        SLIDING_WINDOW=SLIDING_WINDOW,
+    )
     acc, l_i, m_i = _attn_softmax_pv(
         acc,
         l_i,
         m_i,
-        qk_cur,
-        v_cur,
+        qk,
+        v,
         descale_v,
         dotP,
         mfmaLayout,

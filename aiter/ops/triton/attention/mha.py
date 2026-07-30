@@ -126,7 +126,7 @@ def _gluon_flash_attn_forward(
     sink=None,
     window_size=(-1, -1),
     BLOCK_M=128,
-    BLOCK_N=32,
+    BLOCK_N=64,
 ):
     """Validate + launch the Gluon forward kernel for both fixed-length (bshd)
     and varlen (thd) batches.
@@ -183,6 +183,8 @@ def _gluon_flash_attn_forward(
         # The scaled f8f6f4 MFMA is 32x32x64 (K=64), so the P@V contraction
         # (BLOCK_N) must be a multiple of 64.
         BLOCK_N = max(BLOCK_N, 64)
+    elif pe_head_dim > 0:
+        BLOCK_N = min(BLOCK_N, 32)
 
     if varlen:
         _, num_q_heads, _ = q.shape
