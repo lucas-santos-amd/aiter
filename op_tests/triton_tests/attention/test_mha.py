@@ -143,11 +143,10 @@ def test_mha(
 
 
 def _fp8_assert_close(actual, expected, atol=1.0, cos_sim_threshold=0.94):
-    """Loose fp8 comparison: bounded max-abs error plus cosine similarity.
+    """fp8 comparison: bounded max-abs error plus cosine similarity.
 
     fp8 attention has larger elementwise error than bf16, so we check direction
-    (cosine similarity) in addition to a bounded absolute error. Tolerances are
-    intentionally loose; tighten after validating on gfx950 hardware.
+    (cosine similarity) in addition to a bounded absolute error.
     """
     a = actual.float().flatten()
     b = expected.float().flatten()
@@ -165,9 +164,8 @@ def _fp8_assert_close(actual, expected, atol=1.0, cos_sim_threshold=0.94):
 def _quantize_fp8_per_bh(x, fp8_dtype):
     """Per-(batch, head) symmetric fp8 quantization.
 
-    x: [batch, seqlen, heads, head_dim] high-precision tensor. Returns
-    (x_fp8, descale) where descale is [batch, heads] fp32 (amax / fp8_max), the
-    per-(batch, head) dequant scalar consumed by the Gluon kernel.
+    x: [batch, seqlen, heads, head_dim]. Returns (x_fp8, [batch, heads] fp32
+    descale).
     """
     fp8_max = torch.finfo(fp8_dtype).max
     amax = x.abs().amax(dim=(1, 3)).clamp(min=1e-9)  # [batch, heads]
@@ -192,9 +190,6 @@ def test_mha_fp8_gluon(
     CAUSAL: bool,
     dtype=torch.bfloat16,
 ):
-    """FP8 forward on the Gluon backend: pre-quantize q/k/v to fp8 e4m3 with
-    per-(batch, head) descales, run the Gluon kernel (fp32 output), and compare
-    against the high-precision torch reference with a loose fp8 tolerance."""
     skip_if_gluon_unsupported("gluon")
 
     torch.manual_seed(20)
@@ -220,6 +215,112 @@ def test_mha_fp8_gluon(
     )
 
     torch_out, _, _ = attention_ref(q, k, v, causal=CAUSAL)
+
+    _fp8_assert_close(gluon_out, torch_out.to(gluon_out.dtype))
+
+
+def _quantize_fp8_per_bh_varlen(x, fp8_dtype, cu_seqlens):
+    """Varlen counterpart of _quantize_fp8_bshd.
+
+    x: [total_tokens, heads, head_dim]. Returns (x_fp8, [batch, heads] fp32
+    descale).
+    """
+    fp8_max = torch.finfo(fp8_dtype).max
+    batch = cu_seqlens.numel() - 1
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+    token_batch = torch.repeat_interleave(torch.arange(batch, device=x.device), seqlens)
+    amax = torch.zeros((batch, x.shape[1]), device=x.device, dtype=torch.float32)
+    amax.index_reduce_(
+        0, token_batch, x.abs().amax(dim=-1).float(), "amax", include_self=False
+    )
+    amax = amax.clamp(min=1e-9)  # [batch, heads]
+    scale = fp8_max / amax
+    x_fp8 = (x * scale[token_batch].unsqueeze(-1)).to(fp8_dtype)
+    descale = (amax / fp8_max).to(torch.float32)
+    return x_fp8, descale
+
+
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (512, 2048)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 8), (16, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_varlen_fp8_gluon(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    dtype=torch.bfloat16,
+):
+    skip_if_gluon_unsupported("gluon")
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    query_padding_mask = generate_random_padding_mask(
+        SEQLEN_Q, BATCH, "cuda", mode="random"
+    )
+    key_padding_mask = generate_random_padding_mask(
+        SEQLEN_K, BATCH, "cuda", mode="random"
+    )
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        _,
+        _,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+    # generate_qkv returns grad-tracking tensors; detach so the quantization below
+    # doesn't build an autograd graph for this forward-only kernel.
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = _quantize_fp8_per_bh_varlen(
+        q_unpad.detach(), fp8_dtype, cu_seqlens_q
+    )
+    k_fp8, k_descale = _quantize_fp8_per_bh_varlen(
+        k_unpad.detach(), fp8_dtype, cu_seqlens_k
+    )
+    v_fp8, v_descale = _quantize_fp8_per_bh_varlen(
+        v_unpad.detach(), fp8_dtype, cu_seqlens_k
+    )
+
+    gluon_out = flash_attn_varlen_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=CAUSAL,
+        backend="gluon",
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    gluon_out = output_pad_fn(gluon_out)
+
+    torch_out, _, _ = attention_ref(
+        q,
+        k,
+        v,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        causal=CAUSAL,
+    )
 
     _fp8_assert_close(gluon_out, torch_out.to(gluon_out.dtype))
 
