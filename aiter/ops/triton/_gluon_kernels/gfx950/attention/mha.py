@@ -37,18 +37,20 @@ def _make_kv_shared_layouts(
     head_dim_pow2, elem_bytes, k_width=8, non_k_dim=16, banks=64
 ):
     """Swizzled LDS layouts for the K/V staging tiles."""
-    bank_line_bytes = banks * 4
-    bank_line_elems = bank_line_bytes // elem_bytes
-    read_vec_bytes = min(k_width * elem_bytes, 16)
-    num_threads_same_cycle = bank_line_bytes // read_vec_bytes
-    per_phase = (bank_line_elems + head_dim_pow2 - 1) // head_dim_pow2
-    swizzle_vec = min(k_width * max(1, per_phase // 2), read_vec_bytes // elem_bytes)
-    max_phase = min(
-        min(non_k_dim, num_threads_same_cycle) // per_phase,
-        bank_line_elems // swizzle_vec,
-    )
-    k_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[0, 1])
-    v_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[1, 0])
+    # bank_line_bytes = banks * 4
+    # bank_line_elems = bank_line_bytes // elem_bytes
+    # read_vec_bytes = min(k_width * elem_bytes, 16)
+    # num_threads_same_cycle = bank_line_bytes // read_vec_bytes
+    # per_phase = (bank_line_elems + head_dim_pow2 - 1) // head_dim_pow2
+    # swizzle_vec = min(k_width * max(1, per_phase // 2), read_vec_bytes // elem_bytes)
+    # max_phase = min(
+    # min(non_k_dim, num_threads_same_cycle) // per_phase,
+    # bank_line_elems // swizzle_vec,
+    # )
+    # k_shared = gl.SwizzledSharedLayout(swizzle_vec, p er_phase, max_phase, order=[0, 1])
+    # v_shared = gl.SwizzledSharedLayout(swizzle_vec, per_phase, max_phase, order=[1, 0])
+    k_shared = gl.SwizzledSharedLayout(1, 1, 1, order=[0, 1])
+    v_shared = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
     return k_shared, v_shared
 
 
@@ -72,35 +74,39 @@ def _make_load_layout(block_dmodel, load_vec, num_warps, transposed, lanes=64):
 
 
 @gluon.jit
-def _buffer_load_2d(
-    base, offsets, offset_first, offset_second, boundary_first, boundary_second
+def _copy_2d_to_smem(
+    dest, base, offsets, offset_first, offset_second, boundary_first, boundary_second
 ):
-    """buffer_load of one tile into registers; masked lanes read 0."""
+    """Copy one tile from global memory straight into LDS"""
     if offset_first is not None and offset_second is not None:
         mask = (offset_first[:, None] < boundary_first) & (
             offset_second[None, :] < boundary_second
         )
-        tile = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets, mask=mask, other=0.0)
     elif offset_first is not None:
         mask = offset_first[:, None] < boundary_first
-        tile = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets, mask=mask, other=0.0)
     elif offset_second is not None:
         mask = offset_second[None, :] < boundary_second
-        tile = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets, mask=mask, other=0.0)
     else:
-        tile = gl.amd.cdna4.buffer_load(ptr=base, offsets=offsets)
-    return tile
+        mask = None
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(dest, base, offsets, mask=mask)
 
 
 @gluon.jit
-def _load_k(
+def _copy_kv_to_smem(
+    smemK,
+    smemKpe,
+    smemV,
+    buf,
     k_base,
     k_offsets,
     k_pe_offsets,
+    v_base,
+    v_offsets,
     load_start_n,
     seqlen_k,
     kLoadLayout: gl.constexpr,
     kPeLoadLayout: gl.constexpr,
+    vLoadLayout: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
@@ -109,7 +115,10 @@ def _load_k(
     PADDED_HEAD: gl.constexpr,
     HAS_PE: gl.constexpr,
 ):
-    """buffer_load one K block ([BLOCK_DMODEL_POW2, BLOCK_N]), and its PE ([BLOCK_DMODEL_PE, BLOCK_N]) when PE is on (else None)."""
+    """Stage one key block into buffer ``buf``: K ([BLOCK_DMODEL_POW2, BLOCK_N]),
+    its PE slice ([BLOCK_DMODEL_PE, BLOCK_N]) when PE is on, and V
+    ([BLOCK_N, BLOCK_DMODEL_POW2]).
+    """
     k_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kLoadLayout))
     k_offs_d = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(1, kLoadLayout))
     if MASK_STEPS:
@@ -120,7 +129,9 @@ def _load_k(
         k_d = k_offs_d
     else:
         k_d = None
-    k_tile = _buffer_load_2d(k_base, k_offsets, k_d, k_n, BLOCK_DMODEL, seqlen_k)
+    _copy_2d_to_smem(
+        smemK.index(buf), k_base, k_offsets, k_d, k_n, BLOCK_DMODEL, seqlen_k
+    )
 
     if HAS_PE:
         if MASK_STEPS:
@@ -129,27 +140,16 @@ def _load_k(
             )
         else:
             k_pe_n = None
-        return k_tile, _buffer_load_2d(
-            k_base, k_pe_offsets, None, k_pe_n, BLOCK_DMODEL_PE, seqlen_k
+        _copy_2d_to_smem(
+            smemKpe.index(buf),
+            k_base,
+            k_pe_offsets,
+            None,
+            k_pe_n,
+            BLOCK_DMODEL_PE,
+            seqlen_k,
         )
-    else:
-        return k_tile, None
 
-
-@gluon.jit
-def _load_v(
-    v_base,
-    v_offsets,
-    load_start_n,
-    seqlen_k,
-    vLoadLayout: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    BLOCK_DMODEL: gl.constexpr,
-    BLOCK_DMODEL_POW2: gl.constexpr,
-    MASK_STEPS: gl.constexpr,
-    PADDED_HEAD: gl.constexpr,
-):
-    """buffer_load one V block ([BLOCK_N, BLOCK_DMODEL_POW2]) into registers."""
     v_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, vLoadLayout))
     v_offs_d = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, vLoadLayout))
     if MASK_STEPS:
@@ -160,21 +160,19 @@ def _load_v(
         v_d = v_offs_d
     else:
         v_d = None
-    return _buffer_load_2d(v_base, v_offsets, v_n, v_d, seqlen_k, BLOCK_DMODEL)
+    _copy_2d_to_smem(
+        smemV.index(buf), v_base, v_offsets, v_n, v_d, seqlen_k, BLOCK_DMODEL
+    )
+
+    gl.amd.cdna4.async_copy.commit_group()
 
 
 @gluon.jit
-def _store_k_smem(smemK, smemKpe, buf, k_tile, k_pe_tile, HAS_PE: gl.constexpr):
-    smemK.index(buf).store(k_tile)
+def _read_k_smem(smemK, smemKpe, buf, dotK: gl.constexpr, HAS_PE: gl.constexpr):
+    """Read the staged K block (and its PE slice) as MFMA dot operands."""
+    k = gl.amd.cdna4.async_copy.load_shared_relaxed(smemK.index(buf), dotK)
     if HAS_PE:
-        smemKpe.index(buf).store(k_pe_tile)
-
-
-@gluon.jit
-def _load_k_smem(smemK, smemKpe, buf, dotK: gl.constexpr, HAS_PE: gl.constexpr):
-    k = smemK.index(buf).load(dotK)
-    if HAS_PE:
-        return k, smemKpe.index(buf).load(dotK)
+        return k, gl.amd.cdna4.async_copy.load_shared_relaxed(smemKpe.index(buf), dotK)
     else:
         return k, None
 
@@ -333,15 +331,23 @@ def _attn_fwd_inner(
 
     n_iter = (block_max - block_min) // BLOCK_N
 
-    # Prologue
-    k_tile, k_pe_tile = _load_k(
+    # Prologue: prime every buffer so each block gets a full iteration of
+    # compute to land in before it is read.
+    _copy_kv_to_smem(
+        smemK,
+        smemKpe,
+        smemV,
+        0,
         k_base,
         k_offsets,
         k_pe_offsets,
+        v_base,
+        v_offsets,
         block_min,
         seqlen_k,
         kLoadLayout,
         kPeLoadLayout,
+        vLoadLayout,
         BLOCK_N,
         BLOCK_DMODEL,
         BLOCK_DMODEL_POW2,
@@ -350,69 +356,22 @@ def _attn_fwd_inner(
         PADDED_HEAD,
         HAS_PE,
     )
-    v_tile = _load_v(
-        v_base,
-        v_offsets,
-        block_min,
-        seqlen_k,
-        vLoadLayout,
-        BLOCK_N,
-        BLOCK_DMODEL,
-        BLOCK_DMODEL_POW2,
-        False,
-        PADDED_HEAD,
-    )
-    _store_k_smem(smemK, smemKpe, 0, k_tile, k_pe_tile, HAS_PE)
-    smemV.index(0).store(v_tile)
-
     if n_iter > 1:
-        k_tile, k_pe_tile = _load_k(
+        _copy_kv_to_smem(
+            smemK,
+            smemKpe,
+            smemV,
+            1,
             k_base + BLOCK_N * stride_kn,
             k_offsets,
             k_pe_offsets,
-            block_min + BLOCK_N,
-            seqlen_k,
-            kLoadLayout,
-            kPeLoadLayout,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            BLOCK_DMODEL_PE,
-            False,
-            PADDED_HEAD,
-            HAS_PE,
-        )
-        v_tile = _load_v(
             v_base + BLOCK_N * stride_vn,
             v_offsets,
             block_min + BLOCK_N,
             seqlen_k,
-            vLoadLayout,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            False,
-            PADDED_HEAD,
-        )
-        _store_k_smem(smemK, smemKpe, 1, k_tile, k_pe_tile, HAS_PE)
-        smemV.index(1).store(v_tile)
-
-    for i in range(n_iter - NUM_KV_BUFFERS):
-        buf = i % NUM_KV_BUFFERS
-
-        # Read block i
-        k, k_pe = _load_k_smem(smemK, smemKpe, buf, dotK, HAS_PE)
-        v = smemV.index(buf).load(dotV)
-
-        # Issue block i+2
-        k_pf, k_pe_pf = _load_k(
-            k_base + (i + 2) * BLOCK_N * stride_kn,
-            k_offsets,
-            k_pe_offsets,
-            block_min + (i + 2) * BLOCK_N,
-            seqlen_k,
             kLoadLayout,
             kPeLoadLayout,
+            vLoadLayout,
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
@@ -421,19 +380,13 @@ def _attn_fwd_inner(
             PADDED_HEAD,
             HAS_PE,
         )
-        v_pf = _load_v(
-            v_base + (i + 2) * BLOCK_N * stride_vn,
-            v_offsets,
-            block_min + (i + 2) * BLOCK_N,
-            seqlen_k,
-            vLoadLayout,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            False,
-            PADDED_HEAD,
-        )
 
+    for i in range(n_iter - NUM_KV_BUFFERS):
+        buf = i % NUM_KV_BUFFERS
+
+        gl.amd.cdna4.async_copy.wait_group(NUM_KV_BUFFERS - 1)
+
+        k, k_pe = _read_k_smem(smemK, smemKpe, buf, dotK, HAS_PE)
         qk = _attn_qk(
             q,
             k,
@@ -451,6 +404,7 @@ def _attn_fwd_inner(
             SLIDING_WINDOW=SLIDING_WINDOW,
         )
 
+        v = gl.amd.cdna4.async_copy.load_shared_relaxed(smemV.index(buf), dotV)
         acc, l_i, m_i = _attn_softmax_pv(
             acc,
             l_i,
@@ -466,15 +420,36 @@ def _attn_fwd_inner(
             FP8_MAX,
         )
 
-        # Store block i+2
-        _store_k_smem(smemK, smemKpe, buf, k_pf, k_pe_pf, HAS_PE)
-        smemV.index(buf).store(v_pf)
+        # buf has been fully read, so it can take block i+2.
+        _copy_kv_to_smem(
+            smemK,
+            smemKpe,
+            smemV,
+            buf,
+            k_base + (i + 2) * BLOCK_N * stride_kn,
+            k_offsets,
+            k_pe_offsets,
+            v_base + (i + 2) * BLOCK_N * stride_vn,
+            v_offsets,
+            block_min + (i + 2) * BLOCK_N,
+            seqlen_k,
+            kLoadLayout,
+            kPeLoadLayout,
+            vLoadLayout,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE,
+            False,
+            PADDED_HEAD,
+            HAS_PE,
+        )
 
-    # Epilogue
+    # Epilogue: drain the blocks still in flight, in issue order.
     if n_iter > 1:
         buf = (n_iter - 2) % NUM_KV_BUFFERS
-        k, k_pe = _load_k_smem(smemK, smemKpe, buf, dotK, HAS_PE)
-        v = smemV.index(buf).load(dotV)
+        gl.amd.cdna4.async_copy.wait_group(1)
+        k, k_pe = _read_k_smem(smemK, smemKpe, buf, dotK, HAS_PE)
         qk = _attn_qk(
             q,
             k,
@@ -491,6 +466,7 @@ def _attn_fwd_inner(
             IS_FP8=IS_FP8,
             SLIDING_WINDOW=SLIDING_WINDOW,
         )
+        v = gl.amd.cdna4.async_copy.load_shared_relaxed(smemV.index(buf), dotV)
         acc, l_i, m_i = _attn_softmax_pv(
             acc,
             l_i,
@@ -507,8 +483,8 @@ def _attn_fwd_inner(
         )
 
     buf = (n_iter - 1) % NUM_KV_BUFFERS
-    k, k_pe = _load_k_smem(smemK, smemKpe, buf, dotK, HAS_PE)
-    v = smemV.index(buf).load(dotV)
+    gl.amd.cdna4.async_copy.wait_group(0)
+    k, k_pe = _read_k_smem(smemK, smemKpe, buf, dotK, HAS_PE)
     qk = _attn_qk(
         q,
         k,
@@ -525,6 +501,7 @@ def _attn_fwd_inner(
         IS_FP8=IS_FP8,
         SLIDING_WINDOW=SLIDING_WINDOW,
     )
+    v = gl.amd.cdna4.async_copy.load_shared_relaxed(smemV.index(buf), dotV)
     acc, l_i, m_i = _attn_softmax_pv(
         acc,
         l_i,
@@ -600,14 +577,21 @@ def _attn_fwd_inner_masked(
     for i in range(n_iter):
         start_n = block_min + i * BLOCK_N
 
-        k_tile, k_pe_tile = _load_k(
+        _copy_kv_to_smem(
+            smemK,
+            smemKpe,
+            smemV,
+            0,
             k_base,
             k_offsets,
             k_pe_offsets,
+            v_base,
+            v_offsets,
             start_n,
             seqlen_k,
             kLoadLayout,
             kPeLoadLayout,
+            vLoadLayout,
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
@@ -616,25 +600,11 @@ def _attn_fwd_inner_masked(
             PADDED_HEAD,
             HAS_PE,
         )
-        v_tile = _load_v(
-            v_base,
-            v_offsets,
-            start_n,
-            seqlen_k,
-            vLoadLayout,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            MASK_STEPS,
-            PADDED_HEAD,
-        )
-        _store_k_smem(smemK, smemKpe, 0, k_tile, k_pe_tile, HAS_PE)
-        smemV.index(0).store(v_tile)
         k_base += BLOCK_N * stride_kn
         v_base += BLOCK_N * stride_vn
 
-        k, k_pe = _load_k_smem(smemK, smemKpe, 0, dotK, HAS_PE)
-        v = smemV.index(0).load(dotV)
+        gl.amd.cdna4.async_copy.wait_group(0)
+        k, k_pe = _read_k_smem(smemK, smemKpe, 0, dotK, HAS_PE)
 
         qk = _attn_qk(
             q,
@@ -659,6 +629,7 @@ def _attn_fwd_inner_masked(
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=MASK_STEPS,
         )
+        v = gl.amd.cdna4.async_copy.load_shared_relaxed(smemV.index(0), dotV)
         acc, l_i, m_i = _attn_softmax_pv(
             acc,
             l_i,
