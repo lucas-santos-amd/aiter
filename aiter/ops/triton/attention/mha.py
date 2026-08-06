@@ -11,6 +11,9 @@ from packaging.version import Version
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _attn_fwd as _gluon_attn_fwd,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+    _get_config as _get_gluon_config,
+)
 from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
@@ -43,6 +46,22 @@ def is_gluon_available() -> bool:
         return False
     arch = get_arch() or ""
     return any(supported in arch for supported in _GLUON_SUPPORTED_ARCHS)
+
+
+_MHA_BACKENDS = ("triton", "gluon")
+
+
+def _resolve_backend(
+    backend: Literal["triton", "gluon"] | None,
+) -> Literal["triton", "gluon"]:
+    """None selects the default Triton backend; anything else must be known."""
+    if backend is None:
+        return "triton"
+    if backend not in _MHA_BACKENDS:
+        raise ValueError(
+            f"Unknown MHA backend {backend!r}, expected one of {_MHA_BACKENDS}"
+        )
+    return backend
 
 
 def mha_set_use_fused_bwd_kernel(value: bool):
@@ -125,8 +144,7 @@ def _gluon_flash_attn_forward(
     descale_v=None,
     sink=None,
     window_size=(-1, -1),
-    BLOCK_M=128,
-    BLOCK_N=64,
+    config: dict[str, any] | None = None,
 ):
     """Validate + launch the Gluon forward kernel for both fixed-length (bshd)
     and varlen (thd) batches.
@@ -156,7 +174,6 @@ def _gluon_flash_attn_forward(
         f"Triton>=3.6 (arch={get_arch()!r}, triton={triton.__version__})"
     )
     assert q.shape[-1] == k.shape[-1], "q/k head_dim mismatch"
-    assert BLOCK_N % 32 == 0, "BLOCK_N must be a multiple of 32"
 
     if int(window_size[1]) != -1:
         raise ValueError("window_size_right is not supported yet in the Gluon Backend")
@@ -180,11 +197,18 @@ def _gluon_flash_attn_forward(
             f"FP8 Gluon MHA only supports the e4m3 fp8 dtype ({types.e4m3_dtype}) "
             f"(got q={q.dtype}, k={k.dtype}, v={v.dtype})"
         )
-        # The scaled f8f6f4 MFMA is 32x32x64 (K=64), so the P@V contraction
-        # (BLOCK_N) must be a multiple of 64.
-        BLOCK_N = max(BLOCK_N, 64)
-    elif pe_head_dim > 0:
-        BLOCK_N = min(BLOCK_N, 32)
+
+    if config is None:
+        config = _get_gluon_config(is_fp8=IS_FP8, has_pe=pe_head_dim > 0)
+    config = dict(config)
+    BLOCK_M = config.pop("BLOCK_M")
+    BLOCK_N = config.pop("BLOCK_N")
+    assert BLOCK_N % 32 == 0, "BLOCK_N must be a multiple of 32"
+    # The scaled f8f6f4 MFMA is 32x32x64 (K=64), so the P@V contraction
+    # (BLOCK_N) must be a multiple of 64.
+    assert (
+        not IS_FP8 or BLOCK_N % 64 == 0
+    ), "FP8 Gluon MHA requires BLOCK_N to be a multiple of 64"
 
     if varlen:
         _, num_q_heads, _ = q.shape
@@ -293,7 +317,6 @@ def _gluon_flash_attn_forward(
         BLOCK_DMODEL=v_head_dim,
         BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
         BLOCK_DMODEL_PE=pe_head_dim,
-        PRELOAD_V=True,
         NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
         IS_FP8=IS_FP8,
@@ -301,8 +324,7 @@ def _gluon_flash_attn_forward(
         ENABLE_SINK=sink is not None,
         SLIDING_WINDOW=sliding_window,
         HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
-        num_warps=4,
-        waves_per_eu=2,
+        **config,
     )
 
     if v_head_dim != head_size_og:
@@ -788,7 +810,7 @@ def flash_attn_func(
     k_descale=None,
     v_descale=None,
     config: dict[str, any] | None = None,
-    backend: str | None = "triton",
+    backend: Literal["triton", "gluon"] | None = "triton",
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -849,6 +871,7 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    backend = _resolve_backend(backend)
     _LOGGER.info(
         f"FLASH_ATTN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
     )
@@ -873,6 +896,7 @@ def flash_attn_func(
             descale_v=v_descale,
             sink=sink,
             window_size=window_size,
+            config=config,
         )
 
     return _FlashAttnFunc.apply(
@@ -1130,7 +1154,7 @@ def flash_attn_varlen_func(
     k_descale=None,
     v_descale=None,
     config: dict[str, any] | None = None,
-    backend: str | None = "triton",
+    backend: Literal["triton", "gluon"] | None = "triton",
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1197,6 +1221,7 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    backend = _resolve_backend(backend)
     _LOGGER.info(
         f"FLASH_ATTN_VARLEN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
     )
@@ -1227,6 +1252,7 @@ def flash_attn_varlen_func(
             descale_v=v_descale,
             sink=sink,
             window_size=window_size,
+            config=config,
         )
 
     return _FlashAttnVarlenFunc.apply(

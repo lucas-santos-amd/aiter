@@ -22,14 +22,18 @@
 # THE SOFTWARE.
 ##############################################################################
 
+import json
+
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 @gluon.constexpr_function
@@ -740,7 +744,6 @@ def _attn_fwd(
     BLOCK_DMODEL: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
     BLOCK_DMODEL_PE: gl.constexpr,  # zero, or a power of 2 >= 16
-    PRELOAD_V: gl.constexpr,
     NUM_XCD: gl.constexpr,
     USE_INT64_STRIDES: gl.constexpr,
     IS_FP8: gl.constexpr,
@@ -1259,3 +1262,19 @@ def _attn_fwd(
     if PADDED_HEAD:
         out_mask = out_mask & (offs_od[None, :] < BLOCK_DMODEL)
     gl.amd.cdna4.buffer_store(out, ptr=o_base, offsets=o_offsets, mask=out_mask)
+
+
+def _get_config(is_fp8: bool, has_pe: bool = False):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_arch()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-GLUON.json"
+        with open(fpath, "r") as file:
+            _get_config._config_dict = json.load(file)
+    fwd_cfg = _get_config._config_dict["fwd"]
+    # TODO: configs are not tuned
+    if is_fp8:
+        return fwd_cfg["fp8"]
+    elif has_pe:
+        return fwd_cfg["pe"]
+    else:
+        return fwd_cfg["default"]
