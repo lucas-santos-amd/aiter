@@ -22,7 +22,6 @@
 # THE SOFTWARE.
 ##############################################################################
 
-import json
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -33,7 +32,7 @@ from aiter.ops.triton.utils._triton.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 
 
 @gluon.constexpr_function
@@ -744,6 +743,7 @@ def _attn_fwd(
     BLOCK_DMODEL: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
     BLOCK_DMODEL_PE: gl.constexpr,  # zero, or a power of 2 >= 16
+    BLOCK_DMODEL_OUT: gl.constexpr,
     NUM_XCD: gl.constexpr,
     USE_INT64_STRIDES: gl.constexpr,
     IS_FP8: gl.constexpr,
@@ -755,6 +755,7 @@ def _attn_fwd(
 ):
     RCP_LN2: gl.constexpr = 1.4426950408889634
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
+    PADDED_HEAD_OUT: gl.constexpr = BLOCK_DMODEL_OUT != BLOCK_DMODEL_POW2
     HAS_PE: gl.constexpr = BLOCK_DMODEL_PE > 0
 
     # NOTE:
@@ -1075,8 +1076,8 @@ def _attn_fwd(
                 layout=storeLayout,
             )
             o_mask = offs_om[:, None] < seqlen_q
-            if PADDED_HEAD:
-                o_mask = o_mask & (offs_od[None, :] < BLOCK_DMODEL)
+            if PADDED_HEAD_OUT:
+                o_mask = o_mask & (offs_od[None, :] < BLOCK_DMODEL_OUT)
             gl.amd.cdna4.buffer_store(zeros, ptr=o_base, offsets=o_offsets, mask=o_mask)
             return
 
@@ -1259,17 +1260,16 @@ def _attn_fwd(
     out_mask = gl.full([BLOCK_M, 1], True, dtype=gl.int1, layout=storeLayout)
     if overflow_size > 0:
         out_mask = out_mask & (offs_om[:, None] < seqlen_q)
-    if PADDED_HEAD:
-        out_mask = out_mask & (offs_od[None, :] < BLOCK_DMODEL)
+    if PADDED_HEAD_OUT:
+        out_mask = out_mask & (offs_od[None, :] < BLOCK_DMODEL_OUT)
     gl.amd.cdna4.buffer_store(out, ptr=o_base, offsets=o_offsets, mask=out_mask)
 
 
 def _get_config(is_fp8: bool, has_pe: bool = False):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-GLUON.json"
-        with open(fpath, "r") as file:
-            _get_config._config_dict = json.load(file)
+        arch = arch_info.get_arch()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/gluon/attention/mha/mha.json"
+        _get_config._config_dict = load_config_json(fpath)
     fwd_cfg = _get_config._config_dict["fwd"]
     # TODO: configs are not tuned
     if is_fp8:

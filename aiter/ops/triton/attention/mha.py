@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+import warnings
 from typing import Literal
 
 import torch
@@ -258,26 +259,36 @@ def _gluon_flash_attn_forward(
     if sm_scale is None:
         sm_scale = qk_head_dim ** (-0.5)
 
-    # Pad to a vectorizable head dim. Unreachable with positional encoding,
-    # which requires unpadded power-of-2 head sizes.
+    # Pad to a vectorizable head dim
     head_size_og = v_head_dim
     if head_size_og % 8 != 0:
         pad = 8 - head_size_og % 8
+        warnings.warn(
+            f"Gluon MHA is padding q/k/v from head_dim {head_size_og} to "
+            f"{head_size_og + pad} so the head-axis accesses vectorize. This costs "
+            f"three extra pad kernels per call; use a head_dim that is a multiple "
+            f"of 8 to avoid them.",
+            # 3 frames up is the flash_attn_func / flash_attn_varlen_func caller.
+            stacklevel=3,
+        )
         q = torch.nn.functional.pad(q, [0, pad])
         k = torch.nn.functional.pad(k, [0, pad])
         v = torch.nn.functional.pad(v, [0, pad])
         v_head_dim = v.shape[-1]
 
-    o_provided = o
-    if IS_FP8 or o is None or v_head_dim != head_size_og:
-        o_dtype = torch.float32 if IS_FP8 else q.dtype
-        if pe_head_dim > 0:
-            # Q/K carry the PE slice, the output only spans V's head dim.
-            o = torch.empty(
-                q.shape[:-1] + (v_head_dim,), dtype=o_dtype, device=q.device
-            )
-        else:
-            o = torch.empty_like(q, dtype=o_dtype)
+    # o keeps the unpadded head dim: the kernel drops the padding lanes in its
+    # store (BLOCK_DMODEL_OUT), so it writes straight into the caller's buffer.
+    o_shape = q.shape[:-1] + (head_size_og,)
+    o_dtype = torch.float32 if IS_FP8 else q.dtype
+    if o is None:
+        o = torch.empty(o_shape, dtype=o_dtype, device=q.device)
+    else:
+        assert (
+            o.shape == o_shape
+        ), f"Gluon MHA out shape mismatch: expected {tuple(o_shape)}, got {tuple(o.shape)}"
+        assert (
+            o.dtype == o_dtype
+        ), f"Gluon MHA out dtype mismatch: expected {o_dtype}, got {o.dtype}"
 
     if varlen:
         # (total_tokens, head, head_dim)
@@ -345,6 +356,7 @@ def _gluon_flash_attn_forward(
         BLOCK_DMODEL=v_head_dim,
         BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
         BLOCK_DMODEL_PE=pe_head_dim,
+        BLOCK_DMODEL_OUT=head_size_og,
         NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
         IS_FP8=IS_FP8,
@@ -355,11 +367,6 @@ def _gluon_flash_attn_forward(
         **config,
     )
 
-    if v_head_dim != head_size_og:
-        o = o[..., :head_size_og]
-    if o_provided is not None and o_provided.data_ptr() != o.data_ptr():
-        o_provided.copy_(o)
-        o = o_provided
     return o
 
 
