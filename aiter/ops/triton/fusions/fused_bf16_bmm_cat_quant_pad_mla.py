@@ -18,6 +18,11 @@ def _get_config(M: int, N: int, K: int, B: int) -> tuple[dict, bool]:
     return get_gemm_config("FUSED-BF16-BMM-CAT-QUANT-PAD-MLA", M, N, K, B=B)
 
 
+def _get_rope_cache_config(M: int, N: int, K: int, B: int) -> tuple[dict, bool]:
+    # Own family: the RoPE and KV-cache programs change the best BMM tiles.
+    return get_gemm_config("FUSED-BF16-BMM-ROPE-CAT-QUANT-PAD-CACHE-MLA", M, N, K, B=B)
+
+
 def _launch(
     q_nope: torch.Tensor,
     w_uk_t: torch.Tensor,
@@ -86,7 +91,8 @@ def _launch(
         )
 
     if config is None:
-        config, _ = _get_config(m, n, k, qh)
+        get_config = _get_rope_cache_config if rope_and_cache else _get_config
+        config, _ = get_config(m, n, k, qh)
 
     num_pid_m = triton.cdiv(m, config["BLOCK_SIZE_M"])
     num_pid_n = triton.cdiv(n, config["BLOCK_SIZE_N"])
@@ -213,8 +219,11 @@ def fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
     only for gfx950. On other archs, pass config.
 
     Args:
-        q_nope, w_uk_t, q_scale, num_padded_heads, out, fp8_max, config: As in
+        q_nope, w_uk_t, q_scale, num_padded_heads, out, fp8_max: As in
             fused_bf16_bmm_cat_quant_pad_mla.
+        config (Optional[dict]): Kernel tuning parameters, with the keys of
+            fused_bf16_bmm_cat_quant_pad_mla. Defaults to the
+            FUSED-BF16-BMM-ROPE-CAT-QUANT-PAD-CACHE-MLA config for the shape.
         q_pe (torch.Tensor): (M, QH, R) bf16 before RoPE. R is a power of two.
         kv_c (torch.Tensor): (M, L) bf16 compressed KV, L = w_uk_t.shape[-1].
         k_pe (torch.Tensor): (M, R) bf16 key pe before RoPE.

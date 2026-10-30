@@ -90,15 +90,19 @@ def check_against_ref(out, ref, num_padded_heads, qh):
 
 
 def generate_rope_cache_inputs(
-    M: int, d_rope: int = D_ROPE, block_size: int = 16, max_pos: int = 4096
+    M: int,
+    kv_lora: int = KV_LORA,
+    d_rope: int = D_ROPE,
+    block_size: int = 16,
+    max_pos: int = 4096,
 ):
     """kv_c and the unroped k_pe as strided views of one (M, kv_lora + d_rope)
     buffer, as vLLM's MLA passes them, a bf16 cos | sin cache, and slots in a
     paged cache with every 5th token from token 1 on padded (slot -1)."""
     kv_lora_out = torch.randn(
-        (M, KV_LORA + d_rope), dtype=torch.bfloat16, device="cuda"
+        (M, kv_lora + d_rope), dtype=torch.bfloat16, device="cuda"
     )
-    kv_c, k_pe = kv_lora_out.split((KV_LORA, d_rope), dim=-1)
+    kv_c, k_pe = kv_lora_out.split((kv_lora, d_rope), dim=-1)
     angles = torch.rand((max_pos, d_rope // 2), dtype=torch.float32, device="cuda")
     cos_sin_cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(torch.bfloat16)
     positions = torch.randint(0, max_pos, (M,), device="cuda")
@@ -108,7 +112,7 @@ def generate_rope_cache_inputs(
     kv_cache = torch.randint(
         0,
         256,
-        (num_blocks, block_size, KV_LORA + d_rope),
+        (num_blocks, block_size, kv_lora + d_rope),
         dtype=torch.uint8,
         device="cuda",
     )

@@ -17,6 +17,7 @@ import triton
 
 from aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla import (
     _get_config,
+    _get_rope_cache_config,
     fused_bf16_bmm_cat_quant_pad_mla,
     fused_bf16_bmm_rope_cat_quant_pad_cache_mla,
 )
@@ -86,7 +87,10 @@ def make_fn(M, provider, args, cat_quant):
     dup = args.padded_heads // args.qh
     config = None
     if args.config:
-        config, _ = _get_config(M, KV_LORA, D_NOPE, args.qh)
+        get_config = (
+            _get_rope_cache_config if provider == "fused_rope_cache" else _get_config
+        )
+        config, _ = get_config(M, KV_LORA, D_NOPE, args.qh)
         config.update(args.config)
 
     if provider == "unfused":
