@@ -310,40 +310,41 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
         tl.assume(stride_cache_b > 0)
         tl.assume(stride_cache_e > 0)
         tok = tl.cast(pid - bmm_programs - QH * num_pid_m, tl.int64)
+        # Issue every load before the slot check so their latencies overlap.
         tok_slot = tl.load(slot_ptr + tok).to(tl.int64)
-        if tok_slot >= 0:
-            k_scale = tl.load(k_scale_ptr).to(tl.float32)
-            cache_dtype = kv_cache_ptr.dtype.element_ty
-            entry_ptr = (
-                kv_cache_ptr
-                + (tok_slot // cache_block_size) * stride_cache_b
-                + (tok_slot % cache_block_size) * stride_cache_e
-            )
-            offs_c = tl.arange(0, BLOCK_N_KV)
-            c_mask = offs_c < N
-            kv_c = tl.load(
-                kv_c_ptr + tok * stride_kvc_m + offs_c * stride_kvc_d,
-                mask=c_mask,
-                other=0.0,
-            )
-            tl.store(
-                entry_ptr + offs_c * stride_cache_d,
-                _cache_fp8(kv_c, k_scale, CACHE_MAX, cache_dtype),
-                mask=c_mask,
-            )
-            offs_d = tl.arange(0, BLOCK_D_PE)
-            k_pe = tl.load(k_pe_ptr + tok * stride_kpe_m + offs_d * stride_kpe_d)
-            k_pe = _rope_vllm(
-                k_pe[None, :],
-                tl.load(pos_ptr + tok + tl.arange(0, 1)),
-                cos_sin_ptr,
-                stride_cs_pos,
-                stride_cs_d,
-                IS_NEOX,
-                1,
-                BLOCK_D_PE,
-            )
-            tl.store(
-                entry_ptr + (N + offs_d[None, :]) * stride_cache_d,
-                _cache_fp8(k_pe, k_scale, CACHE_MAX, cache_dtype),
-            )
+        k_scale = tl.load(k_scale_ptr).to(tl.float32)
+        offs_c = tl.arange(0, BLOCK_N_KV)
+        offs_d = tl.arange(0, BLOCK_D_PE)
+        kv_c = tl.load(
+            kv_c_ptr + tok * stride_kvc_m + offs_c * stride_kvc_d,
+            mask=offs_c < N,
+            other=0.0,
+        )
+        k_pe = tl.load(k_pe_ptr + tok * stride_kpe_m + offs_d * stride_kpe_d)
+        k_pe = _rope_vllm(
+            k_pe[None, :],
+            tl.load(pos_ptr + tok + tl.arange(0, 1)),
+            cos_sin_ptr,
+            stride_cs_pos,
+            stride_cs_d,
+            IS_NEOX,
+            1,
+            BLOCK_D_PE,
+        )
+        valid = tok_slot >= 0
+        cache_dtype = kv_cache_ptr.dtype.element_ty
+        entry_ptr = (
+            kv_cache_ptr
+            + (tok_slot // cache_block_size) * stride_cache_b
+            + (tok_slot % cache_block_size) * stride_cache_e
+        )
+        tl.store(
+            entry_ptr + offs_c * stride_cache_d,
+            _cache_fp8(kv_c, k_scale, CACHE_MAX, cache_dtype),
+            mask=(offs_c < N) & valid,
+        )
+        tl.store(
+            entry_ptr + (N + offs_d[None, :]) * stride_cache_d,
+            _cache_fp8(k_pe, k_scale, CACHE_MAX, cache_dtype),
+            mask=(offs_d[None, :] < BLOCK_D_PE) & valid,
+        )
