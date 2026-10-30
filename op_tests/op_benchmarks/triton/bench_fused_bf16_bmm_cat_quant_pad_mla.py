@@ -2,8 +2,11 @@
 Benchmark the fused MLA decode query prep (fused_bf16_bmm_cat_quant_pad_mla)
 against the unfused path vLLM runs ahead of the padded asm MLA decode:
 torch.bmm (W_UK absorb), the compiled cat + static fp8 quant, and
-repeat_interleave. Inputs rotate through a pool so each call reads its W_UK^T
-from HBM, as each decode layer does with its own weight.
+repeat_interleave. The fused_rope_cache provider also does the RoPE and the
+fp8 KV-cache write (fused_bf16_bmm_rope_cat_quant_pad_cache_mla); compare it
+with fused plus the cost of vLLM's concat_and_cache_mla_rope_fused. Inputs
+rotate through a pool so each call reads its W_UK^T from HBM, as each decode
+layer does with its own weight.
 """
 
 import json
@@ -15,6 +18,7 @@ import triton
 from aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla import (
     _get_config,
     fused_bf16_bmm_cat_quant_pad_mla,
+    fused_bf16_bmm_rope_cat_quant_pad_cache_mla,
 )
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
@@ -35,11 +39,25 @@ from op_tests.triton_tests.fusions.test_fused_bf16_bmm_cat_quant_pad_mla import 
     cat_quant_fp8,
     compiled_cat_quant_fp8,
     generate_inputs,
+    generate_rope_cache_inputs,
     vllm_fp8_max,
 )
 
-PROVIDERS = ["unfused", "fused"]
+PROVIDERS = ["unfused", "fused", "fused_rope_cache"]
 FIELDS = ("q_nope", "w_uk_t", "q_pe", "q_scale", "buf")
+ROPE_CACHE_FIELDS = FIELDS + (
+    "kv_c",
+    "k_pe",
+    "cos_sin_cache",
+    "positions",
+    "slot_mapping",
+    "kv_cache",
+    "k_scale",
+)
+
+
+def fields(provider):
+    return ROPE_CACHE_FIELDS if provider == "fused_rope_cache" else FIELDS
 
 
 def make_input_gen(M, provider, args):
@@ -54,7 +72,11 @@ def make_input_gen(M, provider, args):
                 dtype=get_fp8_e4m3_dtype(),
                 device="cuda",
             )
-        return q_nope, w_uk_t, q_pe, q_scale, buf
+        if provider != "fused_rope_cache":
+            return q_nope, w_uk_t, q_pe, q_scale, buf
+        rope_cache = generate_rope_cache_inputs(M)
+        k_scale = torch.ones((), dtype=torch.float32, device="cuda")
+        return q_nope, w_uk_t, q_pe, q_scale, buf, *rope_cache, k_scale
 
     return gen
 
@@ -74,7 +96,7 @@ def make_fn(M, provider, args, cat_quant):
             q = cat_quant(buf, q_pe, q_scale, fp8_max)
             return q.repeat_interleave(dup, dim=1)
 
-    else:
+    elif provider == "fused":
 
         def fn(q_nope, w_uk_t, q_pe, q_scale, buf):
             return fused_bf16_bmm_cat_quant_pad_mla(
@@ -88,6 +110,42 @@ def make_fn(M, provider, args, cat_quant):
                 config=config,
             )
 
+    else:
+        cache_dtype = get_fp8_e4m3_dtype()
+
+        def fn(
+            q_nope,
+            w_uk_t,
+            q_pe,
+            q_scale,
+            buf,
+            kv_c,
+            k_pe,
+            cos_sin_cache,
+            positions,
+            slot_mapping,
+            kv_cache,
+            k_scale,
+        ):
+            return fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
+                q_nope,
+                w_uk_t,
+                q_pe,
+                q_scale,
+                kv_c,
+                k_pe,
+                kv_cache.view(cache_dtype),
+                slot_mapping,
+                k_scale,
+                positions,
+                cos_sin_cache,
+                args.is_neox,
+                args.padded_heads,
+                out=buf,
+                fp8_max=fp8_max,
+                config=config,
+            )
+
     return fn
 
 
@@ -95,7 +153,9 @@ def print_kernels(M, args, cat_quant, calls=4):
     """Kernels each provider launches over a few calls, to compare with the vLLM
     trace names. Every kernel should show up once per call."""
     for provider in args.providers:
-        inputs = run_input_generator(make_input_gen(M, provider, args), FIELDS)
+        inputs = run_input_generator(
+            make_input_gen(M, provider, args), fields(provider)
+        )
         fn = make_fn(M, provider, args, cat_quant)
         fn(**inputs)
         torch.cuda.synchronize()
@@ -120,7 +180,9 @@ def print_kernels(M, args, cat_quant, calls=4):
 def bench_fn(M, provider, args, cat_quant):
     torch.manual_seed(0)
     rot_bufs = generate_rotating_buffers_pool(
-        [make_input_gen(M, provider, args)], [FIELDS], **get_rot_bufs_kwargs(args)
+        [make_input_gen(M, provider, args)],
+        [fields(provider)],
+        **get_rot_bufs_kwargs(args),
     )
     ms = do_bench_aiter_triton(
         make_fn(M, provider, args, cat_quant),
@@ -179,6 +241,12 @@ def parse_args(args: list[str] | None = None):
         type=positive_int,
         default=16,
         help="Head count of the padded MLA query",
+    )
+    parser.add_argument(
+        "--is-neox",
+        action="store_true",
+        default=False,
+        help="NeoX RoPE pairs for fused_rope_cache (default GPT-J, as Kimi-K2)",
     )
     parser.add_argument(
         "--config",
