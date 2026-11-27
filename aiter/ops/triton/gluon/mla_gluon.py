@@ -25,8 +25,7 @@
 # mla_gluon_split_metadata cuts the batch's KV into segments of one length, so a
 # long sequence gets more segments and the call no longer waits on the longest one.
 #
-# The bh16 regimes support num_iter in {1, 2, ...} (no gl.assume(num_iter>=3));
-# only bh64 assumes >= 3. See epilogue-1 handling below.
+# Every regime supports num_iter in {1, 2, ...}. See epilogue-1 handling below.
 #
 # Wrapper dispatch: nhead in {64,128} -> bh64; nhead <= 96 routes by KV dtype
 # (bf16 -> bh16bn64, fp8 -> bh16bn128), tiling heads into cdiv(nhead,16) blocks.
@@ -494,10 +493,6 @@ def _mla_gluon(
         gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv1, Kv_c_cache + offs_k_c1, mask=offs_n_nope1[None, :] < split_kv_end, other=0.0)
     gl.amd.cdna4.async_copy.commit_group()
 
-    if REGIME == 'bh64':
-        # bh64 guarantees >= 3 iters/split; this constant-folds the
-        # `if num_iter >= 2` epilogue-1 guard below so its codegen is unchanged.
-        gl.assume(num_iter >= 3)
     buf_idx = 0
     ################ loop
     for i in range(num_iter - 2):
@@ -596,9 +591,7 @@ def _mla_gluon(
     LOG2E: gl.constexpr = 1.4426950408889634
 
     ################ epilogue 1
-    # Skip when num_iter < 2 (possible for bh16bn64 / bh16bn128 in either mode).
-    # bh64 has gl.assume(num_iter >= 3) above so the compiler folds this branch
-    # out there; for the bh16 regimes it stays a runtime branch.
+    # Skip when num_iter < 2.
     if num_iter >= 2:
         async_idx = (buf_idx + 1) % 2
 
@@ -1159,13 +1152,6 @@ def _mla_gluon_launch(
             f"mla_gluon[bh64] requires batch_size divisible by the die count "
             f"{NUM_XCDS}, got {batch_size}"
         )
-        # gl.assume(num_iter > 3) inside the kernel requires every split to have
-        # > 3*BLOCK_N tokens. Smallest split (last) for batch length s is
-        # s - (k-1)*ceil(s/k); a sufficient bound is min_kv_seq_len > k*(3*BLOCK_N + k).
-        min_kv_seq_len_required = NUM_KV_SPLITS * (3 * BLOCK_N + NUM_KV_SPLITS)
-        assert (
-            min_kv_seq_len > min_kv_seq_len_required
-        ), f"mla_gluon[bh64] requires min_kv_seq_len > {min_kv_seq_len_required} (NUM_KV_SPLITS={NUM_KV_SPLITS}), got {min_kv_seq_len}"
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"

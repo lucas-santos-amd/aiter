@@ -45,10 +45,10 @@ def _sparse_prefill_attn_torch(
         unified_kv:        [total_pages, D]
         kv_indices_prefix: [total_prefix] int32
         kv_indptr_prefix:  [T+1] int32
-        kv:                [total_tokens, D] — ``None`` for no extend source
-        kv_indices_extend: [total_extend] int32 — ``None`` for no extend source
-        kv_indptr_extend:  [T+1] int32 — ``None`` for no extend source
-        attn_sink:         [H] fp32 — ``None`` for no sink
+        kv:                [total_tokens, D] - ``None`` for no extend source
+        kv_indices_extend: [total_extend] int32 - ``None`` for no extend source
+        kv_indptr_extend:  [T+1] int32 - ``None`` for no extend source
+        attn_sink:         [H] fp32 - ``None`` for no sink
     Slots outside ``[0, len(pool))`` (``-1`` sentinels or past the pool) are
     masked out.
     Returns:
@@ -439,7 +439,7 @@ def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
         H,
         D,
         prefix_len,
-        0,  # extend_len — single-source path
+        0,  # extend_len - single-source path
         total_pages,
         1,
     )
@@ -460,7 +460,7 @@ def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
         ukv,
         p_idx,
         p_indptr,
-        None,  # kv                — no extend source
+        None,  # kv                - no extend source
         None,  # kv_indices_extend
         None,  # kv_indptr_extend
         sink,
@@ -468,6 +468,37 @@ def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
     )
 
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# 64 or 128 heads take the bh64 regime on gfx950; short rows give KV splits of one
+# or two 64-key blocks. 64 queries get several splits, 1024 one.
+@pytest.mark.parametrize("T", [64, 1024])
+@pytest.mark.parametrize("H", [64, 128])
+def test_pa_prefill_sparse_gfx950_short_rows(T, H):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if DEVICE_ARCH not in ("gfx950",):
+        pytest.skip("this case targets the gfx950 single-source branch")
+
+    torch.manual_seed(0)
+    D, num_kv, dev = 512, 4096, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    lens = torch.randint(1, 641, (T,), device=dev)
+    lens[1::4] = torch.randint(1, 129, (lens[1::4].numel(),), device=dev)
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=dev)
+    indptr[1:] = lens.cumsum(0)
+    indices = torch.randint(
+        0, num_kv, (int(indptr[-1]),), dtype=torch.int32, device=dev
+    )
+    scale = D**-0.5
+
+    ref = _sparse_prefill_attn_torch(
+        q, kv, indices, indptr, None, None, None, None, scale
+    ).float()
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, None, scale)
+    scale_ref = ref.abs().max().item()
+    torch.testing.assert_close(out.float(), ref, atol=2**-6 * scale_ref, rtol=2**-6)
 
 
 def _triton_branch_only():

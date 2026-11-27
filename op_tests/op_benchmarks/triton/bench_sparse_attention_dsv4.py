@@ -8,7 +8,7 @@ entry (which takes the pinned per-arch launch, e.g. on gfx942 for H=8/16 at
 D=512), and the Gluon (CDNA4 / gfx950) prefill backend, and reports the speedup
 over Triton. The Gluon backend is the unified
 `mla_gluon(..., has_pe=False)` entry (HAS_PE=False over the shared `_mla_gluon`
-kernel) — the backend the production entrance uses. When Gluon is unavailable
+kernel) - the backend the production entrance uses. When Gluon is unavailable
 (non-gfx950 arch, or Triton < 3.6), only the Triton perf is reported.
 
 Usage:
@@ -163,7 +163,6 @@ def _launch_prefill(
             indices,  # page_table = ragged kv_indices
             indptr,  # seq_info = ragged kv_indptr
             scale,
-            min_kv_seq_len=float("inf"),  # skip min_kv_seq_len check for decode
             has_pe=False,
             attn_sink=attn_sink if has_sink else None,
         )
